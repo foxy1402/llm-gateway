@@ -35,10 +35,10 @@ docker run \
   -e DB_PATH=/data/gateway.db \
   -v gateway_data:/data \
   -p 8080:8080 \
-  ghcr.io/you/llm-gateway:latest
+  ghcr.io/foxy1402/llm-gateway:latest
 ```
 
-Then open `http://localhost:8080/dashboard/` and sign in with `DASHBOARD_PASSWORD`.
+Then open `http://localhost:8080/dashboard/` and sign in with `DASHBOARD_PASSWORD`. The `latest` tag is rebuilt on every push to `main`/`master` and ships `linux/amd64` + `linux/arm64`.
 
 ### From source
 
@@ -60,7 +60,7 @@ See [`docker-compose.example.yml`](docker-compose.example.yml):
 ```yaml
 services:
   gateway:
-    image: ghcr.io/you/llm-gateway:latest
+    image: ghcr.io/foxy1402/llm-gateway:latest
     ports: ["8080:8080"]
     environment:
       GATEWAY_API_KEY: "gw-change-me"

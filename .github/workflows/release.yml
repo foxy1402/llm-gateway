@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches: [main, master]
     tags: ["v*"]
 
 permissions:
@@ -30,7 +31,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # `latest` tracks the default branch; version tags appear on v* pushes.
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=tag

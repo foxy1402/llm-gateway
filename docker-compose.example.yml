@@ -1,6 +1,6 @@
 services:
   gateway:
-    image: ghcr.io/you/llm-gateway:latest
+    image: ghcr.io/foxy1402/llm-gateway:latest
     ports:
       - "8080:8080"
     environment:
