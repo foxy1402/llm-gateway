@@ -2,28 +2,32 @@ package proxy
 
 import "testing"
 
+// The rule is pure concatenation: base is the full OpenAI-compatible root
+// (including its version), and the canonical endpoint path is appended as-is.
 func TestBuildUpstreamURL(t *testing.T) {
 	cases := []struct{ base, path, want string }{
-		// Classic /v1 OpenAI-compatible bases
-		{"https://gen.pollinations.ai/v1", "/v1/chat/completions", "https://gen.pollinations.ai/v1/chat/completions"},
-		{"https://openrouter.ai/api/v1", "/v1/chat/completions", "https://openrouter.ai/api/v1/chat/completions"},
-		{"https://api.provider.com", "/v1/chat/completions", "https://api.provider.com/v1/chat/completions"},
-		{"https://api.vivgrid.com/v1", "/v1/chat/completions", "https://api.vivgrid.com/v1/chat/completions"},
-		{"https://host/llm/v1/", "/v1/embeddings", "https://host/llm/v1/embeddings"},
+		// OpenAI-compatible /v1 roots
+		{"https://gen.pollinations.ai/v1", "/chat/completions", "https://gen.pollinations.ai/v1/chat/completions"},
+		{"https://openrouter.ai/api/v1", "/chat/completions", "https://openrouter.ai/api/v1/chat/completions"},
+		{"https://api.groq.com/openai/v1", "/chat/completions", "https://api.groq.com/openai/v1/chat/completions"},
+		{"https://host/llm/v1/", "/embeddings", "https://host/llm/v1/embeddings"},
 
-		// Non-/v1 versioned bases: future-proof, keep their own version, drop our /v1
-		{"https://generativelanguage.googleapis.com/v1beta/openai", "/v1/chat/completions", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"},
-		{"https://open.bigmodel.cn/api/paas/v4", "/v1/chat/completions", "https://open.bigmodel.cn/api/paas/v4/chat/completions"},
-		{"https://open.bigmodel.cn/api/paas/v4", "/v1/embeddings", "https://open.bigmodel.cn/api/paas/v4/embeddings"},
-		{"https://host/v2", "/v1/chat/completions", "https://host/v2/chat/completions"},
-		{"https://host/v123", "/v1/chat/completions", "https://host/v123/chat/completions"},
-		{"https://host/api/v2preview", "/v1/responses", "https://host/api/v2preview/responses"},
-		{"https://host/v1beta", "/v1/chat/completions", "https://host/v1beta/chat/completions"},
-		{"https://host/v1beta/", "/v1/chat/completions", "https://host/v1beta/chat/completions"},
+		// Non-/v1 versioned roots: no regex needed, always the user's version + endpoint
+		{"https://generativelanguage.googleapis.com/v1beta/openai", "/chat/completions", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"},
+		{"https://generativelanguage.googleapis.com/v1beta", "/chat/completions", "https://generativelanguage.googleapis.com/v1beta/chat/completions"},
+		{"https://open.bigmodel.cn/api/paas/v4", "/chat/completions", "https://open.bigmodel.cn/api/paas/v4/chat/completions"},
+		{"https://open.bigmodel.cn/api/paas/v4", "/embeddings", "https://open.bigmodel.cn/api/paas/v4/embeddings"},
+		{"https://open.bigmodel.cn/api/paas/v4", "/responses", "https://open.bigmodel.cn/api/paas/v4/responses"},
+		{"https://open.bigmodel.cn/api/paas/v4", "/completions", "https://open.bigmodel.cn/api/paas/v4/completions"},
+		{"https://host/v123", "/chat/completions", "https://host/v123/chat/completions"},
+		{"https://host/api/v2preview", "/chat/completions", "https://host/api/v2preview/chat/completions"},
 
-		// Truly version-less bases keep the /v1 prefix
-		{"https://host/custom", "/v1/chat/completions", "https://host/custom/v1/chat/completions"},
-		{"https://api.no-version.example.com", "/v1/chat/completions", "https://api.no-version.example.com/v1/chat/completions"},
+		// Version-less custom roots keep the exact custom path
+		{"https://host/custom", "/chat/completions", "https://host/custom/chat/completions"},
+		{"https://api.no-version.example.com", "/chat/completions", "https://api.no-version.example.com/chat/completions"},
+
+		// Trailing slash on the base is normalized away
+		{"https://host/api/v1/", "/chat/completions", "https://host/api/v1/chat/completions"},
 	}
 	for _, c := range cases {
 		if got := buildUpstreamURL(c.base, c.path); got != c.want {

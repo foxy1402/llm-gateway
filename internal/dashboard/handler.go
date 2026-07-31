@@ -231,8 +231,8 @@ func (api *apiHandlers) runTest(body string, endpoint string) testResult {
 	return res
 }
 
-// listUpstreamModels queries {base_url}/models (joining without double /v1) and
-// returns the model IDs so the SPA can populate a dropdown in Add Provider.
+// listUpstreamModels queries {base_url}/models (base is the full OpenAI-compatible
+// root) and returns the model IDs so the SPA can populate a dropdown in Add Provider.
 func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BaseURL string `json:"base_url"`
@@ -242,8 +242,8 @@ func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 400, "base_url required")
 		return
 	}
-	// Reuse the same version-aware join as the proxy so ".../v1" is not duplicated.
-	url := proxy.BuildUpstreamURL(req.BaseURL, "/v1/models")
+	// Same concatenation rule as the proxy: base + "/models".
+	url := proxy.BuildUpstreamURL(req.BaseURL, "/models")
 	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -285,6 +285,9 @@ func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, 200, map[string]any{"models": ids})
 }
 
+// proxyPathFor builds the client-facing path ("/v1/chat/completions" etc.) for a
+// synthetic in-memory request through the same mux the real API uses. These are
+// gateway routes, NOT upstream paths, so they always stay versioned at /v1.
 func proxyPathFor(endpoint string) string {
 	switch endpoint {
 	case registry.EndpointResponses:

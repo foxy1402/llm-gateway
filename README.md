@@ -121,7 +121,14 @@ Requires Docker Desktop running locally. Green output = safe to push. Run this b
 
 A provider is one upstream LLM endpoint: base URL, auth key, model name, weight, tags, enabled flag, and whether it speaks `/v1/responses` natively. Its **ID** is what callers use as the `model` field.
 
-The **base URL** may include any OpenAI-compatible version root, not just `/v1` — the gateway joins it without doubling the version segment. Examples: `https://api.groq.com/openai/v1`, `https://generativelanguage.googleapis.com/v1beta/openai`, `https://open.bigmodel.cn/api/paas/v4`, or a version-less host like `https://api.myprovider.example.com` (which gets `/v1` appended).
+The **base URL** is the full OpenAI-compatible root *including its version path*. The gateway always appends a bare endpoint path (`/chat/completions`, `/completions`, `/responses`, `/embeddings`, `/models`) directly onto it, so you control the exact version:
+
+- `https://api.groq.com/openai/v1` → `…/openai/v1/chat/completions`
+- `https://generativelanguage.googleapis.com/v1beta/openai` → `…/v1beta/openai/chat/completions`
+- `https://generativelanguage.googleapis.com/v1beta` → `…/v1beta/chat/completions`
+- `https://open.bigmodel.cn/api/paas/v4` → `…/api/paas/v4/chat/completions`
+
+No version-detection heuristics are applied, so any OpenAI-compatible host (including custom roots like `https://host/custom`) works out of the box.
 
 ### Combos
 
