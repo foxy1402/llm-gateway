@@ -42,7 +42,7 @@ Then open `http://localhost:8080/dashboard/` and sign in with `DASHBOARD_PASSWOR
 
 ### From source
 
-Requires Go 1.22+.
+Requires Go 1.25+ (per `go.mod` and the `modernc.org/sqlite v1.55` dependency).
 
 ```bash
 export GATEWAY_API_KEY=gw-your-secret
