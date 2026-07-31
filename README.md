@@ -121,6 +121,8 @@ Requires Docker Desktop running locally. Green output = safe to push. Run this b
 
 A provider is one upstream LLM endpoint: base URL, auth key, model name, weight, tags, enabled flag, and whether it speaks `/v1/responses` natively. Its **ID** is what callers use as the `model` field.
 
+The **base URL** may include any OpenAI-compatible version root, not just `/v1` — the gateway joins it without doubling the version segment. Examples: `https://api.groq.com/openai/v1`, `https://generativelanguage.googleapis.com/v1beta/openai`, `https://open.bigmodel.cn/api/paas/v4`, or a version-less host like `https://api.myprovider.example.com` (which gets `/v1` appended).
+
 ### Combos
 
 A combo is a virtual model ID bound to an ordered pool of provider IDs plus a rotation policy. Callers send `model: "<combo-id>"` and the gateway picks a healthy member, retrying others on failure.

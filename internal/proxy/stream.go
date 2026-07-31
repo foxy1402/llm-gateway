@@ -49,12 +49,16 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	src := bufio.NewReaderSize(upstream.Body, 4096)
 	var out bytes.Buffer
 
-	// Accumulate usage for terminal responses.completed event.
+	// Accumulate usage for terminal responses.completed event. The two detail
+	// blobs are preserved verbatim so prompt-cache reporting (cached_tokens for
+	// OpenAI-compatible, cache_creation/cache_read for Anthropic-style) survives
+	// translation instead of being silently dropped.
 	var lastUsage struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 		TotalTokens  int `json:"total_tokens"`
 	}
+	var lastUsageDetails usageDetails
 	var sawUsage bool
 	var respModel string
 	// #12: capture prompt/completion token counts for logging regardless of format.
@@ -107,10 +111,10 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 						completionTokens = ct
 					}
 				}
-				if bytes.Equal(payload, []byte("[DONE]")) {
-					if translate && format == StreamFormatResponses {
-						// Emit terminal response.completed.
-						completed := buildResponseCompleted(respModel, lastUsage, sawUsage)
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				if translate && format == StreamFormatResponses {
+					// Emit terminal response.completed.
+					completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage)
 						out.WriteString("event: response.completed\n")
 						out.WriteString("data: ")
 						out.Write(completed)
@@ -120,13 +124,16 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 					}
 				} else {
 					if translate && format == StreamFormatResponses {
-						translated, model, usage, ok := translateChatChunk(payload)
+						translated, model, usage, details, ok := translateChatChunk(payload)
 						if model != "" {
 							respModel = model
 						}
 						if usage != nil {
 							lastUsage = *usage
 							sawUsage = true
+						}
+						if details != nil {
+							lastUsageDetails = *details
 						}
 						if ok {
 							for _, evt := range translated {
@@ -186,13 +193,21 @@ type sseEvent struct {
 	data  []byte
 }
 
+// usageDetails carries the prompt/completion token detail objects (cached_tokens,
+// reasoning tokens, audio tokens…). Kept as raw JSON so we forward provider-specific
+// fields verbatim instead of needing a struct for every vendor's variant.
+type usageDetails struct {
+	PromptTokensDetails     json.RawMessage `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails json.RawMessage `json:"completion_tokens_details,omitempty"`
+}
+
 // translateChatChunk converts one chat-completions SSE data payload into one or
 // more responses-format events.
 func translateChatChunk(payload []byte) (events []sseEvent, model string, usage *struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
-}, ok bool) {
+}, details *usageDetails, ok bool) {
 	var chunk struct {
 		Model   string `json:"model"`
 		Choices []struct {
@@ -203,13 +218,15 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens            int             `json:"prompt_tokens"`
+			CompletionTokens        int             `json:"completion_tokens"`
+			TotalTokens             int             `json:"total_tokens"`
+			PromptTokensDetails     json.RawMessage `json:"prompt_tokens_details"`
+			CompletionTokensDetails json.RawMessage `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
-		return nil, "", nil, false
+		return nil, "", nil, nil, false
 	}
 	model = chunk.Model
 	if chunk.Usage != nil {
@@ -221,6 +238,10 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 			InputTokens:  chunk.Usage.PromptTokens,
 			OutputTokens: chunk.Usage.CompletionTokens,
 			TotalTokens:  chunk.Usage.TotalTokens,
+		}
+		details = &usageDetails{
+			PromptTokensDetails:     chunk.Usage.PromptTokensDetails,
+			CompletionTokensDetails: chunk.Usage.CompletionTokensDetails,
 		}
 	}
 	for _, ch := range chunk.Choices {
@@ -240,14 +261,14 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 			events = append(events, sseEvent{event: "response.output_text.done", data: b})
 		}
 	}
-	return events, model, usage, len(events) > 0
+	return events, model, usage, details, len(events) > 0
 }
 
 func buildResponseCompleted(model string, usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
-}, sawUsage bool) []byte {
+}, details *usageDetails, sawUsage bool) []byte {
 	body := map[string]any{
 		"id":         "resp_" + randomID(),
 		"object":     "response",
@@ -256,7 +277,22 @@ func buildResponseCompleted(model string, usage struct {
 		"status":     "completed",
 	}
 	if sawUsage {
-		body["usage"] = usage
+		// Emit scalars plus any provider detail blobs (cached_tokens etc.) so IDEs
+		// billing on cache reads see the savings instead of a stripped usage block.
+		usageObj := map[string]any{
+			"input_tokens":  usage.InputTokens,
+			"output_tokens": usage.OutputTokens,
+			"total_tokens":  usage.TotalTokens,
+		}
+		if details != nil {
+			if len(details.PromptTokensDetails) > 0 {
+				usageObj["prompt_tokens_details"] = details.PromptTokensDetails
+			}
+			if len(details.CompletionTokensDetails) > 0 {
+				usageObj["completion_tokens_details"] = details.CompletionTokensDetails
+			}
+		}
+		body["usage"] = usageObj
 	}
 	b, _ := json.Marshal(map[string]any{
 		"type":     "response.completed",

@@ -127,9 +127,11 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens            int             `json:"prompt_tokens"`
+			CompletionTokens        int             `json:"completion_tokens"`
+			TotalTokens             int             `json:"total_tokens"`
+			PromptTokensDetails     json.RawMessage `json:"prompt_tokens_details"`
+			CompletionTokensDetails json.RawMessage `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &chat); err != nil {
@@ -169,12 +171,22 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 				},
 			},
 		},
-		"usage": map[string]int{
-			"input_tokens":  chat.Usage.PromptTokens,
-			"output_tokens": chat.Usage.CompletionTokens,
-			"total_tokens":  chat.Usage.TotalTokens,
-		},
 	}
+	usageObj := map[string]any{
+		"input_tokens":  chat.Usage.PromptTokens,
+		"output_tokens": chat.Usage.CompletionTokens,
+		"total_tokens":  chat.Usage.TotalTokens,
+	}
+	// Preserve cache/reasoning detail blobs (cached_tokens for OpenAI-compatible
+	// billing visibility; reasoning_tokens; audio_tokens…). Raw forward so any
+	// vendor-specific key under the details objects survives translation.
+	if len(chat.Usage.PromptTokensDetails) > 0 {
+		usageObj["prompt_tokens_details"] = chat.Usage.PromptTokensDetails
+	}
+	if len(chat.Usage.CompletionTokensDetails) > 0 {
+		usageObj["completion_tokens_details"] = chat.Usage.CompletionTokensDetails
+	}
+	out["usage"] = usageObj
 	if len(chat.Choices) > 0 && chat.Choices[0].FinishReason != "" {
 		out["finish_reason"] = chat.Choices[0].FinishReason
 	}

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -184,11 +185,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			body = rewritten
 		}
 
-		// Dispatch.
-		// Upstream path: if the provider's base_url already ends in the API version
-		// (rooted at /v1 as most OpenAI-compatible gateways do), don't append it
-		// twice — otherwise we'd request .../v1/v1/chat/completions and get a 404
-		// even though the endpoint is correct.
+		// Dispatch. The provider's base_url may already end in its own version
+		// segment (/v1, /v4, /v1beta/openai…). buildUpstreamURL appends our
+		// "/v1/<endpoint>" without doubling any version the base carries, so we
+		// never request ".../v4/v1/chat/completions" and 404 on a correct endpoint.
 		upstreamURL := buildUpstreamURL(upstream.BaseURL, upstreamPath)
 
 		// The upstream request lives on the CLIENT's request context throughout:
@@ -358,17 +358,50 @@ func upstreamPathFor(endpoint string, nativeResponses bool) string {
 	}
 }
 
-// buildUpstreamURL joins a provider base URL with an endpoint path, avoiding a
-// double version prefix. Most OpenAI-compatible providers are configured with
-// base_url = "https://host/v1"; naive concatenation would yield ".../v1/v1/...".
-// If base already ends in /v1 (or /v1/), strip the leading /v1 from the path.
+// buildUpstreamURL joins a provider base URL with an endpoint path such as
+// "/v1/chat/completions". Providers are configured with base URLs that may or may
+// not embed their API version ("https://host", "https://host/v1",
+// "https://open.bigmodel.cn/api/paas/v4", "https://generativelanguage.googleapis.com/v1beta/openai").
+// The gateway's canonical paths are "/v1/<endpoint>". We must not duplicate a version
+// segment the base already carries, nor hide a deliberate version with our own.
+//
+// Heuristic:
+//   - base ends with an API-version segment ("/v1", "/v2", "/v4", "/v1beta", "/v123"…)
+//     → assume a dedicated OpenAI-compatible root, drop the leading "/v1" from our path.
+//   - base ends with version + "/openai" (Google-style) → same.
+//   - base ends with "/vN/N" (Groq-style) → the cleaned version already contains the
+//     trailing numeric, so the naive "hasVersion" check won't treat "/openai/v1" as
+//     covered — handle that before the generic "/openai" branch.
+//   - version-less base → keep the "/v1" prefix (standard OpenAI-compatible root).
 func buildUpstreamURL(base, path string) string {
 	b := strings.TrimSuffix(base, "/")
+	lower := strings.ToLower(b)
 	p := path
-	if strings.HasSuffix(b, "/v1") {
+	hasVersion := hasAPIVersionSuffix(lower)
+	// version + trailing numeric (e.g. "/openai/v1") — handled before the generic
+	// "/openai" branch so its hasVersion check doesn't shadow the numeric suffix.
+	if strings.HasSuffix(lower, "/openai") && !hasVersion {
+		// e.g. "https://generativelanguage.googleapis.com/v1beta/openai"
+		p = strings.TrimPrefix(p, "/v1")
+	} else if hasVersion {
 		p = strings.TrimPrefix(p, "/v1")
 	}
 	return b + p
+}
+
+// apiVersionSeg matches trailing path segments that look like an API version:
+// "v1", "v2", "v4", "v123", or with an optional lifecycle suffix ("v1beta",
+// "v2preview", "v3alpha"). Compiled once at package init.
+var apiVersionSeg = regexp.MustCompile(`v\d+[a-z]*`)
+
+// hasAPIVersionSuffix reports whether the URL path ends with an API-version-shaped
+// segment like "/v1", "/v4", or "/v1beta".
+func hasAPIVersionSuffix(lowerBase string) bool {
+	seg := lowerBase
+	if i := strings.LastIndex(lowerBase, "/"); i >= 0 {
+		seg = lowerBase[i+1:]
+	}
+	return apiVersionSeg.MatchString(seg)
 }
 
 // BuildUpstreamURL is a public wrapper so the dashboard can build upstream /v1

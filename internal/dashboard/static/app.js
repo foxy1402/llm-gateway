@@ -243,7 +243,7 @@ function showProviderForm(id) {
         <div><label>Weight</label><input name="weight" type="number" min="1" value="${p.weight}"></div>
       </div>
       <div class="row">
-        <div style="flex:2"><label>Base URL *</label><input name="base_url" value="${esc(p.base_url)}" placeholder="https://api.groq.com/openai/v1" required></div>
+        <div style="flex:2"><label>Base URL *</label><input name="base_url" value="${esc(p.base_url)}" placeholder="https://api.groq.com/openai/v1 or .../v1beta/openai, .../v4" required></div>
         <div style="flex:2">
           <label>Upstream model *</label>
           <div style="display:flex;gap:6px">
