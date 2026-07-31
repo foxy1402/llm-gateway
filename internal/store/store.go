@@ -6,6 +6,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -22,6 +24,14 @@ type Store struct {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
+	// Ensure the parent directory exists before SQLite tries to open the file —
+	// headless/distroless containers mount volumes that may be empty.
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil && !os.IsPermission(err) {
+			// Non-fatal: a read-only mount would fail on open anyway with a clearer error.
+			return nil, fmt.Errorf("create db dir %q: %w", dir, err)
+		}
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

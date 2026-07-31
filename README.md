@@ -40,6 +40,12 @@ docker run \
 
 Then open `http://localhost:8080/dashboard/` and sign in with `DASHBOARD_PASSWORD`. The `latest` tag is rebuilt on every push to `main`/`master` and ships `linux/amd64` + `linux/arm64`.
 
+**Data directory permissions:** the image runs as the distroless `nonroot` user (uid/gid 65532) and bakes in a `/data` dir owned by that user. A named Docker volume (`-v gateway_data:/data`) inherits that owner on first mount, so it "just works." On a PaaS that mounts a *different* path or forces a root-owned volume, the gateway can't write SQLite and exits with `unable to open database file (14)`. Fixes, in order of preference:
+
+- Point `DB_PATH` at a path your platform guarantees is writable (often a mounted app-storage volume).
+- Pre-create the volume with uid 65532 ownership, e.g. `docker run --rm -v gateway_data:/data alpine chown -R 65532:65532 /data`.
+- If your platform forces a specific uid, override with `docker run --user <their-uid> …` and a matching writable `DB_PATH`.
+
 ### From source
 
 Requires Go 1.25+ (per `go.mod` and the `modernc.org/sqlite v1.55` dependency).
@@ -98,6 +104,16 @@ Any cryptographically random string ≥ 32 chars works. Generate locally (no web
 | **macOS / Linux (alt)** | `head -c 32 /dev/urandom \| base64` |
 
 Or an online generator if you prefer: [passwordsgenerator.net](https://passwordsgenerator.net/) (set length ≥ 32), [1Password's generator](https://1password.com/password-generator), or [bitwarden.com/password-generator](https://bitwarden.com/password-generator/). Prefer generating locally — the secret signs admin session cookies, so avoid pasting it into third-party sites.
+
+## Verifying before you push (PaaS smoke test)
+
+Don't ship blind. `scripts/deploy-smoke.ps1` reproduces exactly what CI and a real container deployment do and fails non-zero if anything regresses — build the image, boot it as `nonroot` with a fresh volume (catches the `CANTOPEN` DB crash), drive the dashboard admin API, check API-key auth, stream a slow SSE through a combo (catches stream-timeout bugs), and confirm streaming usage is logged as real tokens.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\deploy-smoke.ps1
+```
+
+Requires Docker Desktop running locally. Green output = safe to push. Run this before every commit that touches `internal/proxy`, `internal/store`, `internal/dashboard`, `internal/config`, or `Dockerfile`.
 
 ## Concepts
 
