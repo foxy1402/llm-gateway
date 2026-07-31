@@ -244,10 +244,18 @@ function showProviderForm(id) {
       </div>
       <div class="row">
         <div style="flex:2"><label>Base URL *</label><input name="base_url" value="${esc(p.base_url)}" placeholder="https://api.groq.com/openai/v1" required></div>
-        <div style="flex:2"><label>Upstream model *</label><input name="model" value="${esc(p.model)}" placeholder="llama3-70b-8192" required></div>
+        <div style="flex:2">
+          <label>Upstream model *</label>
+          <div style="display:flex;gap:6px">
+            <input name="model" value="${esc(p.model)}" placeholder="llama3-70b-8192" required list="modelOptions" style="flex:1">
+            <datalist id="modelOptions"></datalist>
+            <button class="btn ghost sm" type="button" id="fetchModelsBtn" title="Fetch available model IDs from the upstream's /models">Fetch</button>
+          </div>
+          <div id="fetchModelsMsg" class="ep-hint" style="margin-top:4px;display:none"></div>
+        </div>
       </div>
       <div class="row">
-        <div><label>Auth key</label><input name="auth_key" type="password" value="${esc(p.auth_key)}" autocomplete="new-password"></div>
+        <div><label>Auth key *</label><input name="auth_key" type="password" value="${esc(p.auth_key)}" autocomplete="new-password" required></div>
         <div><label>Tags (comma)</label><input name="tags" value="${esc((p.tags || []).join(','))}"></div>
       </div>
       <div class="row">
@@ -256,7 +264,54 @@ function showProviderForm(id) {
       </div>
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelProviderForm()">Cancel</button></div>
     </form></div>`;
+  $('#fetchModelsBtn').addEventListener('click', fetchUpstreamModels);
   $('#providerForm').scrollIntoView({ behavior: 'smooth' });
+}
+
+// fetchUpstreamModels calls the dashboard API to list the provider's available
+// model IDs and fills a <datalist> attached to the model input, turning it into
+// a searchable dropdown while still allowing a free-text value.
+async function fetchUpstreamModels() {
+  const form = $('#providerForm form');
+  const baseUrl = form.querySelector('[name=base_url]').value.trim();
+  const authKey = form.querySelector('[name=auth_key]').value.trim();
+  const btn = $('#fetchModelsBtn');
+  const msg = $('#fetchModelsMsg');
+  const list = $('#modelOptions');
+  msg.style.display = 'none';
+  list.innerHTML = '';
+  if (!baseUrl) {
+    msg.style.display = 'block';
+    msg.textContent = 'Enter the Base URL first.';
+    return;
+  }
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = 'Fetching…';
+  try {
+    const res = await fetch('api/models/list', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: baseUrl, auth_key: authKey }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    if (!data.models || data.models.length === 0) {
+      msg.style.display = 'block';
+      msg.textContent = 'Upstream returned 0 models.';
+    } else {
+      list.innerHTML = data.models.map(m => `<option value="${esc(m)}"></option>`).join('');
+      msg.style.display = 'block';
+      msg.textContent = `Loaded ${data.models.length} models — click the field and pick one.`;
+      const input = form.querySelector('[name=model]');
+      input.focus();
+    }
+  } catch (e) {
+    msg.style.display = 'block';
+    msg.textContent = 'Fetch failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 }
 function cancelProviderForm() { $('#providerForm').innerHTML = ''; }
 

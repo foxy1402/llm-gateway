@@ -2,10 +2,12 @@ package dashboard
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +47,7 @@ func Mount(mux *http.ServeMux, d *Deps) {
 	mux.Handle("PUT /dashboard/api/providers/{id}", withAuth(http.HandlerFunc(api.updateProvider)))
 	mux.Handle("DELETE /dashboard/api/providers/{id}", withAuth(http.HandlerFunc(api.deleteProvider)))
 	mux.Handle("POST /dashboard/api/providers/{id}/test", withAuth(http.HandlerFunc(api.testProvider)))
+	mux.Handle("POST /dashboard/api/models/list", withAuth(http.HandlerFunc(api.listUpstreamModels)))
 
 	mux.Handle("GET /dashboard/api/combos", withAuth(http.HandlerFunc(api.listCombos)))
 	mux.Handle("POST /dashboard/api/combos", withAuth(http.HandlerFunc(api.createCombo)))
@@ -226,6 +229,60 @@ func (api *apiHandlers) runTest(body string, endpoint string) testResult {
 	// Extract provider_used from the log row just written — simpler: derive from response header
 	// We can't easily know which upstream served, so skip for provider test; for combo test we log it async.
 	return res
+}
+
+// listUpstreamModels queries {base_url}/models (joining without double /v1) and
+// returns the model IDs so the SPA can populate a dropdown in Add Provider.
+func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BaseURL string `json:"base_url"`
+		AuthKey string `json:"auth_key"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.BaseURL == "" {
+		writeErr(w, 400, "base_url required")
+		return
+	}
+	// Reuse the same version-aware join as the proxy so ".../v1" is not duplicated.
+	url := proxy.BuildUpstreamURL(req.BaseURL, "/v1/models")
+	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if req.AuthKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+req.AuthKey)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		writeErr(w, 502, "upstream unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		writeErr(w, 502, fmt.Sprintf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
+		return
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		writeErr(w, 502, "upstream did not return a models list: "+err.Error())
+		return
+	}
+	ids := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	sort.Strings(ids)
+	writeJSON(w, 200, map[string]any{"models": ids})
 }
 
 func proxyPathFor(endpoint string) string {

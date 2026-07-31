@@ -371,6 +371,10 @@ func buildUpstreamURL(base, path string) string {
 	return b + p
 }
 
+// BuildUpstreamURL is a public wrapper so the dashboard can build upstream /v1
+// URLs identically to the proxy (used by the fetch-models helper).
+func BuildUpstreamURL(base, path string) string { return buildUpstreamURL(base, path) }
+
 // rewriteModel replaces the "model" field in the JSON body.
 func rewriteModel(body []byte, model string) ([]byte, error) {
 	// Patch only the top-level "model" field's byte slice instead of
