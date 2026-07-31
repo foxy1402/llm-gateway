@@ -185,7 +185,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 
 		// Dispatch.
-		upstreamURL := strings.TrimSuffix(upstream.BaseURL, "/") + upstreamPath
+		// Upstream path: if the provider's base_url already ends in the API version
+		// (rooted at /v1 as most OpenAI-compatible gateways do), don't append it
+		// twice — otherwise we'd request .../v1/v1/chat/completions and get a 404
+		// even though the endpoint is correct.
+		upstreamURL := buildUpstreamURL(upstream.BaseURL, upstreamPath)
 
 		// The upstream request lives on the CLIENT's request context throughout:
 		// client-cancel (Esc in Cursor) aborts the upstream stream (#11), and the
@@ -241,9 +245,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			continue
 		}
 
-		// 404/405 on a known endpoint → the provider doesn't implement it. Mark
-		// unsupported per-endpoint (#5) and rotate so other providers can serve.
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		// 404/405 endpoint-unsupported handling. Every OpenAI-compatible provider
+		// MUST implement chat.completions — a 404 there means our URL is wrong
+		// (bad base_url), not that the provider "doesn't support" it. Only the
+		// *optional* endpoints (legacy /v1/completions, /v1/embeddings, native
+		// /v1/responses) can genuinely be unimplemented.
+		optional := endpoint == registry.EndpointCompletions ||
+			endpoint == registry.EndpointEmbeddings ||
+			(nativeThisAttempt && endpoint == registry.EndpointResponses)
+		if (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) && optional {
 			resp.Body.Close()
 			p.registry.Health().MarkUnsupported(upstream.ID, endpoint)
 			if plan == nil {
@@ -252,6 +262,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 				return
 			}
 			continue
+		}
+		// Any remaining 404/405 on chat.completions (or a non-optional endpoint) is
+		// a bad path/auth/body — surface the real upstream body so the misconfig is
+		// visible instead of masquerading as "unsupported endpoint".
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			for k, v := range resp.Header {
+				if strings.HasPrefix(k, "Content-") {
+					w.Header()[k] = v
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(bodyBytes)
+			p.log(info.Model, upstream.ID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
+			return
 		}
 
 		// Non-2xx other than the above → surface to caller (e.g. 400 from upstream).
@@ -330,6 +356,19 @@ func upstreamPathFor(endpoint string, nativeResponses bool) string {
 	default:
 		return "/v1/chat/completions"
 	}
+}
+
+// buildUpstreamURL joins a provider base URL with an endpoint path, avoiding a
+// double version prefix. Most OpenAI-compatible providers are configured with
+// base_url = "https://host/v1"; naive concatenation would yield ".../v1/v1/...".
+// If base already ends in /v1 (or /v1/), strip the leading /v1 from the path.
+func buildUpstreamURL(base, path string) string {
+	b := strings.TrimSuffix(base, "/")
+	p := path
+	if strings.HasSuffix(b, "/v1") {
+		p = strings.TrimPrefix(p, "/v1")
+	}
+	return b + p
 }
 
 // rewriteModel replaces the "model" field in the JSON body.
