@@ -1,0 +1,27 @@
+services:
+  gateway:
+    image: ghcr.io/you/llm-gateway:latest
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_API_KEY: "gw-change-me"
+      DASHBOARD_PASSWORD: "change-me"
+      DASHBOARD_SECRET: "a-random-32-char-string-goes-here"
+      DB_PATH: "/data/gateway.db"
+      # GATEWAY_LISTEN: "8080"     # bare port also works (normalized to :8080)
+      # GATEWAY_LOG_LEVEL: "info"
+      # REQUEST_TIMEOUT: "60s"
+    volumes:
+      - gateway_data:/data
+    restart: unless-stopped
+    healthcheck:
+      # distroless has no shell/curl; use the HTTP probe with wget if present,
+      # otherwise rely on the tcp check below. Adjust to your tooling.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  gateway_data:

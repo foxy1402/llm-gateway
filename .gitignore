@@ -1,0 +1,22 @@
+# Binaries
+gateway.exe
+gateway
+/gateway
+
+# Database
+gateway.db
+*.db
+*.db-shm
+*.db-wal
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Go
+*.out
+*.test
+coverage.txt
