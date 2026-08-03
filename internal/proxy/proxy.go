@@ -21,6 +21,12 @@ import (
 
 const maxBodyBytes = 4 << 20 // 4 MiB
 
+// maxAccountsPerProvider caps how many distinct accounts of one provider we try
+// in a single request before declaring that provider done. Free-tier keys burn
+// out one-by-one; this keeps a single client request from pinning against a
+// whole pool serially while still covering the common "2–3 spare keys" case.
+const maxAccountsPerProvider = 3
+
 type Proxy struct {
 	registry *registry.Registry
 	store    *store.Store
@@ -128,32 +134,65 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		plan = p.newRotationPlan(combo, endpoint)
 	}
 
-	tried := map[string]bool{}
-	maxAttempts := 1
+	// Attempt budget: combo members × their accounts. For a direct provider we treat
+	// it as a singleton with its own account pool (so a one-off provider call can
+	// still cycle multiple keys on failure before giving up).
+	memberCount := 1
 	if plan != nil {
-		maxAttempts = len(plan.members)
+		memberCount = len(plan.members)
 	}
-	if maxAttempts == 0 {
+	if memberCount == 0 {
 		writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
 		return
 	}
+	maxAttempts := memberCount * maxAccountsPerProvider
+
+	triedProviders := map[string]bool{} // providers whose account pool is exhausted for this request
+	triedAccounts := map[string]bool{}  // accounts already burned during this request
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var upstream *config.Provider
+		var member *config.ComboMember
 		if plan != nil {
-			pid := plan.next(p.registry, tried)
-			if pid == "" {
+			member = plan.next(p.registry, triedProviders)
+			if member == nil {
 				break
 			}
-			upstream = p.registry.GetProvider(pid)
+			upstream = p.registry.GetProvider(member.ProviderID)
 			if upstream == nil || !upstream.Enabled {
-				tried[pid] = true
+				triedProviders[member.ProviderID] = true
 				continue
 			}
 		} else {
 			upstream = provider
 		}
-		tried[upstream.ID] = true
+
+		// Resolve the model this attempt should use. Per-member model wins; fallback
+		// is the provider's own configured model; direct (non-combo) providers always
+		// use their own model.
+		model := upstream.Model
+		if member != nil && member.Model != "" {
+			model = member.Model
+		}
+
+		// Pick the next *available* account for this provider, skipping ones already
+		// burned this request. An empty result here means every enabled account is
+		// tried or in proactive cooldown → this provider is done for this request.
+		account, ok := p.registry.NextAccount(upstream, p.registry.Health(), triedAccounts)
+		if !ok {
+			triedProviders[upstream.ID] = true
+			continue
+		}
+		triedAccounts[account.ID] = true
+		authKey := account.AuthKey
+
+		// logID tags log entries with the account that actually served the response
+		// so quota burn is traceable per key without breaking provider-level queries
+		// (dashboard filters use provider ID prefix match).
+		logID := upstream.ID
+		if len(upstream.Accounts) > 0 {
+			logID = upstream.ID + "[" + account.Label + "]"
+		}
 
 		// Per-attempt responses decision: for a combo each member decides for itself.
 		nativeThisAttempt := translateResponses && upstream.ResponsesNative
@@ -167,7 +206,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// Build upstream request body.
 		body := info.Raw
 		if translateResponses && !nativeThisAttempt {
-			translated, err := ResponsesToChatRequest(body, upstream.Model)
+			translated, err := ResponsesToChatRequest(body, model)
 			if err != nil {
 				slog.Error("responses->chat translation failed", "err", err)
 				writeError(w, http.StatusInternalServerError, "responses translation failed", "gateway_error")
@@ -175,8 +214,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 			body = translated
 		} else {
-			// Rewrite model field.
-			rewritten, err := rewriteModel(body, upstream.Model)
+			// Rewrite model field to the attempt's chosen model.
+			rewritten, err := rewriteModel(body, model)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "invalid request body", "invalid_request_error")
 				return
@@ -199,18 +238,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 		if err != nil {
 			p.registry.Health().RecordFailure(upstream.ID, 0)
+			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			writeError(w, http.StatusBadGateway, "failed to build upstream request", "gateway_error")
 			return
 		}
 		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("Authorization", "Bearer "+upstream.AuthKey)
+		upReq.Header.Set("Authorization", "Bearer "+authKey)
 		upReq.Header.Set("Accept", "text/event-stream, application/json")
 		upReq.Header.Set("X-Accel-Buffering", "no")
 
 		start := time.Now()
 		resp, err := p.client.Do(upReq)
 		if err != nil {
-			tried[upstream.ID] = true
 			// Client-initiated abort (Esc) or parent deadline: the caller is gone, so
 			// rotating to another provider is wasted and would even fire after the
 			// client disconnected. Fail fast without rotating (#2, #11).
@@ -219,29 +258,41 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 				return
 			}
 			// Transport-level failure (conn refused, dial timeout, header timeout):
-			// the provider is down/unreachable → cooldown it and rotate to the next
-			// member. Do NOT penalize for context.DeadlineExceeded *on the client
-			// side*, only when it's genuinely the upstream's header timeout.
+			// the endpoint itself is unreachable, not the key. Cool down at the
+			// *provider* level (all accounts share the same URL and would fail the
+			// same way) and rotate to the next member. Do NOT penalize for
+			// context.DeadlineExceeded on the client side (#2, #11).
 			p.registry.Health().RecordFailure(upstream.ID, 0)
-			slog.Warn("upstream dispatch failed", "provider", upstream.ID, "err", err)
+			slog.Warn("upstream dispatch failed", "provider", logID, "err", err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "upstream request failed", "gateway_error")
-				p.log(info.Model, upstream.ID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil)
+				p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil)
 				return
 			}
+			triedProviders[upstream.ID] = true
 			continue
 		}
 
-		// Retryable upstream status → record and rotate (only if we have a plan).
+		// Retryable upstream status → record and rotate within this provider's pool.
+		// 429/5xx from a key are account-scoped (that key is over quota or broken) so
+		// the next attempt re-tries the SAME provider's other accounts before the
+		// combo moves to an entirely different provider.
 		if p.registry.Health().IsRetryable(resp.StatusCode) {
 			resp.Body.Close()
-			p.registry.Health().RecordFailure(upstream.ID, resp.StatusCode)
+			// Account-scoped failure only: one burned key doesn't take the whole
+			// pool out of rotation (that's the entire point of multi-account). The
+			// account enters cooldown; other accounts on the same endpoint stay live.
+			// Provider-level cooldown is reserved for transport failures where the
+			// endpoint itself is unreachable and ALL keys would fail identically.
+			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			if plan == nil {
 				writeUpstreamError(w, resp.StatusCode)
-				p.log(info.Model, upstream.ID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil)
+				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil)
 				return
 			}
-			slog.Warn("upstream retryable status", "provider", upstream.ID, "status", resp.StatusCode)
+			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode)
+			// NOTE: provider is NOT dropped from triedProviders — NextAccount will
+			// yield a different key next time plan.next re-selects this provider.
 			continue
 		}
 
@@ -258,9 +309,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			p.registry.Health().MarkUnsupported(upstream.ID, endpoint)
 			if plan == nil {
 				writeError(w, resp.StatusCode, fmt.Sprintf("provider does not support %s", endpoint), "invalid_request_error")
-				p.log(info.Model, upstream.ID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil)
+				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil)
 				return
 			}
+			triedProviders[upstream.ID] = true
 			continue
 		}
 		// Any remaining 404/405 on chat.completions (or a non-optional endpoint) is
@@ -276,7 +328,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(bodyBytes)
-			p.log(info.Model, upstream.ID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
+			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
 			return
 		}
 
@@ -291,19 +343,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(bodyBytes)
-			p.log(info.Model, upstream.ID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
+			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
 			return
 		}
 
 		// Success path.
 		p.registry.Health().RecordSuccess(upstream.ID)
+		p.registry.Health().RecordAccountSuccess(upstream.ID, account.ID)
 		if info.Stream {
 			// SSE streaming. Status was checked above BEFORE streaming starts, so any
 			// retryable error was already rotated — we only reach here on a 2xx and
 			// can safely commit the client response headers.
 			translateStream := format == StreamFormatResponses
 			promptTokens, completionTokens := p.streamResponse(w, resp, format, translateStream)
-			p.log(info.Model, upstream.ID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens)
+			p.log(info.Model, logID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens)
 			return
 		}
 
@@ -317,7 +370,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			if err != nil {
 				slog.Error("chat->responses translation failed", "err", err)
 				writeError(w, http.StatusInternalServerError, "responses translation failed", "gateway_error")
-				p.log(info.Model, upstream.ID, endpoint, 500, time.Since(start), err.Error(), nil, nil)
+				p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil)
 				return
 			}
 			respBody = translated
@@ -332,7 +385,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-		p.log(info.Model, upstream.ID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens)
+		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens)
 		return
 	}
 

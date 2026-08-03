@@ -116,6 +116,32 @@ func (h *HealthTracker) IsAvailable(id string) bool {
 	return time.Now().After(s.cooldownUntil) || s.cooldownUntil.IsZero()
 }
 
+// accountKey builds the cooldown-scoping key for a single account. Accounts use
+// "providerID::accountID" so a burned key (429 / auth fail on one account) only
+// takes that account out of rotation, not its siblings on the same endpoint.
+func accountKey(providerID, accountID string) string {
+	if accountID == "" {
+		return providerID
+	}
+	return providerID + "::" + accountID
+}
+
+// RecordAccountFailure cools down a single account key. Subsequent candidates
+// for this provider skip it until the cooldown elapses.
+func (h *HealthTracker) RecordAccountFailure(providerID, accountID string) {
+	h.RecordFailure(accountKey(providerID, accountID), 0)
+}
+
+// RecordAccountSuccess clears cooldown/failure state for a single account.
+func (h *HealthTracker) RecordAccountSuccess(providerID, accountID string) {
+	h.RecordSuccess(accountKey(providerID, accountID))
+}
+
+// IsAccountAvailable reports whether a single account is currently eligible.
+func (h *HealthTracker) IsAccountAvailable(providerID, accountID string) bool {
+	return h.IsAvailable(accountKey(providerID, accountID))
+}
+
 // SupportsEndpoint reports whether the provider can handle the given endpoint.
 func (h *HealthTracker) SupportsEndpoint(id, endpoint string) bool {
 	s := h.state(id)

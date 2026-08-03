@@ -16,6 +16,24 @@ CREATE TABLE IF NOT EXISTS providers (
     created_at       INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+CREATE TABLE IF NOT EXISTS provider_accounts (
+    id          TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    label       TEXT NOT NULL DEFAULT '',
+    auth_key    TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    position    INTEGER NOT NULL DEFAULT 0,
+    weight      INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS provider_models (
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    model_id    TEXT NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider_id, model_id)
+);
+
 CREATE TABLE IF NOT EXISTS combos (
     id           TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
@@ -27,8 +45,9 @@ CREATE TABLE IF NOT EXISTS combos (
 CREATE TABLE IF NOT EXISTS combo_members (
     combo_id    TEXT NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    model       TEXT NOT NULL DEFAULT '',
     position    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (combo_id, provider_id)
+    PRIMARY KEY (combo_id, provider_id, model)
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -46,3 +65,5 @@ CREATE TABLE IF NOT EXISTS request_log (
 
 CREATE INDEX IF NOT EXISTS idx_log_ts ON request_log(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_log_provider ON request_log(provider_used);
+CREATE INDEX IF NOT EXISTS idx_accounts_provider ON provider_accounts(provider_id);
+CREATE INDEX IF NOT EXISTS idx_models_provider ON provider_models(provider_id);

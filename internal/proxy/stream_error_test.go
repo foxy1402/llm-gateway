@@ -33,7 +33,7 @@ func TestStreamingEarlyErrorRotates(t *testing.T) {
 	defer st.Close()
 	st.UpsertProvider(config.Provider{ID: "bad", BaseURL: bad.URL, AuthKey: "k", Model: "m", Weight: 1, Enabled: true})
 	st.UpsertProvider(config.Provider{ID: "good", BaseURL: good.URL, AuthKey: "k", Model: "m", Weight: 1, Enabled: true})
-	st.UpsertCombo(config.Combo{ID: "c", Rotation: config.Priority, Members: []string{"bad", "good"}, Enabled: true})
+	st.UpsertCombo(config.Combo{ID: "c", Rotation: config.Priority, Members: []config.ComboMember{{ProviderID: "bad"}, {ProviderID: "good"}}, Enabled: true})
 	reg := registry.New()
 	reg.Reload(st)
 	px := New(reg, st, 2*time.Second)

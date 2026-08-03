@@ -14,7 +14,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 	st, _ := Open(context.Background(), filepath.Join(dir, "a.db"))
 	defer st.Close()
 	st.UpsertProvider(config.Provider{ID: "p", BaseURL: "https://x", AuthKey: "k", Model: "m", Weight: 3, Enabled: true})
-	st.UpsertCombo(config.Combo{ID: "c", Rotation: config.RoundRobin, Members: []string{"p"}, Enabled: true})
+	st.UpsertCombo(config.Combo{ID: "c", Rotation: config.RoundRobin, Members: []config.ComboMember{{ProviderID: "p", Model: "m"}}, Enabled: true})
 	st.SetSetting("some.key", "someval")
 
 	sqlDump, err := st.ExportSQL()

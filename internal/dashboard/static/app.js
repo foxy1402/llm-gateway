@@ -233,7 +233,8 @@ async function testProvider(id) {
 }
 
 function showProviderForm(id) {
-  const p = id ? state.providers.find(x => x.id === id) : { id: '', display: '', base_url: '', auth_key: '', model: '', weight: 1, tags: [], enabled: true, responses_native: false };
+  const p = id ? state.providers.find(x => x.id === id) : { id: '', display: '', base_url: '', auth_key: '', model: '', weight: 1, tags: [], enabled: true, responses_native: false, accounts: [] };
+  const accounts = (p.accounts && p.accounts.length ? p.accounts : [{ label: 'default', auth_key: p.auth_key || '', weight: 1, enabled: true }]);
   $('#providerForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} provider</h2>
     <form onsubmit="return saveProvider(event, '${esc(id || '')}')">
@@ -254,8 +255,12 @@ function showProviderForm(id) {
           <div id="fetchModelsMsg" class="ep-hint" style="margin-top:4px;display:none"></div>
         </div>
       </div>
-      <div class="row">
-        <div><label>Auth key *</label><input name="auth_key" type="password" value="${esc(p.auth_key)}" autocomplete="new-password" required></div>
+      <div>
+        <label>Accounts (API keys) — rotation spreads requests across them; one burned key keeps the pool alive</label>
+        <div id="accountList"></div>
+        <button type="button" class="btn sm ghost" id="addAccountBtn">+ Add account</button>
+      </div>
+      <div class="row" style="margin-top:6px">
         <div><label>Tags (comma)</label><input name="tags" value="${esc((p.tags || []).join(','))}"></div>
       </div>
       <div class="row">
@@ -265,7 +270,42 @@ function showProviderForm(id) {
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelProviderForm()">Cancel</button></div>
     </form></div>`;
   $('#fetchModelsBtn').addEventListener('click', fetchUpstreamModels);
+  accounts.forEach(a => addAccountRow(a));
+  $('#addAccountBtn').addEventListener('click', () => addAccountRow({ label: '', auth_key: '', weight: 1, enabled: true }));
   $('#providerForm').scrollIntoView({ behavior: 'smooth' });
+}
+
+// addAccountRow appends one editable account row (label + key + weight + remove).
+function addAccountRow(a) {
+  const wrap = $('#accountList');
+  const row = document.createElement('div');
+  row.className = 'acct-row';
+  row.style.cssText = 'display:flex;gap:6px;align-items:center;margin:4px 0';
+  row.innerHTML = `
+    <input name="acct_label" value="${esc(a.label || '')}" placeholder="label" style="width:110px">
+    <input name="acct_key" type="password" value="${esc(a.auth_key || '')}" placeholder="API key *" autocomplete="new-password" style="flex:1" required>
+    <input name="acct_weight" type="number" min="1" value="${a.weight || 1}" title="weight" style="width:64px">
+    <button type="button" class="btn sm danger" onclick="this.closest('.acct-row').remove()">×</button>`;
+  wrap.appendChild(row);
+}
+
+// collectAccounts reads the account rows from the provider form into a payload list.
+function collectAccounts(form) {
+  const out = [];
+  const labels = form.querySelectorAll('[name=acct_label]');
+  const keys = form.querySelectorAll('[name=acct_key]');
+  const weights = form.querySelectorAll('[name=acct_weight]');
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i].value.trim();
+    if (!key) continue;
+    out.push({
+      label: (labels[i] && labels[i].value.trim()) || 'acct-' + (i + 1),
+      auth_key: key,
+      weight: parseInt(weights[i] && weights[i].value) || 1,
+      enabled: true,
+    });
+  }
+  return out;
 }
 
 // fetchUpstreamModels calls the dashboard API to list the provider's available
@@ -274,7 +314,9 @@ function showProviderForm(id) {
 async function fetchUpstreamModels() {
   const form = $('#providerForm form');
   const baseUrl = form.querySelector('[name=base_url]').value.trim();
-  const authKey = form.querySelector('[name=auth_key]').value.trim();
+  // Use the first entered account key as the fetch credential.
+  const firstKey = form.querySelector('[name=acct_key]');
+  const authKey = (firstKey && firstKey.value.trim()) || '';
   const btn = $('#fetchModelsBtn');
   const msg = $('#fetchModelsMsg');
   const list = $('#modelOptions');
@@ -304,6 +346,13 @@ async function fetchUpstreamModels() {
       msg.textContent = `Loaded ${data.models.length} models — click the field and pick one.`;
       const input = form.querySelector('[name=model]');
       input.focus();
+      // Persist the fetched pool onto the saved provider so combo dropdowns can use it.
+      const pid = form.querySelector('[name=id]').value.trim();
+      if (pid && state.providers.some(x => x.id === pid)) {
+        api.post('/providers/' + encodeURIComponent(pid) + '/models/fetch').then(() => {
+          state.providers.find(x => x.id === pid).models = data.models;
+        }).catch(() => {});
+      }
     }
   } catch (e) {
     msg.style.display = 'block';
@@ -317,12 +366,15 @@ function cancelProviderForm() { $('#providerForm').innerHTML = ''; }
 
 async function saveProvider(e, id) {
   e.preventDefault();
+  const accounts = collectAccounts(e.target);
+  if (accounts.length === 0) { alert('Add at least one account with an API key.'); return false; }
   const f = new FormData(e.target);
   const payload = {
     id: f.get('id'), display: f.get('display'), base_url: f.get('base_url'),
-    auth_key: f.get('auth_key'), model: f.get('model'), weight: parseInt(f.get('weight')) || 1,
+    auth_key: accounts[0].auth_key, model: f.get('model'), weight: parseInt(f.get('weight')) || 1,
     tags: (f.get('tags') || '').split(',').map(s => s.trim()).filter(Boolean),
     enabled: f.get('enabled') === 'on', responses_native: f.get('responses_native') === 'on',
+    accounts: accounts,
   };
   try {
     if (id) await api.put('/providers/' + encodeURIComponent(id), payload);
@@ -357,7 +409,7 @@ function comboTable() {
       <td class="mono">${esc(c.id)}</td>
       <td>${esc(c.display_name)}</td>
       <td><span class="tag">${esc(c.rotation)}</span></td>
-      <td class="small">${(c.members || []).map(m => `<span class="chip">${esc(m)}</span>`).join('')}</td>
+      <td class="small">${(c.members || []).map(m => `<span class="chip">${esc(memberLabel(m))}</span>`).join('')}</td>
       <td><button class="btn sm ${c.enabled ? '' : 'ghost'}" onclick="toggleCombo('${esc(c.id)}')">${c.enabled ? 'On' : 'Off'}</button></td>
       <td style="white-space:nowrap;text-align:right">
         <button class="btn sm ghost" onclick="testCombo('${esc(c.id)}')">Test</button>
@@ -390,9 +442,16 @@ async function testCombo(id) {
   finally { btn.disabled = false; btn.textContent = 'Test'; }
 }
 
+// memberLabel renders a combo member as "provider → model", tolerating both the
+// structured {provider_id,model} shape and a legacy plain-string ID.
+function memberLabel(m) {
+  if (m && typeof m === 'object') return m.provider_id + (m.model ? ' → ' + m.model : '');
+  return String(m);
+}
+
 function showComboForm(id) {
   const c = id ? state.combos.find(x => x.id === id) : { id: '', display_name: '', rotation: 'round-robin', members: [], enabled: true };
-  const avail = state.providers.map(p => p.id);
+  const avail = state.providers;
   $('#comboForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} combo</h2>
     <form onsubmit="return saveCombo(event, '${esc(id || '')}')">
@@ -404,29 +463,52 @@ function showComboForm(id) {
             ${['round-robin', 'weighted-round-robin', 'priority', 'random'].map(r => `<option ${c.rotation === r ? 'selected' : ''}>${r}</option>`).join('')}
           </select></div>
       </div>
-      <label>Members (drag to reorder — order matters for <span class="kbd">priority</span>)</label>
-      <ul class="listMembers" id="memberList">
-        ${(c.members || []).map(m => `<li draggable="true" data-id="${esc(m)}"><span class="handle">☰</span><span class="mono">${esc(m)}</span><span class="spacer"></span><button type="button" class="btn sm danger" onclick="this.closest('li').remove()">×</button></li>`).join('')}
-      </ul>
+      <label>Members (provider + model; drag to reorder — order matters for <span class="kbd">priority</span>)</label>
+      <ul class="listMembers" id="memberList"></ul>
       <div class="toolbar">
-        <select id="memberPicker">${avail.filter(a => !(c.members || []).includes(a)).map(a => `<option>${esc(a)}</option>`).join('')}</select>
+        <select id="memberPicker">${avail.map(a => `<option>${esc(a.id)}</option>`).join('')}</select>
         <button type="button" class="btn sm ghost" onclick="addMember()">+ Add member</button>
       </div>
       <label class="pill"><input type="checkbox" name="enabled" ${c.enabled ? 'checked' : ''} style="width:auto"> Enabled</label>
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelComboForm()">Cancel</button></div>
     </form></div>`;
+  // Render each existing member as a provider+model row.
+  (c.members || []).forEach(m => addMemberRow(normProvider(m), m.model || ''));
   enableDrag();
 }
 function cancelComboForm() { $('#comboForm').innerHTML = ''; }
 
+function normProvider(m) { return (m && typeof m === 'object') ? m.provider_id : String(m); }
+
+// addMemberRow appends a draggable member row with a provider select and a model
+// select fed by that provider's fetched model pool. The model can also be typed
+// free-form via the datalist (covers unfetched providers).
+function addMemberRow(providerID, model) {
+  const prov = state.providers.find(p => p.id === providerID);
+  const li = document.createElement('li');
+  li.draggable = true;
+  li.dataset.provider = providerID;
+  const dl = 'dl-' + Math.random().toString(36).slice(2, 8);
+  li.innerHTML = `
+    <span class="handle">☰</span>
+    <select class="provs"><option value="${esc(providerID)}">${esc(providerID)}</option></select>
+    <input class="modelSel" list="${dl}" placeholder="model (default: provider's)" value="${esc(model || '')}" style="flex:1">
+    <datalist id="${dl}"></datalist>
+    <span class="spacer"></span>
+    <button type="button" class="btn sm danger" onclick="this.closest('li').remove()">×</button>`;
+  const dlEl = li.querySelector('datalist');
+  (prov && prov.models ? prov.models : []).forEach(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    dlEl.appendChild(o);
+  });
+  $('#memberList').appendChild(li);
+}
+
 function addMember() {
   const sel = $('#memberPicker');
   if (!sel.value) return;
-  const li = document.createElement('li');
-  li.draggable = true; li.dataset.id = sel.value;
-  li.innerHTML = `<span class="handle">☰</span><span class="mono">${esc(sel.value)}</span><span class="spacer"></span><button type="button" class="btn sm danger" onclick="this.closest('li').remove()">×</button>`;
-  $('#memberList').appendChild(li);
-  sel.querySelector('option[value="' + CSS.escape(sel.value) + '"]')?.remove();
+  addMemberRow(sel.value, '');
   enableDrag();
 }
 
@@ -451,7 +533,10 @@ function enableDrag() {
 async function saveCombo(e, id) {
   e.preventDefault();
   const f = new FormData(e.target);
-  const members = $$('#memberList li').map(li => li.dataset.id);
+  const members = $$('#memberList li').map(li => ({
+    provider_id: li.dataset.provider,
+    model: (li.querySelector('.modelSel') || {}).value || '',
+  })).filter(m => m.provider_id);
   const payload = {
     id: f.get('id'), display_name: f.get('display_name'), rotation: f.get('rotation'),
     members, enabled: f.get('enabled') === 'on',

@@ -41,7 +41,7 @@ func TestEmbeddingsRejectsCombo(t *testing.T) {
 	px, _, _ := newTestStack(t, upstream, []config.Provider{
 		{ID: "a", BaseURL: upstream.URL, AuthKey: "k", Model: "m", Weight: 1, Enabled: true},
 	}, []config.Combo{
-		{ID: "combo", Rotation: config.RoundRobin, Members: []string{"a"}, Enabled: true},
+		{ID: "combo", Rotation: config.RoundRobin, Members: []config.ComboMember{{ProviderID: "a"}}, Enabled: true},
 	})
 
 	req := httptest.NewRequest("POST", "/v1/embeddings", strings.NewReader(`{"model":"combo","input":"x"}`))

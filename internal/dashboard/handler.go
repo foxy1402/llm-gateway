@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,6 +49,13 @@ func Mount(mux *http.ServeMux, d *Deps) {
 	mux.Handle("DELETE /dashboard/api/providers/{id}", withAuth(http.HandlerFunc(api.deleteProvider)))
 	mux.Handle("POST /dashboard/api/providers/{id}/test", withAuth(http.HandlerFunc(api.testProvider)))
 	mux.Handle("POST /dashboard/api/models/list", withAuth(http.HandlerFunc(api.listUpstreamModels)))
+
+	// Multi-account + model pool management.
+	mux.Handle("POST /dashboard/api/providers/{id}/accounts", withAuth(http.HandlerFunc(api.addAccount)))
+	mux.Handle("DELETE /dashboard/api/providers/{id}/accounts/{acctId}", withAuth(http.HandlerFunc(api.deleteAccount)))
+	mux.Handle("PUT /dashboard/api/providers/{id}/accounts", withAuth(http.HandlerFunc(api.replaceAccounts)))
+	mux.Handle("GET /dashboard/api/providers/{id}/models", withAuth(http.HandlerFunc(api.listProviderModels)))
+	mux.Handle("POST /dashboard/api/providers/{id}/models/fetch", withAuth(http.HandlerFunc(api.fetchProviderModels)))
 
 	mux.Handle("GET /dashboard/api/combos", withAuth(http.HandlerFunc(api.listCombos)))
 	mux.Handle("POST /dashboard/api/combos", withAuth(http.HandlerFunc(api.createCombo)))
@@ -100,15 +108,16 @@ func (api *apiHandlers) reload() {
 // --- providers ---
 
 type providerPayload struct {
-	ID              string   `json:"id"`
-	Display         string   `json:"display"`
-	BaseURL         string   `json:"base_url"`
-	AuthKey         string   `json:"auth_key"`
-	Model           string   `json:"model"`
-	Weight          int      `json:"weight"`
-	Tags            []string `json:"tags"`
-	Enabled         bool     `json:"enabled"`
-	ResponsesNative bool     `json:"responses_native"`
+	ID              string           `json:"id"`
+	Display         string           `json:"display"`
+	BaseURL         string           `json:"base_url"`
+	AuthKey         string           `json:"auth_key"`
+	Model           string           `json:"model"`
+	Weight          int              `json:"weight"`
+	Tags            []string         `json:"tags"`
+	Enabled         bool             `json:"enabled"`
+	ResponsesNative bool             `json:"responses_native"`
+	Accounts        []config.Account `json:"accounts,omitempty"`
 }
 
 func (pp providerPayload) toConfig() config.Provider {
@@ -149,8 +158,49 @@ func (api *apiHandlers) createProvider(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// Persist any accounts bundled in the save (UI creates the default account here).
+	if err := api.syncAccounts(p.ID, p.AuthKey, p.Accounts); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
 	api.reload()
 	writeJSON(w, 201, p)
+}
+
+// syncAccounts persists the provider's account pool. When the caller supplies no
+// accounts but a legacy AuthKey exists and the provider has no accounts yet,
+// synthesize a single default account — keeps first-time single-key creation and
+// imported legacy dumps working without the UI having to know about accounts.
+func (api *apiHandlers) syncAccounts(providerID, legacyKey string, supplied []config.Account) error {
+	out := make([]config.Account, 0, len(supplied))
+	for _, a := range supplied {
+		if a.AuthKey == "" {
+			continue
+		}
+		if a.ID == "" {
+			a.ID = providerID + ":" + shortID()
+		}
+		a.ProviderID = providerID
+		if a.Weight < 1 {
+			a.Weight = 1
+		}
+		out = append(out, a)
+	}
+	if len(out) > 0 {
+		return api.d.Store.ReplaceAccounts(providerID, out)
+	}
+	// No accounts supplied: only fill the legacy key if nothing exists yet.
+	existing, err := api.d.Store.GetProvider(providerID)
+	if err != nil {
+		return err
+	}
+	if existing != nil && len(existing.Accounts) == 0 && legacyKey != "" {
+		return api.d.Store.ReplaceAccounts(providerID, []config.Account{{
+			ID: providerID + ":" + shortID(), ProviderID: providerID,
+			Label: "default", AuthKey: legacyKey, Enabled: true, Weight: 1,
+		}})
+	}
+	return nil
 }
 
 func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +219,10 @@ func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
 		p.Weight = 1
 	}
 	if err := api.d.Store.UpsertProvider(p.toConfig()); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := api.syncAccounts(p.ID, p.AuthKey, p.Accounts); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -242,28 +296,35 @@ func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 400, "base_url required")
 		return
 	}
-	// Same concatenation rule as the proxy: base + "/models".
-	url := proxy.BuildUpstreamURL(req.BaseURL, "/models")
-	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+	ids, err := fetchModelIDs(req.BaseURL, req.AuthKey)
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		writeErr(w, 502, err.Error())
 		return
 	}
-	if req.AuthKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+req.AuthKey)
+	writeJSON(w, 200, map[string]any{"models": ids})
+}
+
+// fetchModelIDs GETs {baseURL}/models and returns the sorted model IDs.
+// Shared by the ad-hoc models/list endpoint and the provider-pool fetcher.
+func fetchModelIDs(baseURL, authKey string) ([]string, error) {
+	url := proxy.BuildUpstreamURL(baseURL, "/models")
+	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if authKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+authKey)
 	}
 	httpReq.Header.Set("Accept", "application/json")
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		writeErr(w, 502, "upstream unreachable: "+err.Error())
-		return
+		return nil, fmt.Errorf("upstream unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		writeErr(w, 502, fmt.Sprintf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
-		return
+		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var parsed struct {
 		Data []struct {
@@ -272,8 +333,7 @@ func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Reques
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		writeErr(w, 502, "upstream did not return a models list: "+err.Error())
-		return
+		return nil, fmt.Errorf("upstream did not return a models list: %w", err)
 	}
 	ids := make([]string, 0, len(parsed.Data))
 	for _, m := range parsed.Data {
@@ -282,7 +342,169 @@ func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	sort.Strings(ids)
+	return ids, nil
+}
+
+// --- provider accounts & models ---
+
+// addAccount appends one account to a provider. AuthKey is required.
+func (api *apiHandlers) addAccount(w http.ResponseWriter, r *http.Request) {
+	pid := r.PathValue("id")
+	p, err := api.d.Store.GetProvider(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p == nil {
+		writeErr(w, 404, "provider not found")
+		return
+	}
+	var req struct {
+		Label   string `json:"label"`
+		AuthKey string `json:"auth_key"`
+		Enabled bool   `json:"enabled"`
+		Weight  int    `json:"weight"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.AuthKey == "" {
+		writeErr(w, 400, "auth_key required")
+		return
+	}
+	accounts := append([]config.Account{}, p.Accounts...)
+	if req.Weight < 1 {
+		req.Weight = 1
+	}
+	accounts = append(accounts, config.Account{
+		ID: pid + ":" + shortID(), ProviderID: pid, Label: req.Label,
+		AuthKey: req.AuthKey, Enabled: req.Enabled, Weight: req.Weight,
+	})
+	if err := api.d.Store.ReplaceAccounts(pid, accounts); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
+	writeJSON(w, 201, map[string]string{"status": "added"})
+}
+
+// replaceAccounts swaps the entire account pool (used by the UI save).
+func (api *apiHandlers) replaceAccounts(w http.ResponseWriter, r *http.Request) {
+	pid := r.PathValue("id")
+	existing, err := api.d.Store.GetProvider(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if existing == nil {
+		writeErr(w, 404, "provider not found")
+		return
+	}
+	var req struct {
+		Accounts []config.Account `json:"accounts"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, 400, "invalid JSON")
+		return
+	}
+	out := make([]config.Account, 0, len(req.Accounts))
+	for _, a := range req.Accounts {
+		if a.AuthKey == "" {
+			continue
+		}
+		if a.ID == "" {
+			a.ID = pid + ":" + shortID()
+		}
+		a.ProviderID = pid
+		if a.Weight < 1 {
+			a.Weight = 1
+		}
+		out = append(out, a)
+	}
+	if err := api.d.Store.ReplaceAccounts(pid, out); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
+	writeJSON(w, 200, map[string]string{"status": "saved"})
+}
+
+// deleteAccount removes one account by ID.
+func (api *apiHandlers) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	pid := r.PathValue("id")
+	acctID := r.PathValue("acctId")
+	p, err := api.d.Store.GetProvider(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p == nil {
+		writeErr(w, 404, "provider not found")
+		return
+	}
+	kept := []config.Account{}
+	for _, a := range p.Accounts {
+		if a.ID != acctID {
+			kept = append(kept, a)
+		}
+	}
+	if err := api.d.Store.ReplaceAccounts(pid, kept); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// listProviderModels returns the stored fetched pool.
+func (api *apiHandlers) listProviderModels(w http.ResponseWriter, r *http.Request) {
+	p, err := api.d.Store.GetProvider(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p == nil {
+		writeErr(w, 404, "provider not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"models": p.Models})
+}
+
+// fetchProviderModels pulls the live /models list using the provider's first
+// enabled account (or its legacy key) and persists it to provider_models.
+func (api *apiHandlers) fetchProviderModels(w http.ResponseWriter, r *http.Request) {
+	pid := r.PathValue("id")
+	p, err := api.d.Store.GetProvider(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p == nil {
+		writeErr(w, 404, "provider not found")
+		return
+	}
+	auth := p.AuthKey
+	for _, a := range p.Accounts {
+		if a.Enabled {
+			auth = a.AuthKey
+			break
+		}
+	}
+	ids, err := fetchModelIDs(p.BaseURL, auth)
+	if err != nil {
+		writeErr(w, 502, err.Error())
+		return
+	}
+	if err := api.d.Store.ReplaceModels(pid, ids); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
 	writeJSON(w, 200, map[string]any{"models": ids})
+}
+
+// shortID returns a short random hex suffix for account IDs.
+func shortID() string {
+	var b [6]byte
+	_, _ = crand.Read(b[:])
+	return fmt.Sprintf("%x", b[:])
 }
 
 // proxyPathFor builds the client-facing path ("/v1/chat/completions" etc.) for a
@@ -329,18 +551,31 @@ func (c *capture) Flush() {}
 
 // --- combos ---
 
+// comboMemberPayload is one provider+model binding in a combo.
+type comboMemberPayload struct {
+	ProviderID string `json:"provider_id"`
+	Model      string `json:"model"`
+}
+
 type comboPayload struct {
-	ID          string   `json:"id"`
-	DisplayName string   `json:"display_name"`
-	Rotation    string   `json:"rotation"`
-	Members     []string `json:"members"`
-	Enabled     bool     `json:"enabled"`
+	ID          string               `json:"id"`
+	DisplayName string               `json:"display_name"`
+	Rotation    string               `json:"rotation"`
+	Members     []comboMemberPayload `json:"members"`
+	Enabled     bool                 `json:"enabled"`
 }
 
 func (cp comboPayload) toConfig() config.Combo {
+	members := make([]config.ComboMember, 0, len(cp.Members))
+	for _, m := range cp.Members {
+		if m.ProviderID == "" {
+			continue
+		}
+		members = append(members, config.ComboMember{ProviderID: m.ProviderID, Model: m.Model})
+	}
 	return config.Combo{
 		ID: cp.ID, DisplayName: cp.DisplayName, Rotation: config.RotationPolicy(cp.Rotation),
-		Members: cp.Members, Enabled: cp.Enabled,
+		Members: members, Enabled: cp.Enabled,
 	}
 }
 
@@ -360,6 +595,10 @@ func (api *apiHandlers) createCombo(w http.ResponseWriter, r *http.Request) {
 	}
 	if c.Rotation == "" {
 		c.Rotation = string(config.RoundRobin)
+	}
+	if err := api.validateCombo(c); err != "" {
+		writeErr(w, 400, err)
+		return
 	}
 	if err := api.d.Store.UpsertCombo(c.toConfig()); err != nil {
 		writeErr(w, 500, err.Error())
@@ -381,12 +620,43 @@ func (api *apiHandlers) updateCombo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.ID = id
+	if err := api.validateCombo(c); err != "" {
+		writeErr(w, 400, err)
+		return
+	}
 	if err := api.d.Store.UpsertCombo(c.toConfig()); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	api.reload()
 	writeJSON(w, 200, c)
+}
+
+// validateCombo enforces the multi-account contract: every member provider exists,
+// and any explicitly-chosen member model belongs to that provider's fetched pool
+// (empty model = provider default, always allowed). This prevents a combo from
+// silently pointing at a model the upstream doesn't expose.
+func (api *apiHandlers) validateCombo(c comboPayload) string {
+	for _, m := range c.Members {
+		p := api.d.Reg.GetProvider(m.ProviderID)
+		if p == nil {
+			return "unknown provider in members: " + m.ProviderID
+		}
+		if m.Model == "" {
+			continue
+		}
+		known := false
+		for _, pm := range p.Models {
+			if pm == m.Model {
+				known = true
+				break
+			}
+		}
+		if !known && len(p.Models) > 0 {
+			return fmt.Sprintf("model %q not in provider %q fetched pool", m.Model, p.ID)
+		}
+	}
+	return ""
 }
 
 func (api *apiHandlers) deleteCombo(w http.ResponseWriter, r *http.Request) {
@@ -537,6 +807,12 @@ func (api *apiHandlers) importSQL(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeErr(w, 500, err.Error())
 		}
+		return
+	}
+	// Self-heal legacy v1 dumps: synthesize default accounts/model entries where the
+	// dump only carried providers.auth_key/model (it predates the account pool).
+	if err := api.d.Store.FinalizeImport(r.Context()); err != nil {
+		writeErr(w, 500, "finalize import: "+err.Error())
 		return
 	}
 	api.reload()

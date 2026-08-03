@@ -46,7 +46,12 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("run schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if err := s.migrate(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -90,7 +95,25 @@ func (s *Store) ListProviders() ([]config.Provider, error) {
 		}
 		out = append(out, p)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	// Hydrate accounts + fetched model pool per provider in two batched queries
+	// rather than N*N round trips.
+	accounts, err := s.allProviderAccounts()
+	if err != nil {
+		return nil, err
+	}
+	models, err := s.allProviderModels()
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Accounts = accounts[out[i].ID]
+		out[i].Models = models[out[i].ID]
+	}
+	return out, nil
 }
 
 func (s *Store) GetProvider(id string) (*config.Provider, error) {
@@ -102,6 +125,16 @@ func (s *Store) GetProvider(id string) (*config.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	accts, err := s.providerAccounts(id)
+	if err != nil {
+		return nil, err
+	}
+	models, err := s.providerModels(id)
+	if err != nil {
+		return nil, err
+	}
+	p.Accounts = accts
+	p.Models = models
 	return &p, nil
 }
 
@@ -121,6 +154,131 @@ func (s *Store) UpsertProvider(p config.Provider) error {
 func (s *Store) DeleteProvider(id string) error {
 	_, err := s.db.Exec("DELETE FROM providers WHERE id = ?", id)
 	return err
+}
+
+// --- Provider accounts & models ---
+
+const accountCols = "id, provider_id, label, auth_key, enabled, position, weight"
+
+func scanAccount(row interface{ Scan(...any) error }) (config.Account, error) {
+	var a config.Account
+	var enabled int
+	err := row.Scan(&a.ID, &a.ProviderID, &a.Label, &a.AuthKey, &enabled, &a.Position, &a.Weight)
+	if err != nil {
+		return config.Account{}, err
+	}
+	a.Enabled = enabled != 0
+	return a, nil
+}
+
+func (s *Store) providerAccounts(providerID string) ([]config.Account, error) {
+	rows, err := s.db.Query("SELECT "+accountCols+" FROM provider_accounts WHERE provider_id = ? ORDER BY position, id", providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []config.Account{}
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) allProviderAccounts() (map[string][]config.Account, error) {
+	rows, err := s.db.Query("SELECT " + accountCols + " FROM provider_accounts ORDER BY provider_id, position, id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]config.Account{}
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[a.ProviderID] = append(out[a.ProviderID], a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) providerModels(providerID string) ([]string, error) {
+	rows, err := s.db.Query("SELECT model_id FROM provider_models WHERE provider_id = ? ORDER BY position, model_id", providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) allProviderModels() (map[string][]string, error) {
+	rows, err := s.db.Query("SELECT provider_id, model_id FROM provider_models ORDER BY provider_id, position, model_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var pid, m string
+		if err := rows.Scan(&pid, &m); err != nil {
+			return nil, err
+		}
+		out[pid] = append(out[pid], m)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceAccounts swaps the entire account pool for a provider atomically.
+func (s *Store) ReplaceAccounts(providerID string, accounts []config.Account) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM provider_accounts WHERE provider_id = ?", providerID); err != nil {
+		return fmt.Errorf("clear accounts: %w", err)
+	}
+	for i, a := range accounts {
+		if _, err := tx.Exec(`INSERT INTO provider_accounts
+			(id, provider_id, label, auth_key, enabled, position, weight)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			a.ID, providerID, a.Label, a.AuthKey, boolToInt(a.Enabled), i, max(a.Weight, 1)); err != nil {
+			return fmt.Errorf("insert account: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// ReplaceModels swaps the fetched model pool for a provider atomically.
+func (s *Store) ReplaceModels(providerID string, models []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM provider_models WHERE provider_id = ?", providerID); err != nil {
+		return fmt.Errorf("clear models: %w", err)
+	}
+	for i, m := range models {
+		if m == "" {
+			continue
+		}
+		if _, err := tx.Exec("INSERT INTO provider_models (provider_id, model_id, position) VALUES (?, ?, ?)", providerID, m, i); err != nil {
+			return fmt.Errorf("insert model: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // --- Combos ---
@@ -178,19 +336,19 @@ func (s *Store) GetCombo(id string) (*config.Combo, error) {
 	return &c, nil
 }
 
-func (s *Store) listComboMembers(comboID string) ([]string, error) {
-	rows, err := s.db.Query("SELECT provider_id FROM combo_members WHERE combo_id = ? ORDER BY position", comboID)
+func (s *Store) listComboMembers(comboID string) ([]config.ComboMember, error) {
+	rows, err := s.db.Query("SELECT provider_id, model FROM combo_members WHERE combo_id = ? ORDER BY position", comboID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []string{}
+	out := []config.ComboMember{}
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var m config.ComboMember
+		if err := rows.Scan(&m.ProviderID, &m.Model); err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }
@@ -210,8 +368,9 @@ func (s *Store) UpsertCombo(c config.Combo) error {
 	if _, err := tx.Exec("DELETE FROM combo_members WHERE combo_id = ?", c.ID); err != nil {
 		return fmt.Errorf("clear members: %w", err)
 	}
-	for i, pid := range c.Members {
-		if _, err := tx.Exec("INSERT INTO combo_members (combo_id, provider_id, position) VALUES (?, ?, ?)", c.ID, pid, i); err != nil {
+	for i, m := range c.Members {
+		if _, err := tx.Exec("INSERT INTO combo_members (combo_id, provider_id, model, position) VALUES (?, ?, ?, ?)",
+			c.ID, m.ProviderID, m.Model, i); err != nil {
 			return fmt.Errorf("insert member: %w", err)
 		}
 	}
@@ -411,4 +570,11 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

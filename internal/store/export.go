@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -34,6 +35,8 @@ func (s *Store) ExportSQL() (string, error) {
 	// Delete in FK-safe order: child first.
 	b.WriteString("DELETE FROM combo_members;\n")
 	b.WriteString("DELETE FROM combos;\n")
+	b.WriteString("DELETE FROM provider_models;\n")
+	b.WriteString("DELETE FROM provider_accounts;\n")
 	b.WriteString("DELETE FROM providers;\n")
 	b.WriteString("DELETE FROM settings;\n\n")
 
@@ -50,6 +53,43 @@ func (s *Store) ExportSQL() (string, error) {
 				b.WriteString(",\n")
 			}
 		}
+
+		// Accounts & fetched model pool.
+		first := true
+		for _, p := range provs {
+			for pos, a := range p.Accounts {
+				if first {
+					b.WriteString("INSERT INTO provider_accounts (id, provider_id, label, auth_key, enabled, position, weight) VALUES\n")
+					first = false
+				} else {
+					b.WriteString(",\n")
+				}
+				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %d, %d, %d)",
+					q(a.ID), q(p.ID), q(a.Label), q(a.AuthKey),
+					boolToInt(a.Enabled), pos, max(a.Weight, 1))
+			}
+		}
+		if !first {
+			b.WriteString(";\n\n")
+		}
+		first = true
+		for _, p := range provs {
+			for pos, m := range p.Models {
+				if m == "" {
+					continue
+				}
+				if first {
+					b.WriteString("INSERT INTO provider_models (provider_id, model_id, position) VALUES\n")
+					first = false
+				} else {
+					b.WriteString(",\n")
+				}
+				fmt.Fprintf(&b, "  (%s, %s, %d)", q(p.ID), q(m), pos)
+			}
+		}
+		if !first {
+			b.WriteString(";\n\n")
+		}
 	}
 	if len(combos) > 0 {
 		b.WriteString("INSERT INTO combos (id, display_name, rotation, enabled) VALUES\n")
@@ -61,17 +101,17 @@ func (s *Store) ExportSQL() (string, error) {
 				b.WriteString(",\n")
 			}
 		}
-		// Members.
+		// Members with per-member model selection.
 		first := true
 		for _, c := range combos {
-			for pos, pid := range c.Members {
+			for pos, m := range c.Members {
 				if first {
-					b.WriteString("INSERT INTO combo_members (combo_id, provider_id, position) VALUES\n")
+					b.WriteString("INSERT INTO combo_members (combo_id, provider_id, model, position) VALUES\n")
 					first = false
 				} else {
 					b.WriteString(",\n")
 				}
-				fmt.Fprintf(&b, "  (%s, %s, %d)", q(c.ID), q(pid), pos)
+				fmt.Fprintf(&b, "  (%s, %s, %s, %d)", q(c.ID), q(m.ProviderID), q(m.Model), pos)
 			}
 		}
 		if !first {
@@ -146,6 +186,60 @@ func (s *Store) ImportSQL(sqlText string) error {
 		}
 		if _, err := tx.Exec(st); err != nil {
 			return fmt.Errorf("execute statement %q: %w", trunc(st, 60), err)
+		}
+	}
+	return tx.Commit()
+}
+
+// FinalizeImport synchronizes derived tables after an import: for any provider row
+// lacking provider_accounts (a v1 legacy dump), synthesize a default account from
+// auth_key; likewise seed provider_models from provider.model if the fetched pool
+// came in empty. This keeps imports self-healing without needing the provider row
+// to carry account/model info itself.
+func (s *Store) FinalizeImport(ctx context.Context) error {
+	provRows, err := s.db.QueryContext(ctx, `SELECT id, auth_key, model FROM providers`)
+	if err != nil {
+		return err
+	}
+	type row struct{ id, key, model string }
+	var rows []row
+	for provRows.Next() {
+		var r row
+		if err := provRows.Scan(&r.id, &r.key, &r.model); err != nil {
+			provRows.Close()
+			return err
+		}
+		rows = append(rows, r)
+	}
+	provRows.Close()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, r := range rows {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_accounts WHERE provider_id = ?`, r.id).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 && r.key != "" {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO provider_accounts (id, provider_id, label, auth_key, enabled, position, weight)
+				 VALUES (?, ?, ?, ?, 1, 0, 1)`,
+				r.id+":default", r.id, "default", r.key); err != nil {
+				return fmt.Errorf("synthesize account for %q: %w", r.id, err)
+			}
+		}
+		var m int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_models WHERE provider_id = ?`, r.id).Scan(&m); err != nil {
+			return err
+		}
+		if m == 0 && r.model != "" {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO provider_models (provider_id, model_id, position) VALUES (?, ?, 0)`,
+				r.id, r.model); err != nil {
+				return fmt.Errorf("synthesize model for %q: %w", r.id, err)
+			}
 		}
 	}
 	return tx.Commit()

@@ -12,19 +12,19 @@ import (
 type rotationPlan struct {
 	comboID  string
 	rotation config.RotationPolicy
-	members  []string
+	members  []config.ComboMember
 	endpoint string
 }
 
 func (p *Proxy) newRotationPlan(combo *config.Combo, endpoint string) *rotationPlan {
-	// Prefer members that support this endpoint.
-	members := make([]string, 0, len(combo.Members))
-	for _, pid := range combo.Members {
-		prov := p.registry.GetProvider(pid)
+	// Keep enabled members that support this endpoint (provider-level check).
+	members := make([]config.ComboMember, 0, len(combo.Members))
+	for _, m := range combo.Members {
+		prov := p.registry.GetProvider(m.ProviderID)
 		if prov == nil || !prov.Enabled {
 			continue
 		}
-		members = append(members, pid)
+		members = append(members, m)
 	}
 	return &rotationPlan{
 		comboID:  combo.ID,
@@ -34,23 +34,23 @@ func (p *Proxy) newRotationPlan(combo *config.Combo, endpoint string) *rotationP
 	}
 }
 
-// next selects the next provider ID to try, returning "" when exhausted.
-func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool) string {
-	eligible := func(pid string) bool {
-		if tried[pid] {
+// next selects the next combo member (provider+model) to try, returning nil when exhausted.
+func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool) *config.ComboMember {
+	eligible := func(m config.ComboMember) bool {
+		if tried[m.ProviderID] {
 			return false
 		}
-		if !reg.Health().IsAvailable(pid) {
+		if !reg.Health().IsAvailable(m.ProviderID) {
 			return false
 		}
-		if !reg.Health().SupportsEndpoint(pid, rp.endpoint) {
+		if !reg.Health().SupportsEndpoint(m.ProviderID, rp.endpoint) {
 			return false
 		}
 		return true
 	}
 
-	available := func() []string {
-		out := []string{}
+	available := func() []config.ComboMember {
+		out := []config.ComboMember{}
 		for _, m := range rp.members {
 			if eligible(m) {
 				out = append(out, m)
@@ -63,15 +63,15 @@ func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool) stri
 	case config.Random:
 		avail := available()
 		if len(avail) == 0 {
-			return ""
+			return nil
 		}
 		// Weight-aware random (#10): providers with higher weight are picked more
 		// often, proportionally. Falls back to uniform when no member has weight>0.
 		totalWeight := 0
 		weights := make([]int64, len(avail))
-		for i, pid := range avail {
+		for i, m := range avail {
 			w := int64(1)
-			if prov := reg.GetProvider(pid); prov != nil && prov.Weight > 0 {
+			if prov := reg.GetProvider(m.ProviderID); prov != nil && prov.Weight > 0 {
 				w = int64(prov.Weight)
 			}
 			weights[i] = w
@@ -81,44 +81,60 @@ func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool) stri
 		if totalWeight <= 0 {
 			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(avail))))
 			if err != nil {
-				return avail[0]
+				return &avail[0]
 			}
-			return avail[n.Int64()]
+			return &avail[n.Int64()]
 		}
 		n, err := rand.Int(rand.Reader, big.NewInt(int64(totalWeight)))
 		if err != nil {
-			return avail[0]
+			return &avail[0]
 		}
 		r := n.Int64()
 		for i, w := range weights {
 			if r < w {
-				return avail[i]
+				return &avail[i]
 			}
 			r -= w
 		}
-		return avail[len(avail)-1]
+		return &avail[len(avail)-1]
 
 	case config.WeightedRoundRobin:
 		// Smooth WRR via registry state.
-		return reg.SelectWRR(rp.comboID, eligible)
+		pid := reg.SelectWRR(rp.comboID, func(pid string) bool {
+			for _, m := range rp.members {
+				if m.ProviderID == pid {
+					return eligible(m)
+				}
+			}
+			return false
+		})
+		if pid == "" {
+			return nil
+		}
+		for i := range rp.members {
+			if rp.members[i].ProviderID == pid {
+				return &rp.members[i]
+			}
+		}
+		return nil
 
 	case config.Priority:
 		// Members are already in position order.
-		for _, m := range rp.members {
-			if eligible(m) {
-				return m
+		for i := range rp.members {
+			if eligible(rp.members[i]) {
+				return &rp.members[i]
 			}
 		}
-		return ""
+		return nil
 
 	case config.RoundRobin:
 		fallthrough
 	default:
 		avail := available()
 		if len(avail) == 0 {
-			return ""
+			return nil
 		}
 		n := reg.IncrementRR(rp.comboID)
-		return avail[int(n%int64(len(avail)))]
+		return &avail[int(n%int64(len(avail)))]
 	}
 }
