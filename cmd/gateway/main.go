@@ -46,6 +46,10 @@ func run() error {
 		return fmt.Errorf("load registry: %w", err)
 	}
 	px := proxy.New(reg, st, env.RequestTimeout)
+	if len(env.ModelAliases) > 0 {
+		px.SetModelAliases(env.ModelAliases)
+		slog.Info("model aliases installed", "count", len(env.ModelAliases))
+	}
 
 	a := &app{env: env, store: st, reg: reg, px: px}
 

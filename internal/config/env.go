@@ -8,13 +8,14 @@ import (
 )
 
 type Env struct {
-	APIKey           string
+	APIKey            string
 	DashboardPassword string
-	DashboardSecret  string
-	Listen           string
-	LogLevel         string
-	DBPath           string
-	RequestTimeout   time.Duration
+	DashboardSecret   string
+	Listen            string
+	LogLevel          string
+	DBPath            string
+	RequestTimeout    time.Duration
+	ModelAliases      map[string]string
 }
 
 func LoadEnv() (*Env, error) {
@@ -47,7 +48,33 @@ func LoadEnv() (*Env, error) {
 	} else {
 		e.RequestTimeout = 60 * time.Second
 	}
+	// MODEL_ALIASES: comma-separated incoming=target pairs. When a client sends a
+	// model name that matches neither a provider nor a combo (common with agents
+	// that default the model to their provider's name, e.g. "vercel"), the left-hand
+	// name routes to the combo/provider on the right. Exact names always win —
+	// aliases are a fallback only.
+	if raw := os.Getenv("MODEL_ALIASES"); raw != "" {
+		m, err := parseAliases(raw)
+		if err != nil {
+			return nil, err
+		}
+		e.ModelAliases = m
+	}
 	return e, nil
+}
+
+// parseAliases parses "a=x, b=y" into map[a]x, map[b]y, validating every pair.
+func parseAliases(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		lhs, rhs, found := strings.Cut(pair, "=")
+		lhs, rhs = strings.TrimSpace(lhs), strings.TrimSpace(rhs)
+		if !found || lhs == "" || rhs == "" {
+			return nil, fmt.Errorf("MODEL_ALIASES entry %q must be incoming=target", strings.TrimSpace(pair))
+		}
+		out[lhs] = rhs
+	}
+	return out, nil
 }
 
 func getEnv(key, fallback string) string {

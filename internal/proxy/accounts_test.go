@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"llm-gateway/internal/config"
+	"llm-gateway/internal/registry"
 )
 
 // TestAlternatingKeysAcrossRequests: one provider with two accounts; successive
@@ -407,6 +409,104 @@ func TestPinnedSiblingFallthrough(t *testing.T) {
 	}
 }
 
+// TestModelAliasesRouteUnknownNames emulates agents that send their provider's
+// name as the model (observed with ironclaw/openclaw): with the alias installed
+// the request routes through; without it, a 404 keeps exact names authoritative.
+func TestModelAliasesRouteUnknownNames(t *testing.T) {
+	var mu sync.Mutex
+	var gotModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		mu.Lock()
+		gotModel = b.Model
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"model":"` + b.Model + `","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "vercel", BaseURL: upstream.URL, Model: "gpt-upstream", Weight: 1, Enabled: true,
+		Accounts: []config.Account{{ID: "vercel:k", ProviderID: "vercel", AuthKey: "key", Enabled: true, Weight: 1}}}}
+	px, st, _ := newTestStack(t, upstream, provs, nil)
+	if err := px.registry.Reload(st); err != nil {
+		t.Fatal(err)
+	}
+	px.SetModelAliases(map[string]string{"ironclaw": "vercel"})
+
+	call := func(model string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+			`{"model":"`+model+`","messages":[],"stream":false}`))
+		rec := httptest.NewRecorder()
+		px.ServeHTTP(rec, req, "chat.completions")
+		return rec
+	}
+
+	if rec := call("ironclaw"); rec.Code != 200 {
+		t.Fatalf("aliased model must route, got %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	if gotModel != "gpt-upstream" {
+		t.Fatalf("upstream should receive the provider's model, got %q", gotModel)
+	}
+	mu.Unlock()
+
+	if rec := call("unaliased-name"); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown names without an alias must stay 404, got %d", rec.Code)
+	}
+	if rec := call("vercel"); rec.Code != 200 {
+		t.Fatalf("exact provider names must keep working, got %d", rec.Code)
+	}
+}
+
+// TestModelAliasCyclesDeterministic: chains resolve until a concrete provider
+// (b-alias → a → b works), and alias-only loops/self-references 404 cleanly
+// instead of spinning.
+func TestModelAliasCyclesDeterministic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"model":"m","choices":[]}`))
+	}))
+	defer upstream.Close()
+	provs := []config.Provider{{ID: "b", BaseURL: upstream.URL, Model: "m", Weight: 1, Enabled: true,
+		Accounts: []config.Account{{ID: "b:k", ProviderID: "b", AuthKey: "key", Enabled: true, Weight: 1}}}}
+	px, st, _ := newTestStack(t, upstream, provs, nil)
+	if err := px.registry.Reload(st); err != nil {
+		t.Fatal(err)
+	}
+	px.SetModelAliases(map[string]string{
+		"a":       "b",
+		"b-alias": "a", // chain: lands on real provider b
+		"x":       "y",
+		"y":       "x",    // pure alias loop, no concrete target
+		"loop":    "loop", // self-reference
+	})
+
+	call := func(model string) int {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+			`{"model":"`+model+`","messages":[],"stream":false}`))
+		rec := httptest.NewRecorder()
+		px.ServeHTTP(rec, req, "chat.completions")
+		return rec.Code
+	}
+	if code := call("a"); code != 200 {
+		t.Fatalf("a should resolve to provider b, got %d", code)
+	}
+	if code := call("b-alias"); code != 200 {
+		t.Fatalf("b-alias should chain to provider b, got %d", code)
+	}
+	if code := call("x"); code != http.StatusNotFound {
+		t.Fatalf("alias-only loop must 404, got %d", code)
+	}
+	if code := call("loop"); code != http.StatusNotFound {
+		t.Fatalf("self-alias must 404, got %d", code)
+	}
+}
+
 // TestAccountCooldownFallsToSibling: key-1 starts returning 429; the SAME request
 // must immediately retry key-2 and succeed, while key-1 enters cooldown.
 func TestAccountCooldownFallsToSibling(t *testing.T) {
@@ -481,4 +581,63 @@ func TestAccountCooldownFallsToSibling(t *testing.T) {
 		t.Fatal("key-2 should stay available")
 	}
 	time.Sleep(0) // allow cooldown goroutines to settle
+}
+
+// TestProviderNameModelWithToolsAndStreaming replicates the ironclaw request
+// pattern: client addresses the gateway provider by name ("vercel") with a
+// tools payload + streaming, while the provider rewrites to a slug upstream
+// model. The gateway must route this, not 404 — if ironclaw gets 404s, the
+// request it actually sends differs from what this test sends.
+func TestProviderNameModelWithToolsAndStreaming(t *testing.T) {
+	var mu sync.Mutex
+	var gotModel string
+	var gotTools bool
+	var gotRaw []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var b map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &b)
+		var model string
+		_ = json.Unmarshal(b["model"], &model)
+		mu.Lock()
+		gotModel = model
+		_, gotTools = b["tools"]
+		gotRaw = raw
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: {\"choices\":[]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "vercel", BaseURL: upstream.URL,
+		Model: "meta/muse-spark-1.2-contributor", Weight: 1, Enabled: true,
+		Accounts: []config.Account{
+			{ID: "vercel:k1", ProviderID: "vercel", AuthKey: "k1", Enabled: true, Weight: 1},
+			{ID: "vercel:k2", ProviderID: "vercel", AuthKey: "k2", Enabled: true, Weight: 1},
+			{ID: "vercel:k3", ProviderID: "vercel", AuthKey: "k3", Enabled: true, Weight: 1},
+			{ID: "vercel:k4", ProviderID: "vercel", AuthKey: "k4", Enabled: true, Weight: 1},
+		}}}
+	px, st, _ := newTestStack(t, upstream, provs, nil)
+	if err := px.registry.Reload(st); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"vercel","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"builtin__echo","parameters":{}}}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req, registry.EndpointChatCompletions)
+
+	if rec.Code != 200 {
+		t.Fatalf("provider-name model with tools+stream must route (not 404), got %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotModel != "meta/muse-spark-1.2-contributor" {
+		t.Fatalf("upstream must receive the rewritten slug, got model=%q body=%s", gotModel, gotRaw)
+	}
+	if !gotTools {
+		t.Fatal("tools array must be forwarded to the upstream untouched")
+	}
 }

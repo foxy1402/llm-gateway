@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,9 @@ type Proxy struct {
 	store    *store.Store
 	client   *http.Client
 	timeout  time.Duration
+	// modelAliases maps names clients might send that match no provider/combo to
+	// the name of the provider/combo that should actually serve the request.
+	modelAliases map[string]string
 }
 
 func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy {
@@ -56,6 +60,9 @@ func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy 
 		timeout:  timeout,
 	}
 }
+
+// SetModelAliases installs the client-name → route fallback map (MODEL_ALIASES).
+func (p *Proxy) SetModelAliases(m map[string]string) { p.modelAliases = m }
 
 // peekInfo extracts routing fields without consuming more than the header JSON.
 type peekInfo struct {
@@ -100,16 +107,30 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		return
 	}
 
-	// Resolve the caller-facing model to a combo or provider.
-	combo := p.registry.GetCombo(info.Model)
-	if combo != nil && !combo.Enabled {
-		combo = nil
-	}
-	provider := p.registry.GetProvider(info.Model)
-
-	if combo == nil && provider == nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("model %q not found", info.Model), "invalid_request_error")
-		return
+	// Resolve the caller-facing model to a combo or provider, following MODEL_ALIASES
+	// fallbacks when the name matches nothing concrete. Providers/combos always win
+	// over aliases, and alias cycles resolve deterministically rather than looping.
+	var aliasChain []string
+	var combo *config.Combo
+	var provider *config.Provider
+	lookup := info.Model
+	for {
+		combo = p.registry.GetCombo(lookup)
+		if combo != nil && !combo.Enabled {
+			combo = nil
+		}
+		provider = p.registry.GetProvider(lookup)
+		if combo != nil || provider != nil {
+			break
+		}
+		target, ok := p.modelAliases[lookup]
+		if !ok || target == lookup || slices.Contains(aliasChain, lookup) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("model %q not found", info.Model), "invalid_request_error")
+			return
+		}
+		slog.Info("model alias applied", "from", lookup, "to", target)
+		aliasChain = append(aliasChain, lookup)
+		lookup = target
 	}
 
 	// Embeddings bypass combos: the model must be a direct provider.
