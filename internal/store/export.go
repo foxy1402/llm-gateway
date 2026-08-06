@@ -59,13 +59,13 @@ func (s *Store) ExportSQL() (string, error) {
 		for _, p := range provs {
 			for pos, a := range p.Accounts {
 				if first {
-					b.WriteString("INSERT INTO provider_accounts (id, provider_id, label, auth_key, enabled, position, weight) VALUES\n")
+					b.WriteString("INSERT INTO provider_accounts (id, provider_id, label, auth_key, model, enabled, position, weight) VALUES\n")
 					first = false
 				} else {
 					b.WriteString(",\n")
 				}
-				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %d, %d, %d)",
-					q(a.ID), q(p.ID), q(a.Label), q(a.AuthKey),
+				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %d, %d)",
+					q(a.ID), q(p.ID), q(a.Label), q(a.AuthKey), q(a.Model),
 					boolToInt(a.Enabled), pos, max(a.Weight, 1))
 			}
 		}
@@ -101,17 +101,22 @@ func (s *Store) ExportSQL() (string, error) {
 				b.WriteString(",\n")
 			}
 		}
-		// Members with per-member model selection.
+		// Members with per-member account + model pins. Empty account pin exports as
+		// NULL (the in-DB representation of "rotate across keys").
 		first := true
 		for _, c := range combos {
 			for pos, m := range c.Members {
 				if first {
-					b.WriteString("INSERT INTO combo_members (combo_id, provider_id, model, position) VALUES\n")
+					b.WriteString("INSERT INTO combo_members (combo_id, provider_id, account_id, model, position) VALUES\n")
 					first = false
 				} else {
 					b.WriteString(",\n")
 				}
-				fmt.Fprintf(&b, "  (%s, %s, %s, %d)", q(c.ID), q(m.ProviderID), q(m.Model), pos)
+				acct := "NULL"
+				if m.AccountID != "" {
+					acct = q(m.AccountID)
+				}
+				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %d)", q(c.ID), q(m.ProviderID), acct, q(m.Model), pos)
 			}
 		}
 		if !first {

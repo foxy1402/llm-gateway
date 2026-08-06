@@ -11,6 +11,10 @@ type Account struct {
 	Enabled    bool   `json:"enabled"`
 	Position   int    `json:"position"`
 	Weight     int    `json:"weight"` // >1 favored by weight-aware account rotation
+	// Model optionally pins this key to one upstream model (aggregator endpoints
+	// like Vercel AI Gateway / OpenRouter where every key can call many models).
+	// Empty = fall back to the combo member model, then the provider default.
+	Model string `json:"model,omitempty"`
 }
 
 // Provider is an upstream endpoint plus the pool of accounts and known models the
@@ -41,11 +45,13 @@ const (
 	Random             RotationPolicy = "random"
 )
 
-// ComboMember binds one provider to one upstream model for routing. Model is the
-// provider-side model ID selected from Provider.Models at save time; an empty
-// Model means "use the provider's configured Model" (legacy behavior).
+// ComboMember binds routing to one specific upstream shape: provider + key + model.
+// AccountID pins the member to one account of the provider (empty = rotate across
+// all keys of that provider). Model overrides the account's own model pin; an empty
+// Model means "use the pinned/rotated account's model, else the provider default".
 type ComboMember struct {
 	ProviderID string `json:"provider_id"`
+	AccountID  string `json:"account_id"`
 	Model      string `json:"model"`
 }
 

@@ -19,3 +19,7 @@ Thumbs.db
 *.out
 *.test
 coverage.txt
+
+# Smoke test runtime artifacts (keep the scripts/harness tracked)
+smoke/*.log
+smoke/_*

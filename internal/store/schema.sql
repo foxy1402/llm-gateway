@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS provider_accounts (
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
     label       TEXT NOT NULL DEFAULT '',
     auth_key    TEXT NOT NULL,
+    model       TEXT NOT NULL DEFAULT '',
     enabled     INTEGER NOT NULL DEFAULT 1,
     position    INTEGER NOT NULL DEFAULT 0,
     weight      INTEGER NOT NULL DEFAULT 1,
@@ -42,12 +43,17 @@ CREATE TABLE IF NOT EXISTS combos (
     created_at   INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- combo_members: each row pins one provider (+ optionally one account key + model).
+-- account_id NULL means rotate across all of the provider's keys; ON DELETE SET NULL
+-- falls back to key rotation when the pinned account is removed. Members are always
+-- rewritten with sequential positions on save, so (combo_id, position) is the PK.
 CREATE TABLE IF NOT EXISTS combo_members (
     combo_id    TEXT NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    account_id  TEXT REFERENCES provider_accounts(id) ON DELETE SET NULL,
     model       TEXT NOT NULL DEFAULT '',
     position    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (combo_id, provider_id, model)
+    PRIMARY KEY (combo_id, position)
 );
 
 CREATE TABLE IF NOT EXISTS request_log (

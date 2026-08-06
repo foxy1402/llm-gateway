@@ -66,7 +66,7 @@ func TestRoundRobin(t *testing.T) {
 	plan := planFor(px, &combo, registry.EndpointChatCompletions)
 	counts := map[string]int{}
 	for i := 0; i < 30; i++ {
-		counts[pidOf(plan.next(reg, map[string]bool{}))]++
+		counts[pidOf(plan.next(reg, map[string]bool{}, map[string]bool{}))]++
 	}
 	if counts["a"] != 10 || counts["b"] != 10 || counts["c"] != 10 {
 		t.Fatalf("round robin counts: %v", counts)
@@ -82,7 +82,7 @@ func TestPriority(t *testing.T) {
 	px, reg := setupRotationEnv(t, provs, combo)
 	plan := planFor(px, &combo, registry.EndpointChatCompletions)
 	for i := 0; i < 5; i++ {
-		if pid := pidOf(plan.next(reg, map[string]bool{})); pid != "a" {
+		if pid := pidOf(plan.next(reg, map[string]bool{}, map[string]bool{})); pid != "a" {
 			t.Fatalf("priority: got %q", pid)
 		}
 	}
@@ -98,7 +98,7 @@ func TestWeightedRoundRobin(t *testing.T) {
 	plan := planFor(px, &combo, registry.EndpointChatCompletions)
 	counts := map[string]int{}
 	for i := 0; i < 60; i++ {
-		counts[pidOf(plan.next(reg, map[string]bool{}))]++
+		counts[pidOf(plan.next(reg, map[string]bool{}, map[string]bool{}))]++
 	}
 	if counts["heavy"] != 40 || counts["light"] != 20 {
 		t.Fatalf("WRR counts: %v", counts)
@@ -115,7 +115,7 @@ func TestCooldown(t *testing.T) {
 	reg.Health().Configure(60, []int{429})
 	reg.Health().RecordFailure("a", 429)
 	plan := planFor(px, &combo, registry.EndpointChatCompletions)
-	if pid := pidOf(plan.next(reg, map[string]bool{})); pid != "b" {
+	if pid := pidOf(plan.next(reg, map[string]bool{}, map[string]bool{})); pid != "b" {
 		t.Fatalf("expected b while a is cooling down, got %q", pid)
 	}
 }
@@ -131,7 +131,7 @@ func TestRandomCoversAll(t *testing.T) {
 	plan := planFor(px, &combo, registry.EndpointChatCompletions)
 	seen := map[string]bool{}
 	for i := 0; i < 200; i++ {
-		seen[pidOf(plan.next(reg, map[string]bool{}))] = true
+		seen[pidOf(plan.next(reg, map[string]bool{}, map[string]bool{}))] = true
 	}
 	if len(seen) != 3 {
 		t.Fatalf("random never selected all providers: %v", seen)
@@ -150,7 +150,7 @@ func TestRandomRespectsWeights(t *testing.T) {
 	counts := map[string]int{}
 	const trials = 5000
 	for i := 0; i < trials; i++ {
-		counts[pidOf(plan.next(reg, map[string]bool{}))]++
+		counts[pidOf(plan.next(reg, map[string]bool{}, map[string]bool{}))]++
 	}
 	if counts["heavy"] < int(0.75*trials) {
 		t.Fatalf("heavy weight=9 got only %d/%d picks; weights ignored", counts["heavy"], trials)
@@ -170,11 +170,11 @@ func TestTriedSetExclusion(t *testing.T) {
 	plan := planFor(px, &combo, registry.EndpointChatCompletions)
 
 	tried := map[string]bool{"a": true}
-	if pid := pidOf(plan.next(reg, tried)); pid != "b" {
+	if pid := pidOf(plan.next(reg, tried, nil)); pid != "b" {
 		t.Fatalf("expected b after a tried, got %q", pid)
 	}
 	tried["b"] = true
-	if m := plan.next(reg, tried); m != nil {
+	if m := plan.next(reg, tried, nil); m != nil {
 		t.Fatalf("expected exhausted, got %q", m.ProviderID)
 	}
 }
@@ -191,11 +191,11 @@ func TestUnsupportedEndpointSkipped(t *testing.T) {
 	reg.Health().MarkUnsupportedCompletions("a")
 
 	plan := planFor(px, &combo, registry.EndpointCompletions)
-	if pid := pidOf(plan.next(reg, map[string]bool{})); pid != "b" {
+	if pid := pidOf(plan.next(reg, map[string]bool{}, map[string]bool{})); pid != "b" {
 		t.Fatalf("expected b (a unsupported), got %q", pid)
 	}
 	planChat := planFor(px, &combo, registry.EndpointChatCompletions)
-	if pid := pidOf(planChat.next(reg, map[string]bool{})); pid != "a" {
+	if pid := pidOf(planChat.next(reg, map[string]bool{}, nil)); pid != "a" {
 		t.Fatalf("expected a for chat.completions, got %q", pid)
 	}
 }

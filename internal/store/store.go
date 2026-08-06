@@ -47,10 +47,6 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("run schema: %w", err)
 	}
 	s := &Store{db: db}
-	if err := s.migrate(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
-	}
 	return s, nil
 }
 
@@ -158,12 +154,12 @@ func (s *Store) DeleteProvider(id string) error {
 
 // --- Provider accounts & models ---
 
-const accountCols = "id, provider_id, label, auth_key, enabled, position, weight"
+const accountCols = "id, provider_id, label, auth_key, model, enabled, position, weight"
 
 func scanAccount(row interface{ Scan(...any) error }) (config.Account, error) {
 	var a config.Account
 	var enabled int
-	err := row.Scan(&a.ID, &a.ProviderID, &a.Label, &a.AuthKey, &enabled, &a.Position, &a.Weight)
+	err := row.Scan(&a.ID, &a.ProviderID, &a.Label, &a.AuthKey, &a.Model, &enabled, &a.Position, &a.Weight)
 	if err != nil {
 		return config.Account{}, err
 	}
@@ -239,22 +235,56 @@ func (s *Store) allProviderModels() (map[string][]string, error) {
 	return out, rows.Err()
 }
 
-// ReplaceAccounts swaps the entire account pool for a provider atomically.
+// ReplaceAccounts swaps the account pool for a provider atomically. The swap is
+// diff-based rather than delete-all: rows whose ID survives the edit are updated
+// in place, so combo_members.account_id pins (ON DELETE SET NULL) are cleared
+// only when a key is genuinely removed — a rename/disable/weight tweak keeps
+// every pin intact.
 func (s *Store) ReplaceAccounts(providerID string, accounts []config.Account) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM provider_accounts WHERE provider_id = ?", providerID); err != nil {
-		return fmt.Errorf("clear accounts: %w", err)
+
+	keep := make(map[string]bool, len(accounts))
+	for _, a := range accounts {
+		keep[a.ID] = true
+	}
+	rows, err := tx.Query("SELECT id FROM provider_accounts WHERE provider_id = ?", providerID)
+	if err != nil {
+		return fmt.Errorf("list accounts: %w", err)
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan account: %w", err)
+		}
+		if !keep[id] {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, id := range stale {
+		if _, err := tx.Exec("DELETE FROM provider_accounts WHERE id = ?", id); err != nil {
+			return fmt.Errorf("delete account %q: %w", id, err)
+		}
 	}
 	for i, a := range accounts {
 		if _, err := tx.Exec(`INSERT INTO provider_accounts
-			(id, provider_id, label, auth_key, enabled, position, weight)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			a.ID, providerID, a.Label, a.AuthKey, boolToInt(a.Enabled), i, max(a.Weight, 1)); err != nil {
-			return fmt.Errorf("insert account: %w", err)
+			(id, provider_id, label, auth_key, model, enabled, position, weight)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				label = excluded.label, auth_key = excluded.auth_key, model = excluded.model,
+				enabled = excluded.enabled, position = excluded.position, weight = excluded.weight`,
+			a.ID, providerID, a.Label, a.AuthKey, a.Model, boolToInt(a.Enabled), i, max(a.Weight, 1)); err != nil {
+			return fmt.Errorf("upsert account: %w", err)
 		}
 	}
 	return tx.Commit()
@@ -337,7 +367,7 @@ func (s *Store) GetCombo(id string) (*config.Combo, error) {
 }
 
 func (s *Store) listComboMembers(comboID string) ([]config.ComboMember, error) {
-	rows, err := s.db.Query("SELECT provider_id, model FROM combo_members WHERE combo_id = ? ORDER BY position", comboID)
+	rows, err := s.db.Query("SELECT provider_id, COALESCE(account_id, ''), model FROM combo_members WHERE combo_id = ? ORDER BY position", comboID)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +375,7 @@ func (s *Store) listComboMembers(comboID string) ([]config.ComboMember, error) {
 	out := []config.ComboMember{}
 	for rows.Next() {
 		var m config.ComboMember
-		if err := rows.Scan(&m.ProviderID, &m.Model); err != nil {
+		if err := rows.Scan(&m.ProviderID, &m.AccountID, &m.Model); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -369,8 +399,14 @@ func (s *Store) UpsertCombo(c config.Combo) error {
 		return fmt.Errorf("clear members: %w", err)
 	}
 	for i, m := range c.Members {
-		if _, err := tx.Exec("INSERT INTO combo_members (combo_id, provider_id, model, position) VALUES (?, ?, ?, ?)",
-			c.ID, m.ProviderID, m.Model, i); err != nil {
+		// Empty pin must be written as NULL: '' is not a NULL for the FK to
+		// provider_accounts(id) and would be rejected (no account has an empty ID).
+		var accountID any
+		if m.AccountID != "" {
+			accountID = m.AccountID
+		}
+		if _, err := tx.Exec("INSERT INTO combo_members (combo_id, provider_id, account_id, model, position) VALUES (?, ?, ?, ?, ?)",
+			c.ID, m.ProviderID, accountID, m.Model, i); err != nil {
 			return fmt.Errorf("insert member: %w", err)
 		}
 	}

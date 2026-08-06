@@ -34,9 +34,22 @@ func (p *Proxy) newRotationPlan(combo *config.Combo, endpoint string) *rotationP
 	}
 }
 
-// next selects the next combo member (provider+model) to try, returning nil when exhausted.
-func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool) *config.ComboMember {
+// memberKey identifies a member within one request/rotation plan for burn
+// tracking: identical (provider, account, model) triples route identically, so
+// burning one legitimately burns the other.
+func memberKey(m config.ComboMember) string {
+	return m.ProviderID + "|" + m.AccountID + "|" + m.Model
+}
+
+// next selects the next combo member (provider+model) to try, returning nil when
+// exhausted. `tried` blocks whole providers whose session is over for this request;
+// `triedMembers` blocks individual pinned members whose key already failed — a
+// same-provider sibling pinned to a different key must stay reachable.
+func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool, triedMembers map[string]bool) *config.ComboMember {
 	eligible := func(m config.ComboMember) bool {
+		if triedMembers[memberKey(m)] {
+			return false
+		}
 		if tried[m.ProviderID] {
 			return false
 		}

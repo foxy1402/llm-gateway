@@ -312,6 +312,23 @@ func (r *Registry) NextAccount(p *config.Provider, health *HealthTracker, skip m
 	return picks[n%len(picks)], true
 }
 
+// PinnedAccount resolves an explicit account pin (combo member → account ID) with
+// the same eligibility rules as NextAccount: the account must exist, be enabled,
+// not already tried this request, and not be in cooldown. ok=false means the
+// Member can't be served right now — the caller should rotate to the next member.
+func (r *Registry) PinnedAccount(p *config.Provider, accountID string, health *HealthTracker, skip map[string]bool) (config.Account, bool) {
+	for _, a := range p.Accounts {
+		if a.ID != accountID {
+			continue
+		}
+		if !a.Enabled || skip[a.ID] || !health.IsAccountAvailable(p.ID, a.ID) {
+			return config.Account{}, false
+		}
+		return a, true
+	}
+	return config.Account{}, false
+}
+
 // AccountsForLog renders the set of enabled accounts for diagnostics.
 func (r *Registry) AccountsForLog(providerID string) []string {
 	p := r.GetProvider(providerID)

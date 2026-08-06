@@ -256,8 +256,10 @@ function showProviderForm(id) {
         </div>
       </div>
       <div>
-        <label>Accounts (API keys) — rotation spreads requests across them; one burned key keeps the pool alive</label>
+        <label>Accounts (API keys) — rotation spreads requests across them; one burned key keeps the pool alive.
+        Set a model on an account to pin that key to one upstream model (e.g. key1 → kimi, key2 → qwen on the same gateway); empty = provider/member model.</label>
         <div id="accountList"></div>
+        <datalist id="acctModelPool"></datalist>
         <button type="button" class="btn sm ghost" id="addAccountBtn">+ Add account</button>
       </div>
       <div class="row" style="margin-top:6px">
@@ -270,41 +272,53 @@ function showProviderForm(id) {
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelProviderForm()">Cancel</button></div>
     </form></div>`;
   $('#fetchModelsBtn').addEventListener('click', fetchUpstreamModels);
+  fillAcctModelPool(p.models || []);
   accounts.forEach(a => addAccountRow(a));
-  $('#addAccountBtn').addEventListener('click', () => addAccountRow({ label: '', auth_key: '', weight: 1, enabled: true }));
+  $('#addAccountBtn').addEventListener('click', () => addAccountRow({ label: '', auth_key: '', model: '', weight: 1, enabled: true }));
   $('#providerForm').scrollIntoView({ behavior: 'smooth' });
 }
 
-// addAccountRow appends one editable account row (label + key + weight + remove).
+// fillAcctModelPool populates the shared per-account model datalist — the same
+// fetched pool that feeds the provider's own model <datalist>.
+function fillAcctModelPool(models) {
+  const dl = $('#acctModelPool');
+  if (dl) dl.innerHTML = (models || []).map(m => `<option value="${esc(m)}"></option>`).join('');
+}
+
+// addAccountRow appends one editable account row (label + key + model + weight + remove).
 function addAccountRow(a) {
   const wrap = $('#accountList');
   const row = document.createElement('div');
   row.className = 'acct-row';
+  row.dataset.id = a.id || ''; // keep the ID so saves preserve keys (and combo pins)
   row.style.cssText = 'display:flex;gap:6px;align-items:center;margin:4px 0';
   row.innerHTML = `
     <input name="acct_label" value="${esc(a.label || '')}" placeholder="label" style="width:110px">
     <input name="acct_key" type="password" value="${esc(a.auth_key || '')}" placeholder="API key *" autocomplete="new-password" style="flex:1" required>
+    <input name="acct_model" list="acctModelPool" value="${esc(a.model || '')}" placeholder="model (optional pin)" style="width:200px" title="Pin this key to one upstream model; empty = provider/member default">
     <input name="acct_weight" type="number" min="1" value="${a.weight || 1}" title="weight" style="width:64px">
     <button type="button" class="btn sm danger" onclick="this.closest('.acct-row').remove()">×</button>`;
   wrap.appendChild(row);
 }
 
-// collectAccounts reads the account rows from the provider form into a payload list.
+// collectAccounts reads the account rows from the provider form into a payload
+// list. Existing rows carry their id so the backend keeps stable IDs across
+// saves — regenerating them would detach combo key pins.
 function collectAccounts(form) {
   const out = [];
-  const labels = form.querySelectorAll('[name=acct_label]');
-  const keys = form.querySelectorAll('[name=acct_key]');
-  const weights = form.querySelectorAll('[name=acct_weight]');
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i].value.trim();
-    if (!key) continue;
-    out.push({
-      label: (labels[i] && labels[i].value.trim()) || 'acct-' + (i + 1),
+  form.querySelectorAll('.acct-row').forEach((row, i) => {
+    const key = row.querySelector('[name=acct_key]').value.trim();
+    if (!key) return;
+    const acct = {
+      label: row.querySelector('[name=acct_label]').value.trim() || 'acct-' + (i + 1),
       auth_key: key,
-      weight: parseInt(weights[i] && weights[i].value) || 1,
+      model: row.querySelector('[name=acct_model]').value.trim() || '',
+      weight: parseInt(row.querySelector('[name=acct_weight]').value) || 1,
       enabled: true,
-    });
-  }
+    };
+    if (row.dataset.id) acct.id = row.dataset.id;
+    out.push(acct);
+  });
   return out;
 }
 
@@ -342,6 +356,7 @@ async function fetchUpstreamModels() {
       msg.textContent = 'Upstream returned 0 models.';
     } else {
       list.innerHTML = data.models.map(m => `<option value="${esc(m)}"></option>`).join('');
+      fillAcctModelPool(data.models);
       msg.style.display = 'block';
       msg.textContent = `Loaded ${data.models.length} models — click the field and pick one.`;
       const input = form.querySelector('[name=model]');
@@ -442,11 +457,24 @@ async function testCombo(id) {
   finally { btn.disabled = false; btn.textContent = 'Test'; }
 }
 
-// memberLabel renders a combo member as "provider → model", tolerating both the
-// structured {provider_id,model} shape and a legacy plain-string ID.
+// memberLabel renders a combo member as "provider[key] → model", tolerating both
+// the structured {provider_id,account_id,model} shape and a legacy plain-string ID.
 function memberLabel(m) {
-  if (m && typeof m === 'object') return m.provider_id + (m.model ? ' → ' + m.model : '');
+  if (m && typeof m === 'object') {
+    const acct = m.account_id ? '[' + esc(accountShortLabel(m.provider_id, m.account_id)) + ']' : '';
+    return m.provider_id + acct + (m.model ? ' → ' + m.model : '');
+  }
   return String(m);
+}
+
+// accountShortLabel turns an account ID ("vercel:abc123") into a readable tag
+// ("abc123") using the provider's account list for a label when one exists.
+function accountShortLabel(providerID, accountID) {
+  const prov = state.providers.find(p => p.id === providerID);
+  const acct = prov && (prov.accounts || []).find(a => a.id === accountID);
+  if (acct && acct.label) return acct.label;
+  const i = accountID.indexOf(':');
+  return i >= 0 ? accountID.slice(i + 1) : accountID;
 }
 
 function showComboForm(id) {
@@ -463,7 +491,7 @@ function showComboForm(id) {
             ${['round-robin', 'weighted-round-robin', 'priority', 'random'].map(r => `<option ${c.rotation === r ? 'selected' : ''}>${r}</option>`).join('')}
           </select></div>
       </div>
-      <label>Members (provider + model; drag to reorder — order matters for <span class="kbd">priority</span>)</label>
+      <label>Members (provider + key + model; drag to reorder — order matters for <span class="kbd">priority</span>)</label>
       <ul class="listMembers" id="memberList"></ul>
       <div class="toolbar">
         <select id="memberPicker">${avail.map(a => `<option>${esc(a.id)}</option>`).join('')}</select>
@@ -472,27 +500,32 @@ function showComboForm(id) {
       <label class="pill"><input type="checkbox" name="enabled" ${c.enabled ? 'checked' : ''} style="width:auto"> Enabled</label>
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelComboForm()">Cancel</button></div>
     </form></div>`;
-  // Render each existing member as a provider+model row.
-  (c.members || []).forEach(m => addMemberRow(normProvider(m), m.model || ''));
+  // Render each existing member as a provider+account+model row.
+  (c.members || []).forEach(m => addMemberRow(normProvider(m), normAccount(m), m.model || ''));
   enableDrag();
 }
 function cancelComboForm() { $('#comboForm').innerHTML = ''; }
 
 function normProvider(m) { return (m && typeof m === 'object') ? m.provider_id : String(m); }
+function normAccount(m) { return (m && typeof m === 'object' && m.account_id) ? m.account_id : ''; }
 
-// addMemberRow appends a draggable member row with a provider select and a model
-// select fed by that provider's fetched model pool. The model can also be typed
-// free-form via the datalist (covers unfetched providers).
-function addMemberRow(providerID, model) {
+// addMemberRow appends a draggable member row: provider name, a key dropdown fed
+// by the provider's account pool (or "any key" = keep rotating), and a model
+// select fed by the provider's fetched model pool (free text still allowed).
+function addMemberRow(providerID, accountID, model) {
   const prov = state.providers.find(p => p.id === providerID);
   const li = document.createElement('li');
   li.draggable = true;
   li.dataset.provider = providerID;
   const dl = 'dl-' + Math.random().toString(36).slice(2, 8);
+  const acctOpts = ['<option value="">⚡ any key (rotate)</option>']
+    .concat((prov && prov.accounts ? prov.accounts : [])
+      .map(a => `<option value="${esc(a.id)}" ${a.id === accountID ? 'selected' : ''}>${esc(a.label || a.id)}</option>`));
   li.innerHTML = `
     <span class="handle">☰</span>
     <select class="provs"><option value="${esc(providerID)}">${esc(providerID)}</option></select>
-    <input class="modelSel" list="${dl}" placeholder="model (default: provider's)" value="${esc(model || '')}" style="flex:1">
+    <select class="acctSel" title="Key pinned to this member">${acctOpts.join('')}</select>
+    <input class="modelSel" list="${dl}" placeholder="model (default: key/provider)" value="${esc(model || '')}" style="flex:1">
     <datalist id="${dl}"></datalist>
     <span class="spacer"></span>
     <button type="button" class="btn sm danger" onclick="this.closest('li').remove()">×</button>`;
@@ -508,7 +541,7 @@ function addMemberRow(providerID, model) {
 function addMember() {
   const sel = $('#memberPicker');
   if (!sel.value) return;
-  addMemberRow(sel.value, '');
+  addMemberRow(sel.value, '', '');
   enableDrag();
 }
 

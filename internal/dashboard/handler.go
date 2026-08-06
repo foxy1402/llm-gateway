@@ -22,11 +22,11 @@ import (
 
 // Deps bundles everything the dashboard handlers need.
 type Deps struct {
-	Store    *store.Store
-	Reg      *registry.Registry
-	Proxy    *proxy.Proxy
-	Auth     *auth.Dashboard
-	Env      *config.Env
+	Store *store.Store
+	Reg   *registry.Registry
+	Proxy *proxy.Proxy
+	Auth  *auth.Dashboard
+	Env   *config.Env
 }
 
 // Mount registers all /dashboard/* routes on mux.
@@ -362,6 +362,7 @@ func (api *apiHandlers) addAccount(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Label   string `json:"label"`
 		AuthKey string `json:"auth_key"`
+		Model   string `json:"model"`
 		Enabled bool   `json:"enabled"`
 		Weight  int    `json:"weight"`
 	}
@@ -375,7 +376,7 @@ func (api *apiHandlers) addAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	accounts = append(accounts, config.Account{
 		ID: pid + ":" + shortID(), ProviderID: pid, Label: req.Label,
-		AuthKey: req.AuthKey, Enabled: req.Enabled, Weight: req.Weight,
+		AuthKey: req.AuthKey, Model: req.Model, Enabled: req.Enabled, Weight: req.Weight,
 	})
 	if err := api.d.Store.ReplaceAccounts(pid, accounts); err != nil {
 		writeErr(w, 500, err.Error())
@@ -528,17 +529,19 @@ type capture struct {
 	buf    []byte
 }
 
-func newCapture() *capture { return &capture{header: http.Header{}, code: 200} }
-func (c *capture) Header() http.Header { return c.header }
-func (c *capture) WriteHeader(code int) { c.code = code }
+func newCapture() *capture                     { return &capture{header: http.Header{}, code: 200} }
+func (c *capture) Header() http.Header         { return c.header }
+func (c *capture) WriteHeader(code int)        { c.code = code }
 func (c *capture) Write(b []byte) (int, error) { c.buf = append(c.buf, b...); return len(b), nil }
-func (c *capture) status() int { return c.code }
+func (c *capture) status() int                 { return c.code }
 func (c *capture) errorString() string {
 	if c.code < 400 {
 		return ""
 	}
 	var e struct {
-		Error struct{ Message string `json:"message"` } `json:"error"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if json.Unmarshal(c.buf, &e) == nil && e.Error.Message != "" {
 		return e.Error.Message
@@ -551,9 +554,11 @@ func (c *capture) Flush() {}
 
 // --- combos ---
 
-// comboMemberPayload is one provider+model binding in a combo.
+// comboMemberPayload is one provider(+key)+model binding in a combo. AccountID
+// pins the member to one API key of the provider ("" = rotate across its keys).
 type comboMemberPayload struct {
 	ProviderID string `json:"provider_id"`
+	AccountID  string `json:"account_id"`
 	Model      string `json:"model"`
 }
 
@@ -571,7 +576,7 @@ func (cp comboPayload) toConfig() config.Combo {
 		if m.ProviderID == "" {
 			continue
 		}
-		members = append(members, config.ComboMember{ProviderID: m.ProviderID, Model: m.Model})
+		members = append(members, config.ComboMember{ProviderID: m.ProviderID, AccountID: m.AccountID, Model: m.Model})
 	}
 	return config.Combo{
 		ID: cp.ID, DisplayName: cp.DisplayName, Rotation: config.RotationPolicy(cp.Rotation),
@@ -633,14 +638,31 @@ func (api *apiHandlers) updateCombo(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateCombo enforces the multi-account contract: every member provider exists,
-// and any explicitly-chosen member model belongs to that provider's fetched pool
-// (empty model = provider default, always allowed). This prevents a combo from
-// silently pointing at a model the upstream doesn't expose.
+// any pinned account belongs to that provider, and any explicitly-chosen member
+// model belongs to that provider's fetched pool (empty model = provider default,
+// always allowed). This prevents a combo from silently pointing at a key/model the
+// upstream doesn't expose — and keeps bogus pins from surfacing later as opaque
+// SQLite FK violations on insert.
 func (api *apiHandlers) validateCombo(c comboPayload) string {
 	for _, m := range c.Members {
 		p := api.d.Reg.GetProvider(m.ProviderID)
 		if p == nil {
 			return "unknown provider in members: " + m.ProviderID
+		}
+		if m.AccountID != "" {
+			found := false
+			for _, a := range p.Accounts {
+				if a.ID == m.AccountID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				if len(p.Accounts) == 0 {
+					return fmt.Sprintf("member pins account %q but provider %q has no accounts", m.AccountID, m.ProviderID)
+				}
+				return fmt.Sprintf("unknown account %q on provider %q", m.AccountID, m.ProviderID)
+			}
 		}
 		if m.Model == "" {
 			continue

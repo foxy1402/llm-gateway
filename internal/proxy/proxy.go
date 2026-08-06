@@ -149,12 +149,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 
 	triedProviders := map[string]bool{} // providers whose account pool is exhausted for this request
 	triedAccounts := map[string]bool{}  // accounts already burned during this request
+	triedMembers := map[string]bool{}   // pinned members whose key already failed this request
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var upstream *config.Provider
 		var member *config.ComboMember
 		if plan != nil {
-			member = plan.next(p.registry, triedProviders)
+			member = plan.next(p.registry, triedProviders, triedMembers)
 			if member == nil {
 				break
 			}
@@ -167,21 +168,37 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			upstream = provider
 		}
 
-		// Resolve the model this attempt should use. Per-member model wins; fallback
-		// is the provider's own configured model; direct (non-combo) providers always
-		// use their own model.
-		model := upstream.Model
-		if member != nil && member.Model != "" {
-			model = member.Model
+		// Resolve which account serves this attempt. A combo member may pin one
+		// specific key (member.AccountID); otherwise rotate across the provider's
+		// pool. Either way the pick must happen before model resolution: a bound
+		// model lives partly on the member and partly on the account itself.
+		var account config.Account
+		var ok bool
+		if member != nil && member.AccountID != "" {
+			account, ok = p.registry.PinnedAccount(upstream, member.AccountID, p.registry.Health(), triedAccounts)
+		} else {
+			account, ok = p.registry.NextAccount(upstream, p.registry.Health(), triedAccounts)
+		}
+		if !ok {
+			if member != nil && member.AccountID != "" {
+				// Only this pinned key is out (tried/disabled/cooling); same-provider
+				// siblings pinned to other keys must stay reachable.
+				triedMembers[memberKey(*member)] = true
+			} else {
+				triedProviders[upstream.ID] = true
+			}
+			continue
 		}
 
-		// Pick the next *available* account for this provider, skipping ones already
-		// burned this request. An empty result here means every enabled account is
-		// tried or in proactive cooldown → this provider is done for this request.
-		account, ok := p.registry.NextAccount(upstream, p.registry.Health(), triedAccounts)
-		if !ok {
-			triedProviders[upstream.ID] = true
-			continue
+		// Model precedence: combo member > pinned/rotated key's own binding >
+		// provider default. The member wins because it's the most specific,
+		// deliberately-configured layer (e.g. "vercel key2 → gpt-oss").
+		model := upstream.Model
+		if account.Model != "" {
+			model = account.Model
+		}
+		if member != nil && member.Model != "" {
+			model = member.Model
 		}
 		triedAccounts[account.ID] = true
 		authKey := account.AuthKey
