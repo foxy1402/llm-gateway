@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS request_log (
     latency_ms        INTEGER NOT NULL,
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
+    cached_tokens     INTEGER,
     error             TEXT,
     upstream_url      TEXT DEFAULT '',
     request_payload   TEXT DEFAULT '',

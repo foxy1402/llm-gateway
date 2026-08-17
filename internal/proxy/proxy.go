@@ -308,7 +308,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			slog.Warn("upstream dispatch failed", "provider", logID, "err", err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "upstream request failed", "gateway_error")
-					p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, upstreamURL, string(body), "")
+					p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), "")
 					return
 			}
 			triedProviders[upstream.ID] = true
@@ -329,7 +329,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			if plan == nil {
 					writeUpstreamError(w, resp.StatusCode)
-					p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil, upstreamURL, string(body), "")
+					p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil, nil, upstreamURL, string(body), "")
 					return
 				}
 			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode)
@@ -351,7 +351,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			p.registry.Health().MarkUnsupported(upstream.ID, endpoint)
 			if plan == nil {
 				writeError(w, resp.StatusCode, fmt.Sprintf("provider does not support %s", endpoint), "invalid_request_error")
-				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil, upstreamURL, string(body), "")
+				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil, nil, upstreamURL, string(body), "")
 				return
 			}
 			triedProviders[upstream.ID] = true
@@ -370,7 +370,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(bodyBytes)
-		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, upstreamURL, string(body), string(bodyBytes))
+		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, upstreamURL, string(body), string(bodyBytes))
 		return
 	}
 
@@ -385,7 +385,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(bodyBytes)
-		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, upstreamURL, string(body), string(bodyBytes))
+		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, upstreamURL, string(body), string(bodyBytes))
 			return
 		}
 
@@ -397,8 +397,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// retryable error was already rotated — we only reach here on a 2xx and
 			// can safely commit the client response headers.
 			translateStream := format == StreamFormatResponses
-			promptTokens, completionTokens := p.streamResponse(w, resp, format, translateStream)
-				p.log(info.Model, logID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens, upstreamURL, string(body), "")
+			promptTokens, completionTokens, cachedTokens := p.streamResponse(w, resp, format, translateStream)
+				p.log(info.Model, logID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens, cachedTokens, upstreamURL, string(body), "")
 			return
 		}
 
@@ -406,19 +406,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 		resp.Body.Close()
 
-		var promptTokens, completionTokens *int
+		var promptTokens, completionTokens, cachedTokens *int
 		if translateResponses && !nativeThisAttempt {
 			translated, err := ChatToResponsesResponse(respBody, info.Model)
 			if err != nil {
 				slog.Error("chat->responses translation failed", "err", err)
 			writeError(w, http.StatusInternalServerError, "responses translation failed", "gateway_error")
-					p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil, upstreamURL, string(body), string(respBody))
+					p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), string(respBody))
 				return
 			}
 			respBody = translated
-			promptTokens, completionTokens = extractResponsesUsage(respBody)
+			promptTokens, completionTokens, cachedTokens = extractResponsesUsage(respBody)
 		} else {
-			promptTokens, completionTokens = extractChatUsage(respBody)
+			promptTokens, completionTokens, cachedTokens = extractChatUsage(respBody)
 		}
 
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
@@ -427,12 +427,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens, upstreamURL, string(body), string(respBody))
+			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens, cachedTokens, upstreamURL, string(body), string(respBody))
 		return
 	}
 
 	writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
-	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, "", "", "")
+	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, nil, "", "", "")
 }
 
 func upstreamPathFor(endpoint string, nativeResponses bool) string {
@@ -536,7 +536,7 @@ func spliceModel(body []byte, model string) ([]byte, bool) {
 	return nil, false
 }
 
-func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct *int, upstreamURL string, reqPayload string, respSnippet string) {
+func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct, cached *int, upstreamURL string, reqPayload string, respSnippet string) {
 	// Truncate payloads to avoid storing megabytes per log entry.
 	if len(reqPayload) > maxLogPayload {
 		reqPayload = string(reqPayload[:maxLogPayload])
@@ -553,6 +553,7 @@ func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency ti
 		LatencyMs:        latency.Milliseconds(),
 		PromptTokens:     pt,
 		CompletionTokens: ct,
+		CachedTokens:     cached,
 		Error:            errMsg,
 		UpstreamURL:      upstreamURL,
 		RequestPayload:   reqPayload,
@@ -580,32 +581,46 @@ func writeUpstreamError(w http.ResponseWriter, upstreamStatus int) {
 
 // --- usage extraction ---
 
-func extractChatUsage(body []byte) (prompt, completion *int) {
+func extractChatUsage(body []byte) (prompt, completion, cached *int) {
 	var v struct {
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &v) == nil && (v.Usage.PromptTokens > 0 || v.Usage.CompletionTokens > 0) {
 		p := v.Usage.PromptTokens
 		c := v.Usage.CompletionTokens
-		return &p, &c
+		if d := v.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+			ct := d.CachedTokens
+			cached = &ct
+		}
+		return &p, &c, cached
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
-func extractResponsesUsage(body []byte) (prompt, completion *int) {
+func extractResponsesUsage(body []byte) (prompt, completion, cached *int) {
 	var v struct {
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			InputTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &v) == nil && (v.Usage.InputTokens > 0 || v.Usage.OutputTokens > 0) {
 		p := v.Usage.InputTokens
 		c := v.Usage.OutputTokens
-		return &p, &c
+		if d := v.Usage.InputTokensDetails; d != nil && d.CachedTokens > 0 {
+			ct := d.CachedTokens
+			cached = &ct
+		}
+		return &p, &c, cached
 	}
-	return nil, nil
+	return nil, nil, nil
 }

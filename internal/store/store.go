@@ -48,7 +48,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	// Migrations: add detail columns to existing databases (idempotent — safe to
 	// re-run; SQLite errors on duplicate column are ignored).
-	for _, col := range []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''"} {
+	for _, col := range []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER"} {
 		colName := strings.Fields(col)[0]
 		db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE request_log ADD COLUMN %s", col))
 		_ = colName // silence unused lint; the DDL above uses colName via col split
@@ -432,9 +432,9 @@ func (s *Store) LogRequest(e config.LogEntry) error {
 		e.Timestamp = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`INSERT INTO request_log
-		(ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, error, upstream_url, request_payload, response_snippet)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.Timestamp, e.ModelIn, e.ProviderUsed, e.Endpoint, e.Status, e.LatencyMs, e.PromptTokens, e.CompletionTokens, e.Error,
+		(ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, error, upstream_url, request_payload, response_snippet)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Timestamp, e.ModelIn, e.ProviderUsed, e.Endpoint, e.Status, e.LatencyMs, e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.Error,
 		e.UpstreamURL, e.RequestPayload, e.ResponseSnippet)
 	return err
 }
@@ -461,7 +461,7 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 		where = append(where, "ts < ?")
 		args = append(args, f.Until)
 	}
-	q := "SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log"
+	q := "SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -480,8 +480,8 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 	out := []config.LogEntry{}
 	for rows.Next() {
 		var e config.LogEntry
-		var prompt, completion sql.NullInt64
-		if err := rows.Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet); err != nil {
+		var prompt, completion, cached sql.NullInt64
+		if err := rows.Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &cached, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet); err != nil {
 			return nil, err
 		}
 		if prompt.Valid {
@@ -492,6 +492,10 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 			v := int(completion.Int64)
 			e.CompletionTokens = &v
 		}
+		if cached.Valid {
+			v := int(cached.Int64)
+			e.CachedTokens = &v
+		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -500,11 +504,11 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 // GetLog returns a single log entry by ID, including full detail columns.
 func (s *Store) GetLog(id int64) (*config.LogEntry, error) {
 	var e config.LogEntry
-	var prompt, completion sql.NullInt64
+	var prompt, completion, cached sql.NullInt64
 	err := s.db.QueryRow(
-		"SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log WHERE id = ?",
+		"SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log WHERE id = ?",
 		id,
-	).Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet)
+	).Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &cached, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -518,6 +522,10 @@ func (s *Store) GetLog(id int64) (*config.LogEntry, error) {
 	if completion.Valid {
 		v := int(completion.Int64)
 		e.CompletionTokens = &v
+	}
+	if cached.Valid {
+		v := int(cached.Int64)
+		e.CachedTokens = &v
 	}
 	return &e, nil
 }

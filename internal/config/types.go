@@ -74,6 +74,7 @@ type LogEntry struct {
 	LatencyMs        int64  `json:"latency_ms"`
 	PromptTokens     *int   `json:"prompt_tokens,omitempty"`
 	CompletionTokens *int   `json:"completion_tokens,omitempty"`
+	CachedTokens     *int   `json:"cached_tokens,omitempty"` // prompt tokens served from upstream KV cache
 	Error            string `json:"error,omitempty"`
 	UpstreamURL      string `json:"upstream_url,omitempty"`
 	RequestPayload   string `json:"request_payload,omitempty"`

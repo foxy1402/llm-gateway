@@ -28,10 +28,10 @@ const streamStallTimeout = 90 * time.Second
 // chat-completions deltas to responses-format events when requested.
 //
 // Caller has already inspected the response and committed to this upstream.
-// Returns (promptTokens, completionTokens) extracted from the terminal usage frame
-// so the caller can log real token counts for streaming requests (#12); nil when
-// the upstream did not report usage.
-func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, format StreamFormat, translate bool) (*int, *int) {
+// Returns (promptTokens, completionTokens, cachedTokens) extracted from the terminal
+// usage frame so the caller can log real token counts for streaming requests (#12);
+// nil when the upstream did not report usage.
+func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, format StreamFormat, translate bool) (*int, *int, *int) {
 	// SSE headers.
 	// Note: if translate is false, we forward chat-completions stream bytes as-is.
 	h := w.Header()
@@ -62,7 +62,7 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	var sawUsage bool
 	var respModel string
 	// #12: capture prompt/completion token counts for logging regardless of format.
-	var promptTokens, completionTokens *int
+	var promptTokens, completionTokens, cachedTokens *int
 
 	// Per-chunk stall detection: run each line read in a goroutine and bound it with
 	// a timer that resets on every successful read.
@@ -93,7 +93,7 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			stall.Reset(streamStallTimeout)
 		case <-stall.C:
 			// Upstream stalled: terminate the stream gracefully.
-			return promptTokens, completionTokens
+			return promptTokens, completionTokens, cachedTokens
 		}
 		line, err := rr.line, rr.err
 		if len(line) > 0 {
@@ -103,12 +103,15 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 				// #12: extract usage from every chunk before translation. Upstream
 				// chunks are always chat-completions format (prompt_tokens/completion_tokens),
 				// even when we later translate them to the responses shape for the client.
-				if pt, ct := extractChunkUsage(payload); pt != nil || ct != nil {
+				if pt, ct, cached := extractChunkUsage(payload); pt != nil || ct != nil || cached != nil {
 					if pt != nil {
 						promptTokens = pt
 					}
 					if ct != nil {
 						completionTokens = ct
+					}
+					if cached != nil {
+						cachedTokens = cached
 					}
 				}
 			if bytes.Equal(payload, []byte("[DONE]")) {
@@ -169,23 +172,32 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			break
 		}
 	}
-	return promptTokens, completionTokens
+	return promptTokens, completionTokens, cachedTokens
 }
 
-// extractChunkUsage pulls prompt/completion token counts from a single chat-completions
-// SSE chunk's usage block. Returns nil for both when the chunk has no usage.
-func extractChunkUsage(payload []byte) (*int, *int) {
+// extractChunkUsage pulls prompt/completion/cached token counts from a single
+// chat-completions SSE chunk's usage block. Returns nil for all when the chunk
+// has no usage.
+func extractChunkUsage(payload []byte) (*int, *int, *int) {
 	var c struct {
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(payload, &c) != nil || c.Usage == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	pt, ct := c.Usage.PromptTokens, c.Usage.CompletionTokens
-	return &pt, &ct
+	var cached *int
+	if d := c.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+		v := d.CachedTokens
+		cached = &v
+	}
+	return &pt, &ct, cached
 }
 
 type sseEvent struct {

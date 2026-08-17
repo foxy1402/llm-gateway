@@ -29,6 +29,11 @@ const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString();
 const mask = (s) => (s && s.length > 8 ? s.slice(0, 4) + '••••••' + s.slice(-4) : '••••••');
+// Log stat formatters: thousands separators; duration in seconds past 1s; TPS is
+// completion tokens over the whole request (includes time-to-first-token for streams).
+const fmtNum = (n) => n == null ? '—' : Number(n).toLocaleString();
+const fmtDuration = (ms) => ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+const fmtTps = (ct, ms) => (ct != null && ms > 0) ? (ct * 1000 / ms).toFixed(1) : '—';
 
 function clearTimers() {
   if (state.logRefresh) clearInterval(state.logRefresh);
@@ -658,15 +663,17 @@ async function loadLogs() {
 function renderLogTable(data) {
   const items = data.items || [];
   $('#logTable').innerHTML = items.length === 0 ? '<div class="empty">No log entries match.</div>' :
-    `<table><thead><tr><th>Time</th><th>Model in</th><th>Provider</th><th>Endpoint</th><th>Status</th><th>Tokens</th><th>Latency</th></tr></thead><tbody>` +
+    `<table><thead><tr><th>Time</th><th>Model in</th><th>Provider</th><th>Endpoint</th><th>Status</th><th title="prompt / completion tokens">Tokens</th><th title="prompt tokens served from the upstream KV cache">Cache</th><th title="completion tokens per second (whole request)">TPS</th><th>Duration</th></tr></thead><tbody>` +
     items.map(l => `<tr class="log-row" data-id="${l.id}">
       <td class="small muted">${fmtTime(l.ts)}</td>
       <td class="mono small">${esc(l.model_in)}</td>
       <td class="mono small">${esc(l.provider_used)}</td>
       <td class="small muted">${esc(l.endpoint)}</td>
       <td><span class="badge ${l.status < 400 ? 'ok' : 'err'}">${l.status}</span>${l.error ? ' <span class="small pill-bad" title="' + esc(l.error) + '">!</span>' : ''}</td>
-      <td class="small">${l.prompt_tokens ?? '—'}/${l.completion_tokens ?? '—'}</td>
-      <td class="small">${l.latency_ms}ms</td></tr>`).join('') + `</tbody></table>`;
+      <td class="small">${fmtNum(l.prompt_tokens)}/${fmtNum(l.completion_tokens)}</td>
+      <td class="small">${fmtNum(l.cached_tokens)}</td>
+      <td class="small">${fmtTps(l.completion_tokens, l.latency_ms)}</td>
+      <td class="small">${fmtDuration(l.latency_ms)}</td></tr>`).join('') + `</tbody></table>`;
   // Attach click handlers for expandable detail rows.
   $$('.log-row').forEach(row => {
     row.addEventListener('click', () => showLogDetail(row));
@@ -799,12 +806,28 @@ async function showLogDetail(row) {
 
   const detailRow = document.createElement('tr');
   detailRow.className = 'log-detail-row';
-  detailRow.innerHTML = `<td colspan="7" class="log-detail">
+  // Stat chips: duration/TPS derive from latency_ms + token counts; cache stats
+  // come from the usage details blob and are only present when the upstream reports them.
+  const stats = [`<div class="log-stat"><span class="log-stat-label">Duration</span><span class="log-stat-value">${fmtDuration(detail.latency_ms)}</span></div>`];
+  if (detail.prompt_tokens != null || detail.completion_tokens != null)
+    stats.push(`<div class="log-stat"><span class="log-stat-label">Tokens in/out</span><span class="log-stat-value">${fmtNum(detail.prompt_tokens)} / ${fmtNum(detail.completion_tokens)}</span></div>`);
+  if (detail.completion_tokens != null && detail.latency_ms > 0)
+    stats.push(`<div class="log-stat"><span class="log-stat-label">TPS</span><span class="log-stat-value">${fmtTps(detail.completion_tokens, detail.latency_ms)} tok/s</span></div>`);
+  if (detail.cached_tokens != null && detail.cached_tokens > 0) {
+    stats.push(`<div class="log-stat"><span class="log-stat-label">Cache read</span><span class="log-stat-value">${fmtNum(detail.cached_tokens)}</span></div>`);
+    if (detail.prompt_tokens > 0) {
+      const eff = detail.prompt_tokens - detail.cached_tokens;
+      const pct = Math.round(detail.cached_tokens / detail.prompt_tokens * 100);
+      stats.push(`<div class="log-stat log-stat-wide"><span class="log-stat-label">Cache savings</span><span class="log-stat-value">${fmtNum(detail.prompt_tokens)} → ${fmtNum(eff)} effective (${pct}% cached)</span></div>`);
+    }
+  }
+  detailRow.innerHTML = `<td colspan="9" class="log-detail">
     <div class="log-detail-header">
       <span class="small muted">Log #${detail.id} — ${fmtTime(detail.ts)}</span>
       <button class="btn sm ghost log-detail-close" title="Close detail">×</button>
     </div>
     <div class="log-detail-body">
+      <div class="log-detail-stats">${stats.join('')}</div>
       <div class="log-detail-section">
         <div class="log-detail-label">Upstream URL</div>
         <pre class="log-detail-code">${esc(detail.upstream_url || '—')}</pre>

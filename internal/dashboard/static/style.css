@@ -89,6 +89,11 @@ canvas{max-width:100%}
 .log-detail{padding:16px 20px;background:var(--panel2);font-size:13px}
 .log-detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border)}
 .log-detail-body{display:flex;flex-direction:column;gap:14px}
+.log-detail-stats{display:flex;flex-wrap:wrap;gap:10px}
+.log-stat{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;flex-direction:column;gap:4px;min-width:110px}
+.log-stat-label{font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.log-stat-value{font-family:var(--mono);font-size:14px;color:var(--text)}
+.log-stat-wide .log-stat-value{color:var(--accent)}
 .log-detail-section{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .log-detail-label{font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}
 .log-detail-code{margin:0;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;color:var(--text)}
