@@ -574,6 +574,7 @@ async function saveCombo(e, id) {
   const f = new FormData(e.target);
   const members = $$('#memberList li').map(li => ({
     provider_id: li.dataset.provider,
+    account_id: (li.querySelector('.acctSel') || {}).value || '',
     model: (li.querySelector('.modelSel') || {}).value || '',
   })).filter(m => m.provider_id);
   const payload = {
