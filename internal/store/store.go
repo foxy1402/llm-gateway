@@ -46,6 +46,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("run schema: %w", err)
 	}
+	// Migrations: add detail columns to existing databases (idempotent — safe to
+	// re-run; SQLite errors on duplicate column are ignored).
+	for _, col := range []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''"} {
+		colName := strings.Fields(col)[0]
+		db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE request_log ADD COLUMN %s", col))
+		_ = colName // silence unused lint; the DDL above uses colName via col split
+	}
 	s := &Store{db: db}
 	return s, nil
 }
@@ -425,9 +432,10 @@ func (s *Store) LogRequest(e config.LogEntry) error {
 		e.Timestamp = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`INSERT INTO request_log
-		(ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.Timestamp, e.ModelIn, e.ProviderUsed, e.Endpoint, e.Status, e.LatencyMs, e.PromptTokens, e.CompletionTokens, e.Error)
+		(ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, error, upstream_url, request_payload, response_snippet)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Timestamp, e.ModelIn, e.ProviderUsed, e.Endpoint, e.Status, e.LatencyMs, e.PromptTokens, e.CompletionTokens, e.Error,
+		e.UpstreamURL, e.RequestPayload, e.ResponseSnippet)
 	return err
 }
 
@@ -453,7 +461,7 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 		where = append(where, "ts < ?")
 		args = append(args, f.Until)
 	}
-	q := "SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, COALESCE(error,'') FROM request_log"
+	q := "SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -473,7 +481,7 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 	for rows.Next() {
 		var e config.LogEntry
 		var prompt, completion sql.NullInt64
-		if err := rows.Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &e.Error); err != nil {
+		if err := rows.Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet); err != nil {
 			return nil, err
 		}
 		if prompt.Valid {
@@ -487,6 +495,40 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// GetLog returns a single log entry by ID, including full detail columns.
+func (s *Store) GetLog(id int64) (*config.LogEntry, error) {
+	var e config.LogEntry
+	var prompt, completion sql.NullInt64
+	err := s.db.QueryRow(
+		"SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log WHERE id = ?",
+		id,
+	).Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if prompt.Valid {
+		v := int(prompt.Int64)
+		e.PromptTokens = &v
+	}
+	if completion.Valid {
+		v := int(completion.Int64)
+		e.CompletionTokens = &v
+	}
+	return &e, nil
+}
+
+// ClearLogs deletes all request_log entries. Returns the number of deleted rows.
+func (s *Store) ClearLogs() (int64, error) {
+	res, err := s.db.Exec("DELETE FROM request_log")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // CountLogsToday returns the number of log entries since local midnight.

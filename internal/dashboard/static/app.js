@@ -22,7 +22,7 @@ const api = {
   del: (u) => api.req('DELETE', u),
 };
 
-const state = { providers: [], combos: [], settings: {}, currentRoute: 'overview', logRefresh: null, healthRefresh: null };
+const state = { providers: [], combos: [], settings: {}, currentRoute: 'overview', logRefresh: null, healthRefresh: null, logAutoRefresh: true };
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
@@ -593,23 +593,50 @@ async function renderLogs() {
     state.providers = await api.get('/providers');
     app.innerHTML = `
       <h1>Request Logs</h1>
-      <div class="sub">Every proxied call, with filtering and hourly chart.</div>
+      <div class="sub">Every proxied call, with filtering and hourly chart. Click a row for details.</div>
       <div class="card">
         <div class="row">
           <div><label>Provider</label><select id="f_provider"><option value="">All</option>${state.providers.map(p => `<option>${esc(p.id)}</option>`).join('')}</select></div>
           <div><label>Endpoint</label><select id="f_endpoint"><option value="">All</option><option>chat.completions</option><option>completions</option><option>responses</option><option>embeddings</option></select></div>
           <div><label>Errors only</label><select id="f_errors"><option value="0">No</option><option value="1">Yes</option></select></div>
-          <div style="align-self:end"><button class="btn sm" onclick="applyLogFilter()">Apply</button></div>
+          <div style="align-self:end;display:flex;gap:6px">
+            <button class="btn sm ${state.logAutoRefresh ? '' : 'ghost'}" id="autoRefreshBtn" onclick="toggleLogAutoRefresh()">${state.logAutoRefresh ? '⏸ Pause' : '▶ Live'}</button>
+            <button class="btn sm" onclick="applyLogFilter()">Apply</button>
+            <button class="btn sm danger" onclick="clearLogs()">Clear Logs</button>
+          </div>
         </div>
       </div>
       <div class="card"><h2>Requests per hour (24h)</h2><canvas id="logChart" width="1000" height="220"></canvas></div>
       <div class="card"><div id="logTable"></div><div class="pagination" id="logPager"></div></div>`;
     await loadLogs();
     await drawChart();
+    // Auto-refresh every 5 seconds for real-time log updates (if enabled).
+    if (state.logAutoRefresh) {
+      state.logRefresh = setInterval(async () => {
+        try { await loadLogs(); } catch (_) {}
+      }, 5000);
+    }
   } catch (e) { app.innerHTML = errBox(e); }
 }
 
 async function applyLogFilter() { logFilter.offset = 0; await loadLogs(); }
+
+function toggleLogAutoRefresh() {
+  state.logAutoRefresh = !state.logAutoRefresh;
+  const btn = $('#autoRefreshBtn');
+  if (btn) {
+    btn.textContent = state.logAutoRefresh ? '⏸ Pause' : '▶ Live';
+    btn.className = 'btn sm ' + (state.logAutoRefresh ? '' : 'ghost');
+  }
+  if (state.logAutoRefresh) {
+    state.logRefresh = setInterval(async () => {
+      try { await loadLogs(); } catch (_) {}
+    }, 5000);
+  } else {
+    if (state.logRefresh) clearInterval(state.logRefresh);
+    state.logRefresh = null;
+  }
+}
 
 async function loadLogs() {
   const params = new URLSearchParams({
@@ -625,7 +652,7 @@ function renderLogTable(data) {
   const items = data.items || [];
   $('#logTable').innerHTML = items.length === 0 ? '<div class="empty">No log entries match.</div>' :
     `<table><thead><tr><th>Time</th><th>Model in</th><th>Provider</th><th>Endpoint</th><th>Status</th><th>Tokens</th><th>Latency</th></tr></thead><tbody>` +
-    items.map(l => `<tr>
+    items.map(l => `<tr class="log-row" data-id="${l.id}">
       <td class="small muted">${fmtTime(l.ts)}</td>
       <td class="mono small">${esc(l.model_in)}</td>
       <td class="mono small">${esc(l.provider_used)}</td>
@@ -633,6 +660,10 @@ function renderLogTable(data) {
       <td><span class="badge ${l.status < 400 ? 'ok' : 'err'}">${l.status}</span>${l.error ? ' <span class="small pill-bad" title="' + esc(l.error) + '">!</span>' : ''}</td>
       <td class="small">${l.prompt_tokens ?? '—'}/${l.completion_tokens ?? '—'}</td>
       <td class="small">${l.latency_ms}ms</td></tr>`).join('') + `</tbody></table>`;
+  // Attach click handlers for expandable detail rows.
+  $$('.log-row').forEach(row => {
+    row.addEventListener('click', () => showLogDetail(row));
+  });
   // Pagination.
   const pages = Math.ceil((data.total || 0) / data.limit);
   const cur = Math.floor(data.offset / data.limit);
@@ -697,6 +728,98 @@ async function drawChart() {
     ctx.fillText(p, lx + 14, 15);
     lx += 14 + ctx.measureText(p).width + 16;
   });
+}
+
+// Track which log detail row is currently expanded.
+let expandedLogId = null;
+
+async function showLogDetail(row) {
+  const id = row.dataset.id;
+  const tbody = row.parentElement;
+  // If clicking the already-expanded row, collapse it.
+  if (expandedLogId === id) {
+    const existing = tbody.querySelector('.log-detail-row');
+    if (existing) existing.remove();
+    expandedLogId = null;
+    row.classList.remove('log-row-expanded');
+    return;
+  }
+  // Collapse any previously expanded detail row.
+  const prev = tbody.querySelector('.log-detail-row');
+  if (prev) prev.remove();
+  $$('.log-row-expanded').forEach(r => r.classList.remove('log-row-expanded'));
+
+  expandedLogId = id;
+  row.classList.add('log-row-expanded');
+
+  // Fetch full detail.
+  let detail;
+  try { detail = await api.get('/logs/' + id); } catch (e) { return; }
+
+  const fmtJson = (s) => {
+    if (!s) return '<span class="muted">empty</span>';
+    try { return esc(JSON.stringify(JSON.parse(s), null, 2)); } catch (_) { return esc(s); }
+  };
+
+  const detailRow = document.createElement('tr');
+  detailRow.className = 'log-detail-row';
+  detailRow.innerHTML = `<td colspan="7" class="log-detail">
+    <div class="log-detail-header">
+      <span class="small muted">Log #${detail.id} — ${fmtTime(detail.ts)}</span>
+      <button class="btn sm ghost log-detail-close" title="Close detail">×</button>
+    </div>
+    <div class="log-detail-body">
+      <div class="log-detail-section">
+        <div class="log-detail-label">Upstream URL</div>
+        <pre class="log-detail-code">${esc(detail.upstream_url || '—')}</pre>
+      </div>
+      <div class="log-detail-section">
+        <div class="log-detail-label">Request Payload</div>
+        <pre class="log-detail-code">${fmtJson(detail.request_payload)}</pre>
+      </div>
+      <div class="log-detail-section">
+        <div class="log-detail-label">Response Snippet</div>
+        <pre class="log-detail-code">${fmtJson(detail.response_snippet)}</pre>
+      </div>
+      ${detail.error ? `<div class="log-detail-section"><div class="log-detail-label" style="color:var(--bad)">Error</div><pre class="log-detail-code log-detail-error">${esc(detail.error)}</pre></div>` : ''}
+    </div>
+  </td>`;
+
+  row.after(detailRow);
+  detailRow.querySelector('.log-detail-close').addEventListener('click', (e) => {
+    e.stopPropagation();
+    detailRow.remove();
+    expandedLogId = null;
+    row.classList.remove('log-row-expanded');
+  });
+}
+
+function toggleLogAutoRefresh() {
+  state.logAutoRefresh = !state.logAutoRefresh;
+  const btn = $('#autoRefreshBtn');
+  if (state.logAutoRefresh) {
+    btn.className = 'btn sm';
+    btn.textContent = '⏸ Pause';
+    state.logRefresh = setInterval(async () => {
+      try { await loadLogs(); } catch (_) {}
+    }, 5000);
+  } else {
+    btn.className = 'btn sm ghost';
+    btn.textContent = '▶ Live';
+    if (state.logRefresh) { clearInterval(state.logRefresh); state.logRefresh = null; }
+  }
+}
+
+async function clearLogs() {
+  if (!confirm('Clear ALL request logs? This cannot be undone.')) return;
+  try {
+    const res = await api.post('/logs/clear', {});
+    logFilter.offset = 0;
+    await loadLogs();
+    alert('Cleared ' + (res.deleted || 0) + ' log entries.');
+  } catch (e) {
+    alert('Failed to clear logs: ' + e.message);
+  }
 }
 
 // ---------- Settings ----------

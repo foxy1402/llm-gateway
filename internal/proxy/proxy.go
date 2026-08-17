@@ -22,6 +22,10 @@ import (
 
 const maxBodyBytes = 4 << 20 // 4 MiB
 
+// maxLogPayload caps how many bytes of a request/response body we store in the
+// request_log for dashboard inspection. Bodies larger than this are truncated.
+const maxLogPayload = 4 << 10 // 4 KiB
+
 // maxAccountsPerProvider caps how many distinct accounts of one provider we try
 // in a single request before declaring that provider done. Free-tier keys burn
 // out one-by-one; this keeps a single client request from pinning against a
@@ -304,8 +308,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			slog.Warn("upstream dispatch failed", "provider", logID, "err", err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "upstream request failed", "gateway_error")
-				p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil)
-				return
+					p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, upstreamURL, string(body), "")
+					return
 			}
 			triedProviders[upstream.ID] = true
 			continue
@@ -324,10 +328,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// endpoint itself is unreachable and ALL keys would fail identically.
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			if plan == nil {
-				writeUpstreamError(w, resp.StatusCode)
-				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil)
-				return
-			}
+					writeUpstreamError(w, resp.StatusCode)
+					p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil, upstreamURL, string(body), "")
+					return
+				}
 			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode)
 			// NOTE: provider is NOT dropped from triedProviders — NextAccount will
 			// yield a different key next time plan.next re-selects this provider.
@@ -347,7 +351,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			p.registry.Health().MarkUnsupported(upstream.ID, endpoint)
 			if plan == nil {
 				writeError(w, resp.StatusCode, fmt.Sprintf("provider does not support %s", endpoint), "invalid_request_error")
-				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil)
+				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil, upstreamURL, string(body), "")
 				return
 			}
 			triedProviders[upstream.ID] = true
@@ -364,24 +368,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 					w.Header()[k] = v
 				}
 			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(bodyBytes)
-			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
-			return
-		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(bodyBytes)
+		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, upstreamURL, string(body), string(bodyBytes))
+		return
+	}
 
-		// Non-2xx other than the above → surface to caller (e.g. 400 from upstream).
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			for k, v := range resp.Header {
-				if strings.HasPrefix(k, "Content-") {
-					w.Header()[k] = v
-				}
+	// Non-2xx other than the above → surface to caller (e.g. 400 from upstream).
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		for k, v := range resp.Header {
+			if strings.HasPrefix(k, "Content-") {
+				w.Header()[k] = v
 			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(bodyBytes)
-			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil)
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(bodyBytes)
+		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, upstreamURL, string(body), string(bodyBytes))
 			return
 		}
 
@@ -394,7 +398,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// can safely commit the client response headers.
 			translateStream := format == StreamFormatResponses
 			promptTokens, completionTokens := p.streamResponse(w, resp, format, translateStream)
-			p.log(info.Model, logID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens)
+				p.log(info.Model, logID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens, upstreamURL, string(body), "")
 			return
 		}
 
@@ -407,8 +411,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			translated, err := ChatToResponsesResponse(respBody, info.Model)
 			if err != nil {
 				slog.Error("chat->responses translation failed", "err", err)
-				writeError(w, http.StatusInternalServerError, "responses translation failed", "gateway_error")
-				p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil)
+			writeError(w, http.StatusInternalServerError, "responses translation failed", "gateway_error")
+					p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil, upstreamURL, string(body), string(respBody))
 				return
 			}
 			respBody = translated
@@ -423,12 +427,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens)
+			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens, upstreamURL, string(body), string(respBody))
 		return
 	}
 
 	writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
-	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil)
+	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, "", "", "")
 }
 
 func upstreamPathFor(endpoint string, nativeResponses bool) string {
@@ -532,7 +536,14 @@ func spliceModel(body []byte, model string) ([]byte, bool) {
 	return nil, false
 }
 
-func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct *int) {
+func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct *int, upstreamURL string, reqPayload string, respSnippet string) {
+	// Truncate payloads to avoid storing megabytes per log entry.
+	if len(reqPayload) > maxLogPayload {
+		reqPayload = string(reqPayload[:maxLogPayload])
+	}
+	if len(respSnippet) > maxLogPayload {
+		respSnippet = string(respSnippet[:maxLogPayload])
+	}
 	entry := config.LogEntry{
 		Timestamp:        time.Now().Unix(),
 		ModelIn:          modelIn,
@@ -543,6 +554,9 @@ func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency ti
 		PromptTokens:     pt,
 		CompletionTokens: ct,
 		Error:            errMsg,
+		UpstreamURL:      upstreamURL,
+		RequestPayload:   reqPayload,
+		ResponseSnippet:  respSnippet,
 	}
 	// Async to avoid blocking the response path.
 	go func() {

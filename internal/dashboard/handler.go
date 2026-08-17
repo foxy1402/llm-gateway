@@ -65,6 +65,8 @@ func Mount(mux *http.ServeMux, d *Deps) {
 
 	mux.Handle("GET /dashboard/api/logs", withAuth(http.HandlerFunc(api.listLogs)))
 	mux.Handle("GET /dashboard/api/logs/chart", withAuth(http.HandlerFunc(api.logsChart)))
+	mux.Handle("GET /dashboard/api/logs/{id}", withAuth(http.HandlerFunc(api.getLog)))
+	mux.Handle("POST /dashboard/api/logs/clear", withAuth(http.HandlerFunc(api.clearLogs)))
 
 	mux.Handle("GET /dashboard/api/settings", withAuth(http.HandlerFunc(api.getSettings)))
 	mux.Handle("PUT /dashboard/api/settings", withAuth(http.HandlerFunc(api.updateSettings)))
@@ -730,6 +732,38 @@ func (api *apiHandlers) logsChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, data)
+}
+
+func (api *apiHandlers) getLog(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	if idStr == "" {
+		writeErr(w, 400, "id required")
+		return
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeErr(w, 400, "invalid id")
+		return
+	}
+	entry, err := api.d.Store.GetLog(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if entry == nil {
+		writeErr(w, 404, "log entry not found")
+		return
+	}
+	writeJSON(w, 200, entry)
+}
+
+func (api *apiHandlers) clearLogs(w http.ResponseWriter, r *http.Request) {
+	n, err := api.d.Store.ClearLogs()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "cleared", "deleted": n})
 }
 
 func atoi(s string, fallback int) int {

@@ -67,14 +67,17 @@ type Combo struct {
 type LogEntry struct {
 	ID               int64  `json:"id"`
 	Timestamp        int64  `json:"ts"`
-	ModelIn          string `json:"model_in"`      // what caller sent (combo id or provider id)
-	ProviderUsed     string `json:"provider_used"` // actual upstream provider id
-	Endpoint         string `json:"endpoint"`      // chat.completions | completions | responses | embeddings
+	ModelIn          string `json:"model_in"`           // what caller sent (combo id or provider id)
+	ProviderUsed     string `json:"provider_used"`      // actual upstream provider id
+	Endpoint         string `json:"endpoint"`           // chat.completions | completions | responses | embeddings
 	Status           int    `json:"status"`
 	LatencyMs        int64  `json:"latency_ms"`
 	PromptTokens     *int   `json:"prompt_tokens,omitempty"`
 	CompletionTokens *int   `json:"completion_tokens,omitempty"`
 	Error            string `json:"error,omitempty"`
+	UpstreamURL      string `json:"upstream_url,omitempty"`
+	RequestPayload   string `json:"request_payload,omitempty"`
+	ResponseSnippet  string `json:"response_snippet,omitempty"`
 }
 
 type LogFilter struct {

@@ -75,3 +75,17 @@ canvas{max-width:100%}
 .endpoint-panel .ep-value code{font-family:var(--mono);background:var(--panel2);border:1px solid var(--border);border-radius:4px;padding:4px 8px;word-break:break-all;flex:1}
 .endpoint-panel .ep-hint{color:var(--muted);font-size:12px;border-top:1px solid var(--border);padding-top:8px}
 .endpoint-panel .err{color:var(--bad)}
+
+/* Log table clickable rows and detail panel */
+.log-row{cursor:pointer;transition:background .15s}
+.log-row:hover{background:var(--panel2)}
+.log-row-expanded{background:var(--chip)!important}
+.log-detail-row td{padding:0!important;border-bottom:2px solid var(--accent)}
+.log-detail{padding:16px 20px;background:var(--panel2);font-size:13px}
+.log-detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.log-detail-body{display:flex;flex-direction:column;gap:14px}
+.log-detail-section{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
+.log-detail-label{font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}
+.log-detail-code{margin:0;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;color:var(--text)}
+.log-detail-error{color:var(--bad);border-color:rgba(220,38,38,.3)}
+.log-detail-close{padding:2px 8px;font-size:16px;line-height:1;min-width:auto}

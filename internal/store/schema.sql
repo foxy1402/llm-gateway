@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS request_log (
     latency_ms        INTEGER NOT NULL,
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
-    error             TEXT
+    error             TEXT,
+    upstream_url      TEXT DEFAULT '',
+    request_payload   TEXT DEFAULT '',
+    response_snippet  TEXT DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_log_ts ON request_log(ts DESC);
