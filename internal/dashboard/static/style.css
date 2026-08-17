@@ -64,6 +64,10 @@ label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
 .listMembers li{display:flex;align-items:center;gap:8px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px;cursor:grab}
 .listMembers li.dragging{opacity:.4}
 .listMembers .handle{cursor:grab;color:var(--muted)}
+/* The global input/select{width:100%} collapses these controls inside the flex
+   row. Give each an explicit flex share so the model input stays readable. */
+.listMembers li>select{width:auto;flex:1;min-width:110px}
+.listMembers li>.modelSel{width:auto;flex:1.4;min-width:140px}
 canvas{max-width:100%}
 .pill{display:inline-flex;align-items:center;gap:6px}
 .pagination{display:flex;gap:8px;justify-content:center;margin-top:14px}
@@ -81,6 +85,7 @@ canvas{max-width:100%}
 .log-row:hover{background:var(--panel2)}
 .log-row-expanded{background:var(--chip)!important}
 .log-detail-row td{padding:0!important;border-bottom:2px solid var(--accent)}
+.log-detail-pinned{width:100%;border-collapse:collapse;margin-bottom:12px}
 .log-detail{padding:16px 20px;background:var(--panel2);font-size:13px}
 .log-detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border)}
 .log-detail-body{display:flex;flex-direction:column;gap:14px}

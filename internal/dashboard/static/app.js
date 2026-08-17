@@ -30,7 +30,13 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString();
 const mask = (s) => (s && s.length > 8 ? s.slice(0, 4) + '••••••' + s.slice(-4) : '••••••');
 
-function clearTimers() { if (state.logRefresh) clearInterval(state.logRefresh); if (state.healthRefresh) clearInterval(state.healthRefresh); state.logRefresh = state.healthRefresh = null; }
+function clearTimers() {
+  if (state.logRefresh) clearInterval(state.logRefresh);
+  if (state.healthRefresh) clearInterval(state.healthRefresh);
+  state.logRefresh = state.healthRefresh = null;
+  // Drop any open log detail panel when leaving the logs page.
+  if (typeof closeExpandedDetail === 'function') closeExpandedDetail();
+}
 
 const routes = {
   overview: renderOverview,
@@ -525,7 +531,7 @@ function addMemberRow(providerID, accountID, model) {
     <span class="handle">☰</span>
     <select class="provs"><option value="${esc(providerID)}">${esc(providerID)}</option></select>
     <select class="acctSel" title="Key pinned to this member">${acctOpts.join('')}</select>
-    <input class="modelSel" list="${dl}" placeholder="model (default: key/provider)" value="${esc(model || '')}" style="flex:1">
+    <input class="modelSel" list="${dl}" placeholder="model (default: key/provider)" value="${esc(model || '')}">
     <datalist id="${dl}"></datalist>
     <span class="spacer"></span>
     <button type="button" class="btn sm danger" onclick="this.closest('li').remove()">×</button>`;
@@ -664,6 +670,8 @@ function renderLogTable(data) {
   $$('.log-row').forEach(row => {
     row.addEventListener('click', () => showLogDetail(row));
   });
+  // Restore any open detail panel after a (re)render so auto-refresh keeps it visible.
+  mountExpandedDetail($('#logTable').querySelector('tbody'));
   // Pagination.
   const pages = Math.ceil((data.total || 0) / data.limit);
   const cur = Math.floor(data.offset / data.limit);
@@ -730,31 +738,58 @@ async function drawChart() {
   });
 }
 
-// Track which log detail row is currently expanded.
+// Track the expanded log detail. The node is cached (not rebuilt) so auto-refresh
+// re-rendering the table keeps the detail panel open — see mountExpandedDetail().
 let expandedLogId = null;
+let expandedDetailNode = null;
+
+function closeExpandedDetail() {
+  if (expandedDetailNode) expandedDetailNode.remove();
+  const pinned = document.getElementById('logTable')?.querySelector('.log-detail-pinned');
+  if (pinned) pinned.remove();
+  expandedDetailNode = null;
+  expandedLogId = null;
+  $$('.log-row-expanded').forEach(r => r.classList.remove('log-row-expanded'));
+}
+
+// Re-insert the cached detail node after every (re)render so auto-refresh keeps
+// it open. If the row is still on screen the panel stays anchored to it; if new
+// entries pushed the row off the current page, the panel pins to the top of the
+// log area instead of disappearing.
+function mountExpandedDetail(tbody) {
+  if (!expandedLogId) return;
+  $$('.log-row-expanded').forEach(r => r.classList.remove('log-row-expanded'));
+  const oldPinned = $('#logTable .log-detail-pinned');
+  if (oldPinned) oldPinned.remove();
+  const row = tbody && tbody.querySelector('.log-row[data-id="' + expandedLogId + '"]');
+  if (row) {
+    row.classList.add('log-row-expanded');
+    if (expandedDetailNode) row.after(expandedDetailNode); // still fetching → highlight only
+  } else if (expandedDetailNode) {
+    // Row not on the current page: pin the panel at the top of the table area.
+    const pinned = document.createElement('table');
+    pinned.className = 'log-detail-pinned';
+    const tb = document.createElement('tbody');
+    tb.appendChild(expandedDetailNode);
+    pinned.appendChild(tb);
+    $('#logTable').insertBefore(pinned, $('#logTable').firstChild);
+  }
+}
 
 async function showLogDetail(row) {
   const id = row.dataset.id;
-  const tbody = row.parentElement;
   // If clicking the already-expanded row, collapse it.
-  if (expandedLogId === id) {
-    const existing = tbody.querySelector('.log-detail-row');
-    if (existing) existing.remove();
-    expandedLogId = null;
-    row.classList.remove('log-row-expanded');
-    return;
-  }
-  // Collapse any previously expanded detail row.
-  const prev = tbody.querySelector('.log-detail-row');
-  if (prev) prev.remove();
-  $$('.log-row-expanded').forEach(r => r.classList.remove('log-row-expanded'));
+  if (expandedLogId === id) { closeExpandedDetail(); return; }
+  closeExpandedDetail();
 
   expandedLogId = id;
   row.classList.add('log-row-expanded');
 
   // Fetch full detail.
   let detail;
-  try { detail = await api.get('/logs/' + id); } catch (e) { return; }
+  try { detail = await api.get('/logs/' + id); } catch (e) { closeExpandedDetail(); return; }
+  // User collapsed or picked another row while the fetch was in flight.
+  if (expandedLogId !== id) return;
 
   const fmtJson = (s) => {
     if (!s) return '<span class="muted">empty</span>';
@@ -785,13 +820,14 @@ async function showLogDetail(row) {
     </div>
   </td>`;
 
-  row.after(detailRow);
+  expandedDetailNode = detailRow;
   detailRow.querySelector('.log-detail-close').addEventListener('click', (e) => {
     e.stopPropagation();
-    detailRow.remove();
-    expandedLogId = null;
-    row.classList.remove('log-row-expanded');
+    closeExpandedDetail();
   });
+  // Use mountExpandedDetail to insert at the correct position — the original
+  // row reference may be stale if auto-refresh re-rendered during the fetch.
+  mountExpandedDetail($('#logTable').querySelector('tbody'));
 }
 
 function toggleLogAutoRefresh() {
@@ -812,6 +848,7 @@ function toggleLogAutoRefresh() {
 
 async function clearLogs() {
   if (!confirm('Clear ALL request logs? This cannot be undone.')) return;
+  closeExpandedDetail();
   try {
     const res = await api.post('/logs/clear', {});
     logFilter.offset = 0;
