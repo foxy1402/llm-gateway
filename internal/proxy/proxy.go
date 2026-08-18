@@ -225,6 +225,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		if member != nil && member.Model != "" {
 			model = member.Model
 		}
+		// No model resolved at any layer: dispatching would forward an empty
+		// "model" and surface the upstream's opaque "model not found" 404.
+		// Skip this member instead so siblings with a real pin can still serve.
+		if model == "" {
+			slog.Warn("no upstream model resolved for attempt",
+				"provider", upstream.ID, "account", account.Label)
+			if member != nil {
+				triedMembers[memberKey(*member)] = true
+			} else {
+				triedProviders[upstream.ID] = true
+			}
+			if plan == nil {
+				writeError(w, http.StatusBadGateway,
+					fmt.Sprintf("no upstream model configured for provider %q: set a default model on the provider or pin one on the key/combo member", upstream.ID),
+					"gateway_error")
+				return
+			}
+			continue
+		}
 		triedAccounts[account.ID] = true
 		authKey := account.AuthKey
 

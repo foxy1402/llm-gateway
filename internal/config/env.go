@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +18,16 @@ type Env struct {
 	DBPath            string
 	RequestTimeout    time.Duration
 	ModelAliases      map[string]string
+	BanCfg            BanConfig
+}
+
+// BanConfig controls the dashboard-login fail-to-ban gate.
+type BanConfig struct {
+	MaxFail     int           // failures inside FindTime before a ban; 0 disables the gate
+	FindTime    time.Duration // failure window
+	BanTime     time.Duration // base ban duration, doubles per repeat offense
+	MaxBan      time.Duration // cap for the escalated ban duration
+	BehindProxy bool          // read client IP from X-Forwarded-For/X-Real-IP (PaaS behind a LB)
 }
 
 func LoadEnv() (*Env, error) {
@@ -26,6 +38,13 @@ func LoadEnv() (*Env, error) {
 		Listen:            normalizeListen(getEnv("GATEWAY_LISTEN", ":8080")),
 		LogLevel:          getEnv("GATEWAY_LOG_LEVEL", "info"),
 		DBPath:            getEnv("DB_PATH", "./gateway.db"),
+	}
+	e.BanCfg = BanConfig{
+		MaxFail:     getEnvInt("BAN_MAXFAIL", 5),
+		FindTime:    getEnvDur("BAN_FIND_TIME", 10*time.Minute),
+		BanTime:     getEnvDur("BAN_TIME", 30*time.Minute),
+		MaxBan:      getEnvDur("BAN_MAX_TIME", 24*time.Hour),
+		BehindProxy: os.Getenv("TRUSTED_PROXY") == "1",
 	}
 	if e.APIKey == "" {
 		return nil, fmt.Errorf("GATEWAY_API_KEY is required")
@@ -82,6 +101,32 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		slog.Warn("invalid integer env, using fallback", "key", key, "value", v)
+		return fallback
+	}
+	return n
+}
+
+func getEnvDur(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		slog.Warn("invalid duration env, using fallback", "key", key, "value", v)
+		return fallback
+	}
+	return d
 }
 
 // normalizeListen coerces the various forms users put in GATEWAY_LISTEN into a

@@ -22,11 +22,12 @@ import (
 
 // Deps bundles everything the dashboard handlers need.
 type Deps struct {
-	Store *store.Store
-	Reg   *registry.Registry
-	Proxy *proxy.Proxy
-	Auth  *auth.Dashboard
-	Env   *config.Env
+	Store   *store.Store
+	Reg     *registry.Registry
+	Proxy   *proxy.Proxy
+	Auth    *auth.Dashboard
+	Env     *config.Env
+	FailBan *auth.FailBan // guards the login endpoint; nil disables
 }
 
 // Mount registers all /dashboard/* routes on mux.
@@ -37,8 +38,13 @@ func Mount(mux *http.ServeMux, d *Deps) {
 
 	withAuth := dash.Middleware
 
-	// Auth endpoints.
-	mux.HandleFunc("POST /dashboard/api/login", dash.LoginHandler)
+	// Auth endpoints. The login POST is the brute-force target (a session
+	// exposes every stored key), so it sits behind the fail-to-ban gate.
+	var login http.Handler = http.HandlerFunc(dash.LoginHandler)
+	if d.FailBan != nil {
+		login = d.FailBan.Guard(login)
+	}
+	mux.Handle("POST /dashboard/api/login", login)
 	mux.HandleFunc("POST /dashboard/api/logout", dash.LogoutHandler)
 
 	// Domain APIs.
@@ -954,7 +960,7 @@ button{margin-top:12px;width:100%;padding:10px;background:#2563eb;color:#fff;bor
 <body><form class="card" onsubmit="return doLogin(event)"><h1>LLM Gateway</h1>
 <input type="password" id="pw" placeholder="Dashboard password" autofocus autocomplete="current-password">
 <button type="submit">Sign in</button><div class="err" id="err"></div></form>
-<script>async function doLogin(e){e.preventDefault();const pw=document.getElementById('pw').value;const res=await fetch('/dashboard/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(res.ok){location.href='/dashboard/'}else{document.getElementById('err').textContent='Invalid password'}}</script>
+<script>async function doLogin(e){e.preventDefault();const pw=document.getElementById('pw').value;const res=await fetch('/dashboard/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(res.ok){location.href='/dashboard/'}else{const msg=(await res.text()).trim();document.getElementById('err').textContent=msg||'Invalid password'}}</script>
 </body></html>`
 
 func serveLogin(w http.ResponseWriter, r *http.Request) {

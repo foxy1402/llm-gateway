@@ -92,6 +92,11 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `GATEWAY_LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `DB_PATH` | no | `./gateway.db` | SQLite file path (use a mounted volume in Docker) |
 | `REQUEST_TIMEOUT` | no | `60s` | Timeout for **connect + response headers** only (per attempt). Streaming bodies run unbounded until the client disconnects or the upstream stalls for 90s — a fixed timeout would kill long coding generations mid-edit. |
+| `BAN_MAXFAIL` | no | `5` | Failed dashboard logins within `BAN_FIND_TIME` before the client IP is banned (429 + `Retry-After`). Guards the login that protects all stored provider keys. `0` disables the gate. |
+| `BAN_FIND_TIME` | no | `10m` | Failure window for the login fail-to-ban counter |
+| `BAN_TIME` | no | `30m` | Base ban duration; doubles per repeat offense |
+| `BAN_MAX_TIME` | no | `24h` | Cap on the escalated ban duration |
+| `TRUSTED_PROXY` | no | `0` | Set `1` when running behind a PaaS load balancer or reverse proxy so the fail-to-ban reads the real client IP from `X-Forwarded-For`/`X-Real-IP`. **Leave unset when the gateway is directly exposed** — otherwise a spoofed header could evade bans. Without it on a PaaS, all traffic appears to come from the load balancer and a ban would lock everyone out, including you. |
 
 ### Generating DASHBOARD_SECRET
 

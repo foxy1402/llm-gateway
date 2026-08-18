@@ -66,6 +66,16 @@ func registerRoutes(mux *http.ServeMux, a *app) {
 		Auth:  auth.NewDashboard(a.env.DashboardPassword, a.env.DashboardSecret),
 		Env:   a.env,
 	}
+	// Strict fail-to-ban on the login endpoint (BAN_MAXFAIL=0 disables).
+	if a.env.BanCfg.MaxFail > 0 {
+		saved, err := a.store.GetSetting(auth.BanSettingsKey)
+		if err != nil {
+			slog.Warn("fail-ban state load failed, starting fresh", "err", err)
+		}
+		dashDeps.FailBan = auth.NewFailBan(a.env.BanCfg, saved, func(state string) error {
+			return a.store.SetSetting(auth.BanSettingsKey, state)
+		})
+	}
 	dashboard.Mount(mux, dashDeps)
 }
 
