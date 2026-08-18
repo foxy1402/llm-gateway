@@ -240,6 +240,53 @@ func TestLogAndQuery(t *testing.T) {
 	}
 }
 
+// TestLogCachedTokensRoundTrip: cached_tokens must persist and read back through
+// both QueryLogs (list) and GetLog (detail) — this is the column the dashboard's
+// stat chips and "Cache read"/"Cache savings" panel depend on. A log with no
+// cached tokens reported must read back nil (NULL), not 0, so the UI can tell
+// "cache unsupported by this upstream" apart from "cache read but empty".
+func TestLogCachedTokensRoundTrip(t *testing.T) {
+	st := open(t)
+	cached := 1152
+	withCache := config.LogEntry{
+		Timestamp: 1, ModelIn: "m", ProviderUsed: "p", Endpoint: "chat.completions",
+		Status: 200, LatencyMs: 5, CachedTokens: &cached,
+	}
+	withoutCache := config.LogEntry{
+		Timestamp: 2, ModelIn: "m", ProviderUsed: "p", Endpoint: "chat.completions",
+		Status: 200, LatencyMs: 5,
+	}
+	if err := st.LogRequest(withCache); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LogRequest(withoutCache); err != nil {
+		t.Fatal(err)
+	}
+
+	logs, err := st.QueryLogs(config.LogFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("want 2 logs, got %d", len(logs))
+	}
+	// QueryLogs orders by ts DESC: logs[0] is the later (no-cache) entry.
+	if logs[0].CachedTokens != nil {
+		t.Fatalf("entry without usage must read back nil cached_tokens, got %v", *logs[0].CachedTokens)
+	}
+	if logs[1].CachedTokens == nil || *logs[1].CachedTokens != cached {
+		t.Fatalf("cached_tokens lost in QueryLogs: %+v", logs[1].CachedTokens)
+	}
+
+	detail, err := st.GetLog(logs[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail == nil || detail.CachedTokens == nil || *detail.CachedTokens != cached {
+		t.Fatalf("cached_tokens lost in GetLog: %+v", detail)
+	}
+}
+
 func TestSettingsRoundTrip(t *testing.T) {
 	st := open(t)
 	if err := st.SetSetting("k", "v"); err != nil {

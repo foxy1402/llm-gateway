@@ -114,10 +114,10 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 						cachedTokens = cached
 					}
 				}
-			if bytes.Equal(payload, []byte("[DONE]")) {
-				if translate && format == StreamFormatResponses {
-					// Emit terminal response.completed.
-					completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage)
+				if bytes.Equal(payload, []byte("[DONE]")) {
+					if translate && format == StreamFormatResponses {
+						// Emit terminal response.completed.
+						completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage)
 						out.WriteString("event: response.completed\n")
 						out.WriteString("data: ")
 						out.Write(completed)

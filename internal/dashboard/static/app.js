@@ -816,8 +816,12 @@ async function showLogDetail(row) {
   if (detail.cached_tokens != null && detail.cached_tokens > 0) {
     stats.push(`<div class="log-stat"><span class="log-stat-label">Cache read</span><span class="log-stat-value">${fmtNum(detail.cached_tokens)}</span></div>`);
     if (detail.prompt_tokens > 0) {
-      const eff = detail.prompt_tokens - detail.cached_tokens;
-      const pct = Math.round(detail.cached_tokens / detail.prompt_tokens * 100);
+      // Clamp defensively: some upstreams have reported cached_tokens slightly
+      // over prompt_tokens, which would otherwise render a negative "effective"
+      // count or a >100% cache rate.
+      const cappedCached = Math.min(detail.cached_tokens, detail.prompt_tokens);
+      const eff = detail.prompt_tokens - cappedCached;
+      const pct = Math.round(cappedCached / detail.prompt_tokens * 100);
       stats.push(`<div class="log-stat log-stat-wide"><span class="log-stat-label">Cache savings</span><span class="log-stat-value">${fmtNum(detail.prompt_tokens)} → ${fmtNum(eff)} effective (${pct}% cached)</span></div>`);
     }
   }
