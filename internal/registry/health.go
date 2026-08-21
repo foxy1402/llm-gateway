@@ -26,11 +26,35 @@ type HealthTracker struct {
 	codeMu     sync.RWMutex
 }
 
+// defaultRetryableCodes: 429 (rate limited) and 5xx (upstream trouble) always
+// warrant rotation. 402 is included too — several OpenAI-compatible gateways
+// (e.g. some Vercel AI Gateway upstreams) report an exhausted-credits key as
+// "402 Payment Required" instead of 429, and that failure mode is exactly as
+// account-scoped and retryable as a rate limit: a sibling key on the same
+// provider is very likely to still have credit.
+var defaultRetryableCodes = map[int]bool{402: true, 429: true, 500: true, 502: true, 503: true, 504: true}
+
+// defaultRetryableCodesList renders defaultRetryableCodes as a slice for
+// callers (Reload's fallback) that need the "no setting stored yet" default
+// in list form. Kept in one place so the two defaults can't drift apart.
+func defaultRetryableCodesList() []int {
+	out := make([]int, 0, len(defaultRetryableCodes))
+	for c := range defaultRetryableCodes {
+		out = append(out, c)
+	}
+	sort.Ints(out)
+	return out
+}
+
 func NewHealthTracker() *HealthTracker {
+	m := make(map[int]bool, len(defaultRetryableCodes))
+	for k, v := range defaultRetryableCodes {
+		m[k] = v
+	}
 	return &HealthTracker{
 		states:     map[string]*providerHealth{},
 		cooldown:   60 * time.Second,
-		errorCodes: map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true},
+		errorCodes: m,
 	}
 }
 

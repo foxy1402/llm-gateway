@@ -92,6 +92,8 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `GATEWAY_LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `DB_PATH` | no | `./gateway.db` | SQLite file path (use a mounted volume in Docker) |
 | `REQUEST_TIMEOUT` | no | `60s` | Timeout for **connect + response headers** only (per attempt). Streaming bodies run unbounded until the client disconnects or the upstream stalls for 90s — a fixed timeout would kill long coding generations mid-edit. |
+| `MAX_REQUEST_BODY_MB` | no | `25` | Cap on the incoming `/v1/*` request body size. Raise this if you send large base64-encoded images (vision/OCR) or documents — a single high-res image can easily be 5-20MB as base64 JSON. `0` or invalid values fall back to the default. |
+| `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` | no | `10` | Self-heal ceiling: how many accounts (API keys) of **one** provider get tried within a single request before giving up on it. Default `10` covers realistic key pools in full (a provider with 5 keys tries all 5 before failing). Lower it if you'd rather fail fast than have one slow/unlucky request serially churn through a very large key pool. `0` or invalid values fall back to the default. |
 | `BAN_MAXFAIL` | no | `5` | Failed dashboard logins within `BAN_FIND_TIME` before the client IP is banned (429 + `Retry-After`). Guards the login that protects all stored provider keys. `0` disables the gate. |
 | `BAN_FIND_TIME` | no | `10m` | Failure window for the login fail-to-ban counter |
 | `BAN_TIME` | no | `30m` | Base ban duration; doubles per repeat offense |
@@ -148,7 +150,9 @@ A combo is a virtual model ID bound to an ordered pool of provider IDs plus a ro
 
 ### Failure & cooldown
 
-When an upstream returns a retryable status (default `429, 500, 502, 503, 504`) or times out, the gateway records a failure and cools that provider down for `health.cooldown` seconds (default 60). Cooled-down providers are skipped until the window expires. A 404 on `/v1/completions` permanently flags that provider as not supporting the legacy endpoint (until restart).
+When an upstream returns a retryable status (default `402, 429, 500, 502, 503, 504`) or times out, the gateway records a failure and cools that **account** (API key) down for `health.cooldown` seconds (default 60) — a sibling key on the same provider stays in rotation. `402` is included by default because several OpenAI-compatible upstreams (e.g. some Vercel AI Gateway providers) report exhausted credits as "402 Payment Required" instead of the more common `429`; both are equally account-scoped and equally worth rotating away from. Customize the set via the `health.error_codes` dashboard/admin setting (comma-separated status codes) and the cooldown via `health.cooldown`. A 404 on `/v1/completions` permanently flags that provider as not supporting the legacy endpoint (until restart).
+
+**Self-heal within one request**: a direct provider call or an unpinned combo member automatically rotates across that provider's *other* healthy keys — up to `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` of them — before the request fails, so a single client call transparently survives one or more keys being rate-limited or out of credit. Pinned combo members (a member bound to one specific key) don't have siblings to fall back to *within that member*, but a same-provider sibling pinned to a **different** key on another combo member still rotates in normally.
 
 ## API examples
 
@@ -272,9 +276,10 @@ internal/middleware/ logging + panic recovery
 
 | Scenario | Behavior |
 |---|---|
-| Upstream 429 / 5xx | Rotate to next, apply cooldown |
+| Upstream 402 / 429 / 5xx | Rotate to the next account (same provider first, then next combo member), apply per-account cooldown |
 | Upstream 404/405 on any endpoint | Mark provider unsupported for that endpoint, rotate |
-| All combo members exhausted | `502` with OpenAI-shaped error |
+| Every account/combo member exhausted after a 402/429/5xx | Surface the last real upstream status (e.g. `429`) instead of a generic error |
+| Every account/combo member exhausted with no upstream response at all | `502` with OpenAI-shaped error |
 | Upstream connect/header timeout | Rotate |
 | Client disconnects mid-stream | Upstream request aborted (no eager rotation) |
 | Stream stalls >90s between chunks | Stream gracefully terminated |

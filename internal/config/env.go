@@ -10,15 +10,17 @@ import (
 )
 
 type Env struct {
-	APIKey            string
-	DashboardPassword string
-	DashboardSecret   string
-	Listen            string
-	LogLevel          string
-	DBPath            string
-	RequestTimeout    time.Duration
-	ModelAliases      map[string]string
-	BanCfg            BanConfig
+	APIKey                        string
+	DashboardPassword             string
+	DashboardSecret               string
+	Listen                        string
+	LogLevel                      string
+	DBPath                        string
+	RequestTimeout                time.Duration
+	ModelAliases                  map[string]string
+	BanCfg                        BanConfig
+	MaxRequestBodyMB              int
+	MaxAccountAttemptsPerProvider int
 }
 
 // BanConfig controls the dashboard-login fail-to-ban gate.
@@ -45,6 +47,23 @@ func LoadEnv() (*Env, error) {
 		BanTime:     getEnvDur("BAN_TIME", 30*time.Minute),
 		MaxBan:      getEnvDur("BAN_MAX_TIME", 24*time.Hour),
 		BehindProxy: os.Getenv("TRUSTED_PROXY") == "1",
+	}
+	// Default of 25MB comfortably covers base64-encoded vision/OCR payloads
+	// (a single high-res image commonly runs 5-20MB as base64 JSON) while still
+	// bounding worst-case memory per request; raise it if callers send larger
+	// documents/images.
+	e.MaxRequestBodyMB = getEnvInt("MAX_REQUEST_BODY_MB", 25)
+	if e.MaxRequestBodyMB <= 0 {
+		e.MaxRequestBodyMB = 25
+	}
+	// Per-provider self-heal attempt cap: how many accounts of ONE provider get
+	// tried within a single request before giving up on it. Default 10 covers
+	// realistic key pools in full (a 5-key provider tries all 5); raise it if you
+	// run larger pools, or lower it if you'd rather fail fast than serially churn
+	// through many keys on one slow/unlucky request.
+	e.MaxAccountAttemptsPerProvider = getEnvInt("MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER", 10)
+	if e.MaxAccountAttemptsPerProvider <= 0 {
+		e.MaxAccountAttemptsPerProvider = 10
 	}
 	if e.APIKey == "" {
 		return nil, fmt.Errorf("GATEWAY_API_KEY is required")

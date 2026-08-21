@@ -900,7 +900,7 @@ async function renderSettings() {
         <div class="card"><h2>Health & rotation</h2>
           <form onsubmit="return saveSettings(event)">
             <label>Cooldown (seconds)</label><input name="health.cooldown" type="number" min="1" value="${esc(s['health.cooldown'] || '60')}">
-            <label>Error codes triggering rotation (comma)</label><input name="health.error_codes" value="${esc(s['health.error_codes'] || '429,500,502,503,504')}">
+            <label>Error codes triggering rotation (comma)</label><input name="health.error_codes" value="${esc(s['health.error_codes'] || '402,429,500,502,503,504')}">
             <div class="form-actions"><button class="btn" type="submit">Save</button></div>
           </form></div>
         <div class="card"><h2>Logging & retention</h2>

@@ -50,6 +50,8 @@ func run() error {
 		px.SetModelAliases(env.ModelAliases)
 		slog.Info("model aliases installed", "count", len(env.ModelAliases))
 	}
+	px.SetMaxBodyBytes(int64(env.MaxRequestBodyMB) << 20)
+	px.SetMaxAccountsPerProviderCap(env.MaxAccountAttemptsPerProvider)
 
 	a := &app{env: env, store: st, reg: reg, px: px}
 

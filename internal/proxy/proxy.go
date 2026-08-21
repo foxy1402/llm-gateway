@@ -20,17 +20,27 @@ import (
 	"llm-gateway/internal/store"
 )
 
-const maxBodyBytes = 4 << 20 // 4 MiB
+// defaultMaxBodyBytes bounds the incoming request body when the gateway isn't
+// told otherwise (env.MaxRequestBodyMB via SetMaxBodyBytes). 25 MiB comfortably
+// covers base64-encoded vision/OCR payloads (a single high-res image commonly
+// runs 5-20MB as base64 JSON) — the previous 4 MiB default silently rejected
+// those with a 413 before routing ever saw the request.
+const defaultMaxBodyBytes = 25 << 20 // 25 MiB
 
 // maxLogPayload caps how many bytes of a request/response body we store in the
 // request_log for dashboard inspection. Bodies larger than this are truncated.
 const maxLogPayload = 4 << 10 // 4 KiB
 
-// maxAccountsPerProvider caps how many distinct accounts of one provider we try
-// in a single request before declaring that provider done. Free-tier keys burn
-// out one-by-one; this keeps a single client request from pinning against a
-// whole pool serially while still covering the common "2–3 spare keys" case.
-const maxAccountsPerProvider = 3
+// defaultMaxAccountsPerProviderCap bounds how many distinct accounts of ONE
+// provider get tried within a single request's attempt budget. The actual
+// per-unit budget is min(enabled accounts, this cap) — previously a flat "3"
+// regardless of pool size, which silently left keys 4+ of a 5-key provider (or
+// an unpinned combo member) untried even though they were healthy. That
+// undermined the self-heal behavior users rely on: rotate to a fresh key when
+// one hits 429/402/5xx. The cap itself still exists so one unlucky request
+// can't serially burn through dozens of keys in a huge pool; override via
+// SetMaxAccountsPerProviderCap (env MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER).
+const defaultMaxAccountsPerProviderCap = 10
 
 type Proxy struct {
 	registry *registry.Registry
@@ -40,6 +50,13 @@ type Proxy struct {
 	// modelAliases maps names clients might send that match no provider/combo to
 	// the name of the provider/combo that should actually serve the request.
 	modelAliases map[string]string
+	// maxBodyBytes caps the incoming request body read in peekBody. Defaults to
+	// defaultMaxBodyBytes; overridden via SetMaxBodyBytes (env.MAX_REQUEST_BODY_MB).
+	maxBodyBytes int64
+	// maxAccountsPerProviderCap bounds the per-provider attempt budget. Defaults to
+	// defaultMaxAccountsPerProviderCap; overridden via SetMaxAccountsPerProviderCap
+	// (env.MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER).
+	maxAccountsPerProviderCap int
 }
 
 func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy {
@@ -58,15 +75,68 @@ func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy 
 		TLSHandshakeTimeout: min(timeout, 10*time.Second),
 	}
 	return &Proxy{
-		registry: reg,
-		store:    st,
-		client:   &http.Client{Transport: tr},
-		timeout:  timeout,
+		registry:                  reg,
+		store:                     st,
+		client:                    &http.Client{Transport: tr},
+		timeout:                   timeout,
+		maxBodyBytes:              defaultMaxBodyBytes,
+		maxAccountsPerProviderCap: defaultMaxAccountsPerProviderCap,
 	}
 }
 
 // SetModelAliases installs the client-name → route fallback map (MODEL_ALIASES).
 func (p *Proxy) SetModelAliases(m map[string]string) { p.modelAliases = m }
+
+// SetMaxBodyBytes overrides the incoming request body cap (MAX_REQUEST_BODY_MB).
+// Values <= 0 are ignored so a misconfigured env can't accidentally disable the
+// guard entirely.
+func (p *Proxy) SetMaxBodyBytes(n int64) {
+	if n > 0 {
+		p.maxBodyBytes = n
+	}
+}
+
+// SetMaxAccountsPerProviderCap overrides the per-provider attempt-budget cap
+// (MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER). Values <= 0 are ignored.
+func (p *Proxy) SetMaxAccountsPerProviderCap(n int) {
+	if n > 0 {
+		p.maxAccountsPerProviderCap = n
+	}
+}
+
+// enabledAccountCount returns how many accounts of a provider could plausibly
+// serve a request: real enabled rows, or 1 for legacy single-key providers
+// that store the key on the provider itself (NextAccount synthesizes a single
+// pseudo-account in that case).
+func enabledAccountCount(p *config.Provider) int {
+	if p == nil {
+		return 0
+	}
+	if len(p.Accounts) == 0 {
+		return 1
+	}
+	n := 0
+	for _, a := range p.Accounts {
+		if a.Enabled {
+			n++
+		}
+	}
+	return n
+}
+
+// accountBudget returns how many attempts an unpinned attempt-unit (a direct
+// provider call, or an unpinned combo member) should get: every enabled key
+// deserves a shot at serving the request, up to the safety cap.
+func (p *Proxy) accountBudget(prov *config.Provider) int {
+	n := enabledAccountCount(prov)
+	if n < 1 {
+		n = 1 // let the loop enter once and surface a proper "no account available" outcome
+	}
+	if n > p.maxAccountsPerProviderCap {
+		n = p.maxAccountsPerProviderCap
+	}
+	return n
+}
 
 // peekInfo extracts routing fields without consuming more than the header JSON.
 type peekInfo struct {
@@ -76,8 +146,8 @@ type peekInfo struct {
 }
 
 // peekBody reads the request body (bounded) and parses the routing fields.
-func peekBody(r *http.Request) (*peekInfo, error) {
-	r.Body = http.MaxBytesReader(nil, r.Body, maxBodyBytes)
+func (p *Proxy) peekBody(r *http.Request) (*peekInfo, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, p.maxBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
@@ -101,7 +171,7 @@ func peekBody(r *http.Request) (*peekInfo, error) {
 // upstreamPath maps an endpoint to the upstream URL path for a provider that
 // natively supports it.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint string) {
-	info, err := peekBody(r)
+	info, err := p.peekBody(r)
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, "could not read request body", "invalid_request_error")
 		return
@@ -159,22 +229,43 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		plan = p.newRotationPlan(combo, endpoint)
 	}
 
-	// Attempt budget: combo members × their accounts. For a direct provider we treat
-	// it as a singleton with its own account pool (so a one-off provider call can
-	// still cycle multiple keys on failure before giving up).
-	memberCount := 1
+	// Attempt budget: sized off each unit's actual account pool rather than a flat
+	// multiplier, so a 5-key provider (or unpinned combo member) really gets up to
+	// 5 tries instead of silently stopping at 3. A pinned combo member only ever
+	// resolves to its one bound key, so it contributes just that key's budget.
+	// Combo members each get +1 padding on top: rotationPlan.next doesn't know an
+	// account pool is exhausted until the account-resolve call actually fails
+	// (PinnedAccount/NextAccount), which costs one "discovery" iteration that
+	// doesn't reach the network — without the pad that iteration would silently
+	// eat into a later member's budget. For a direct provider there's no member
+	// selection indirection (no plan.next), so no such discovery iteration exists
+	// and no padding is needed.
+	var maxAttempts int
 	if plan != nil {
-		memberCount = len(plan.members)
+		for _, m := range plan.members {
+			if m.AccountID != "" {
+				maxAttempts += 2 // 1 dispatch + 1 exhaustion-discovery
+				continue
+			}
+			maxAttempts += p.accountBudget(p.registry.GetProvider(m.ProviderID)) + 1
+		}
+	} else {
+		maxAttempts = p.accountBudget(provider)
 	}
-	if memberCount == 0 {
+	if maxAttempts == 0 {
 		writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
 		return
 	}
-	maxAttempts := memberCount * maxAccountsPerProvider
 
 	triedProviders := map[string]bool{} // providers whose account pool is exhausted for this request
 	triedAccounts := map[string]bool{}  // accounts already burned during this request
 	triedMembers := map[string]bool{}   // pinned members whose key already failed this request
+	// lastFailStatus/lastFailLogID remember the most recent retryable upstream
+	// response so that if every account/member is ultimately exhausted we can
+	// surface that real status (e.g. 429/402) to the caller instead of an opaque
+	// 502 "all upstreams failed" — useful signal for a client's own backoff.
+	var lastFailStatus int
+	var lastFailLogID string
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var upstream *config.Provider
@@ -335,9 +426,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 
 		// Retryable upstream status → record and rotate within this provider's pool.
-		// 429/5xx from a key are account-scoped (that key is over quota or broken) so
-		// the next attempt re-tries the SAME provider's other accounts before the
-		// combo moves to an entirely different provider.
+		// 429/402/5xx from a key are account-scoped (that key is over quota, out of
+		// credit, or broken) so the next attempt re-tries the SAME provider's other
+		// accounts — this applies equally to a direct-provider call (plan == nil)
+		// and a combo member: a 5-key direct provider must self-heal onto key 2
+		// exactly like a combo would, not fail the whole request because key 1
+		// happened to be picked first. Before this fix, plan == nil short-circuited
+		// straight to the client on the very first retryable response and never
+		// gave sibling keys a chance.
 		if p.registry.Health().IsRetryable(resp.StatusCode) {
 			resp.Body.Close()
 			// Account-scoped failure only: one burned key doesn't take the whole
@@ -346,14 +442,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// Provider-level cooldown is reserved for transport failures where the
 			// endpoint itself is unreachable and ALL keys would fail identically.
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
-			if plan == nil {
-				writeUpstreamError(w, resp.StatusCode)
-				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), fmt.Sprintf("upstream returned %d", resp.StatusCode), nil, nil, nil, upstreamURL, string(body), "")
-				return
-			}
+			lastFailStatus, lastFailLogID = resp.StatusCode, logID
 			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode)
 			// NOTE: provider is NOT dropped from triedProviders — NextAccount will
-			// yield a different key next time plan.next re-selects this provider.
+			// yield a different key next time plan.next (or the plan==nil direct
+			// path, which always re-targets the same provider) re-selects it.
 			continue
 		}
 
@@ -450,6 +543,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		return
 	}
 
+	if lastFailStatus != 0 {
+		writeUpstreamError(w, lastFailStatus)
+		p.log(info.Model, lastFailLogID, endpoint, lastFailStatus, 0, fmt.Sprintf("all accounts exhausted, last status %d", lastFailStatus), nil, nil, nil, "", "", "")
+		return
+	}
 	writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
 	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, nil, "", "", "")
 }

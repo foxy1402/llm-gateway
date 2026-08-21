@@ -62,7 +62,7 @@ func (r *Registry) Reload(st *store.Store) error {
 	}
 	// Load health settings.
 	cooldownSec, _ := getSettingInt(st, "health.cooldown", 60)
-	errCodes, _ := getSettingCSVInts(st, "health.error_codes", []int{429, 500, 502, 503, 504})
+	errCodes, _ := getSettingCSVInts(st, "health.error_codes", defaultRetryableCodesList())
 	r.health.Configure(cooldownSec, errCodes)
 
 	provMap := map[string]*config.Provider{}

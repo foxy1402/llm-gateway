@@ -641,3 +641,118 @@ func TestProviderNameModelWithToolsAndStreaming(t *testing.T) {
 		t.Fatal("tools array must be forwarded to the upstream untouched")
 	}
 }
+
+// TestSelfHealTriesEveryAccountInLargePool: a direct provider with 5 keys where
+// the first 4 are all dead (mixing 429 and 402 — exhausted-credit upstreams
+// commonly use either) must still succeed on the 5th within ONE client
+// request. This is a regression test for the old flat "maxAccountsPerProvider
+// = 3" budget, which silently gave up after 3 tries regardless of how many
+// healthy keys remained in the pool.
+func TestSelfHealTriesEveryAccountInLargePool(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	dead := map[string]int{
+		"Bearer k1": http.StatusTooManyRequests,
+		"Bearer k2": http.StatusPaymentRequired,
+		"Bearer k3": http.StatusTooManyRequests,
+		"Bearer k4": http.StatusPaymentRequired,
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		seen = append(seen, auth)
+		mu.Unlock()
+		if code, ok := dead[auth]; ok {
+			w.WriteHeader(code)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"model":"m","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "p", BaseURL: upstream.URL, Model: "m", Weight: 1, Enabled: true,
+		Accounts: []config.Account{
+			{ID: "p:k1", ProviderID: "p", Label: "one", AuthKey: "k1", Enabled: true, Weight: 1},
+			{ID: "p:k2", ProviderID: "p", Label: "two", AuthKey: "k2", Enabled: true, Weight: 1},
+			{ID: "p:k3", ProviderID: "p", Label: "three", AuthKey: "k3", Enabled: true, Weight: 1},
+			{ID: "p:k4", ProviderID: "p", Label: "four", AuthKey: "k4", Enabled: true, Weight: 1},
+			{ID: "p:k5", ProviderID: "p", Label: "five", AuthKey: "k5", Enabled: true, Weight: 1},
+		}}}
+	px, st, _ := newTestStack(t, upstream, provs, nil)
+	if err := st.ReplaceAccounts("p", provs[0].Accounts); err != nil {
+		t.Fatal(err)
+	}
+	if err := px.registry.Reload(st); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"p","messages":[],"stream":false}`))
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req, registry.EndpointChatCompletions)
+	if rec.Code != 200 {
+		t.Fatalf("request should self-heal past 4 dead keys onto the 5th, got status %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 5 {
+		t.Fatalf("expected all 5 keys tried in one request, got %d calls: %v", len(seen), seen)
+	}
+	if seen[len(seen)-1] != "Bearer k5" {
+		t.Fatalf("last call should be the only live key, got %v", seen)
+	}
+}
+
+// TestComboUnpinnedMemberTriesAllFourKeysNotJustThree: a combo with a single
+// unpinned member pointing at a 4-key provider, ALL of which are dead — this is
+// the same "budget scales with pool size" fix, but exercised through the
+// combo/rotationPlan code path (which pads for a "discovery" loop iteration,
+// unlike the direct-provider path). Every key must get a real shot before the
+// request gives up; the old flat "memberCount(1) * maxAccountsPerProvider(3)"
+// budget stopped after only 3 of the 4 keys.
+func TestComboUnpinnedMemberTriesAllFourKeysNotJustThree(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		seen = append(seen, auth)
+		mu.Unlock()
+		w.WriteHeader(http.StatusTooManyRequests) // every key is dead
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "p", BaseURL: upstream.URL, Model: "m", Weight: 1, Enabled: true,
+		Accounts: []config.Account{
+			{ID: "p:k1", ProviderID: "p", Label: "one", AuthKey: "k1", Enabled: true, Weight: 1},
+			{ID: "p:k2", ProviderID: "p", Label: "two", AuthKey: "k2", Enabled: true, Weight: 1},
+			{ID: "p:k3", ProviderID: "p", Label: "three", AuthKey: "k3", Enabled: true, Weight: 1},
+			{ID: "p:k4", ProviderID: "p", Label: "four", AuthKey: "k4", Enabled: true, Weight: 1},
+		}}}
+	combos := []config.Combo{{ID: "c", Rotation: config.Priority, Enabled: true,
+		Members: []config.ComboMember{{ProviderID: "p"}}}}
+	px, st, _ := newTestStack(t, upstream, provs, combos)
+	if err := st.ReplaceAccounts("p", provs[0].Accounts); err != nil {
+		t.Fatal(err)
+	}
+	if err := px.registry.Reload(st); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"c","messages":[],"stream":false}`))
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req, registry.EndpointChatCompletions)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("all keys dead: expected the last real 429 surfaced, got status %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	distinct := map[string]bool{}
+	for _, s := range seen {
+		distinct[s] = true
+	}
+	if len(distinct) != 4 {
+		t.Fatalf("expected all 4 distinct keys tried in one request, got %d distinct calls: %v", len(distinct), seen)
+	}
+}

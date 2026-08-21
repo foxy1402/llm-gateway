@@ -30,6 +30,21 @@ SERVERS = [
         "keys": {"nk-live": "ok", "nk-dead": "429"},
         "models": ["moonshotai/kimi-k3", "openai/gpt-oss-120b"],
     },
+    {
+        # Self-heal smoke check: a single DIRECT provider (no combo) with 5 keys.
+        # 2 dead via 429, 2 dead via 402 (exhausted-credit upstreams), 1 live.
+        # One client request must still succeed by rotating past all 4 dead keys.
+        "name": "selfheal-mock",
+        "port": 19873,
+        "keys": {
+            "sh-k1": "429",
+            "sh-k2": "402",
+            "sh-k3": "429",
+            "sh-k4": "402",
+            "sh-k5": "ok",
+        },
+        "models": ["selfheal-model"],
+    },
 ]
 
 LOG_PATH = sys.argv[1] if len(sys.argv) > 1 else "requests.log"
@@ -74,18 +89,38 @@ def make_handler(cfg):
             auth = self.headers.get("Authorization", "")
             token = auth.replace("Bearer ", "", 1)
             behavior = cfg["keys"].get(token)
+            # Vision/OCR smoke check: scan every message's content array (chat-
+            # completions shape) for an image_url part and report what arrived,
+            # so the smoke script can assert the image survived any translation
+            # (e.g. /v1/responses -> chat.completions) byte-for-byte.
+            image_len = 0
+            image_count = 0
+            for msg in payload.get("messages", []):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "image_url":
+                            url = (part.get("image_url") or {}).get("url", "")
+                            image_count += 1
+                            image_len += len(url)
             self._record({
                 "upstream": cfg["name"],
                 "kind": "chat",
                 "token": token,
                 "model": payload.get("model"),
                 "stream": payload.get("stream", False),
+                "body_len": length,
+                "image_count": image_count,
+                "image_len": image_len,
             })
             if behavior is None:
                 self._send_json(401, {"error": {"message": "invalid api key", "type": "auth_error"}})
                 return
             if behavior == "429":
                 self._send_json(429, {"error": {"message": "quota exceeded", "type": "rate_limit"}})
+                return
+            if behavior == "402":
+                self._send_json(402, {"error": {"message": "insufficient credits", "type": "payment_required"}})
                 return
             model = payload.get("model", "?")
             resp = {
@@ -96,7 +131,10 @@ def make_handler(cfg):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": f"[{cfg['name']}] served by token={token} model={model}",
+                        "content": (
+                            f"[{cfg['name']}] served by token={token} model={model} "
+                            f"body_len={length} images={image_count} image_len={image_len}"
+                        ),
                     },
                     "finish_reason": "stop",
                 }],

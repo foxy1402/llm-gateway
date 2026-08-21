@@ -19,6 +19,22 @@ func TestSupportsEndpointGeneral(t *testing.T) {
 	}
 }
 
+// TestDefaultRetryableCodesIncludes402 guards the "credits exhausted" default:
+// several OpenAI-compatible upstreams (e.g. some Vercel AI Gateway providers)
+// report an out-of-credit key as 402 Payment Required rather than 429, and
+// that failure is exactly as account-scoped/retryable as a rate limit.
+func TestDefaultRetryableCodesIncludes402(t *testing.T) {
+	h := NewHealthTracker()
+	for _, code := range []int{402, 429, 500, 502, 503, 504} {
+		if !h.IsRetryable(code) {
+			t.Fatalf("default retryable codes should include %d", code)
+		}
+	}
+	if h.IsRetryable(200) || h.IsRetryable(404) {
+		t.Fatal("200/404 must not be retryable by default")
+	}
+}
+
 func TestCooldownWindow(t *testing.T) {
 	h := NewHealthTracker()
 	h.Configure(60, []int{429})
