@@ -13,7 +13,7 @@ Configuration (providers, combos, settings) lives in an embedded SQLite database
 
 ## Features
 
-- **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`, `/v1/embeddings`
+- **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`, `/v1/embeddings` (`/v1/embeddings` must address a provider id directly — see [Combos](#combos))
 - **Combos**: virtual model IDs that fan out to a pool of providers with configurable rotation and failure-aware fallback
 - **Four rotation strategies**: `round-robin`, `weighted-round-robin` (smooth, Nginx-style), `priority` (ordered failover), `random`
 - **`/v1/responses` translation**: providers without native Responses API support are transparently translated through chat completions
@@ -147,6 +147,10 @@ A combo is a virtual model ID bound to an ordered pool of provider IDs plus a ro
 | `weighted-round-robin` | Smooth WRR — members picked in proportion to `weight`. |
 | `priority` | Always tries members in order, skipping unhealthy ones (classic failover). |
 | `random` | Random healthy member, weighted by provider `weight` (higher weight picked proportionally more often; uniform when all weights are 0/1). |
+
+**`/v1/embeddings` cannot address a combo — by design, not a bug.** Embedding vectors from different models aren't interchangeable: they can differ in dimension and always live in a different (incompatible) vector space. If a combo silently rotated an embeddings request across providers/models, you could embed some documents with model A and a later query with model B — similarity search against that mix returns meaningless results, with nothing in the response telling you it happened. Requesting `model: "<combo-id>"` against `/v1/embeddings` fails fast with `404` (`"model %q is a combo; embeddings require a direct provider id"`) instead.
+
+This doesn't cost you self-heal, though: **a direct provider with multiple accounts/keys already rotates across all of them on `/v1/embeddings`**, exactly like it does for chat completions (see [Failure & cooldown](#failure--cooldown)) — one provider id, many keys under it, no combo needed.
 
 ### Failure & cooldown
 
@@ -285,6 +289,7 @@ internal/middleware/ logging + panic recovery
 | Stream stalls >90s between chunks | Stream gracefully terminated |
 | Bad/missing API key | `401`, no upstream call |
 | Unknown model | `404` OpenAI-shaped error |
+| `/v1/embeddings` addressed to a combo id | `404` — embeddings require a direct provider id (by design, see [Combos](#combos)) |
 | Body too large | `413` |
 | Import without export header | `400`, no DB change |
 | Import DB error | `500`, transaction rolled back |
