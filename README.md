@@ -98,7 +98,27 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `BAN_FIND_TIME` | no | `10m` | Failure window for the login fail-to-ban counter |
 | `BAN_TIME` | no | `30m` | Base ban duration; doubles per repeat offense |
 | `BAN_MAX_TIME` | no | `24h` | Cap on the escalated ban duration |
-| `TRUSTED_PROXY` | no | `0` | Set `1` when running behind a PaaS load balancer or reverse proxy so the fail-to-ban reads the real client IP from `X-Forwarded-For`/`X-Real-IP`. **Leave unset when the gateway is directly exposed** — otherwise a spoofed header could evade bans. Without it on a PaaS, all traffic appears to come from the load balancer and a ban would lock everyone out, including you. |
+| `TRUSTED_PROXY` | no | `0` | Whether the fail-to-ban gate trusts the `X-Forwarded-For`/`X-Real-IP` headers for the client's real IP. See [Setting TRUSTED_PROXY correctly](#setting-trusted_proxy-correctly) — getting this wrong either lets attackers evade bans or lets one attacker lock out every legitimate user. |
+
+### Setting TRUSTED_PROXY correctly
+
+`TRUSTED_PROXY` controls one thing: whether the login fail-to-ban gate (`BAN_*`) believes the `X-Forwarded-For` / `X-Real-IP` headers when figuring out a caller's real IP, instead of the raw TCP connection address. Get it backwards and you get one of two bad outcomes:
+
+- **Set `1` but nothing in front actually sets those headers truthfully** → any caller can put whatever IP they want in `X-Forwarded-For` and the ban gate will believe it, so an attacker just rotates a fake header value on every request to dodge the ban entirely.
+- **Left unset (`0`) but there IS a trusted reverse proxy/load balancer in front** → every request's TCP source is the proxy itself, not the real visitor, so the gate sees one IP for *all* traffic. One attacker's failed logins bans that one IP — which is also the IP everyone else's traffic comes from — locking out every legitimate user, including you.
+
+The question that actually decides it: **is there something you trust sitting between the public internet and the gateway process that itself sets/overwrites `X-Forwarded-For` (never just forwarding whatever the client sent)?**
+
+| Deployment | Set `TRUSTED_PROXY`? | Why |
+|---|---|---|
+| Managed PaaS with its own edge/LB in front by design (Render, Railway, Fly.io, Heroku, AWS/GCP/Azure *managed* app platforms, Cloudflare) | **`1`** | The platform's edge always terminates the public connection and forwards to your container with a trustworthy `X-Forwarded-For` — there is no way to reach your container except through that edge, so the gateway's TCP peer is always the platform's LB, never the real client. |
+| **Raw cloud VM / IaaS with the container's port opened directly** (Oracle Cloud Compute, AWS EC2, GCP Compute Engine, DigitalOcean Droplet, Azure VM) via a security-list/NSG/firewall rule + `docker run -p`, and nothing else in front | **`0` (leave unset)** | ⚠️ This is **not** the PaaS case, even though it's "in the cloud." The public internet talks straight to your container's port — nothing rewrites headers, so anyone can forge `X-Forwarded-For` and dodge every ban. |
+| Same raw cloud VM, but with an actual **Load Balancer product** in front (OCI Load Balancer, AWS ALB/ELB, GCP Cloud Load Balancing, DO Load Balancer) or Cloudflare (proxied), so the VM's port is no longer directly reachable | **`1`** | Now something you trust is terminating the public connection and setting `X-Forwarded-For` itself — same reasoning as the PaaS row. |
+| Home server / self-hosted, with your **own** reverse proxy in front (nginx, Caddy, Traefik, Cloudflare Tunnel) that you control and that overwrites/sets `X-Forwarded-For` itself | **`1`** | Same reasoning again — you control the proxy, so the header can't be spoofed by the actual client, only by that trusted process. |
+| Home server / self-hosted, port-forwarded straight to the gateway with **no** reverse proxy in front (the gateway's HTTP server receives the public connection directly) | **`0` (leave unset)** | Nothing sanitizes the header — any client can forge `X-Forwarded-For` themselves and evade every ban. The raw `RemoteAddr` is the only value that can't be spoofed here. |
+| Home server / local-only, closed port (not exposed to the internet at all — LAN, `localhost`, VPN/Tailscale only) | **`0` (leave unset)** | The default; there's no untrusted public traffic to spoof headers in the first place, so trusting them buys nothing and only matters if you later add a reverse proxy in front. |
+
+Rule of thumb: `TRUSTED_PROXY=1` is safe **only** when you're certain every request that reaches the gateway process already passed through infrastructure you control (or a reputable managed platform) that strips/rewrites `X-Forwarded-For` — never set it just because you're "on the cloud." A raw VM with a directly-opened port (the OCI-Compute-plus-`docker run -p` case) behaves exactly like a home router port-forward: the gateway's port itself is the only thing facing the internet, so it must stay `0`.
 
 ### Generating DASHBOARD_SECRET
 
