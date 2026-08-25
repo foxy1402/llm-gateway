@@ -36,7 +36,16 @@ func Mount(mux *http.ServeMux, d *Deps) {
 
 	api := &apiHandlers{d: d}
 
-	withAuth := dash.Middleware
+	// The dashboard renders user-controlled strings (provider IDs, log payloads)
+	// but must never be sniffed into an executable context or framed.
+	secure := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			h.ServeHTTP(w, r)
+		})
+	}
+	withAuth := func(h http.Handler) http.Handler { return secure(dash.Middleware(h)) }
 
 	// Auth endpoints. The login POST is the brute-force target (a session
 	// exposes every stored key), so it sits behind the fail-to-ban gate.
@@ -44,8 +53,8 @@ func Mount(mux *http.ServeMux, d *Deps) {
 	if d.FailBan != nil {
 		login = d.FailBan.Guard(login)
 	}
-	mux.Handle("POST /dashboard/api/login", login)
-	mux.HandleFunc("POST /dashboard/api/logout", dash.LogoutHandler)
+	mux.Handle("POST /dashboard/api/login", secure(login))
+	mux.Handle("POST /dashboard/api/logout", secure(http.HandlerFunc(dash.LogoutHandler)))
 
 	// Domain APIs.
 	mux.Handle("GET /dashboard/api/providers", withAuth(http.HandlerFunc(api.listProviders)))
@@ -85,7 +94,7 @@ func Mount(mux *http.ServeMux, d *Deps) {
 	mux.Handle("GET /dashboard/api/endpoint", withAuth(http.HandlerFunc(api.endpointInfo)))
 
 	// Static SPA + login page.
-	mux.HandleFunc("GET /dashboard/login", serveLogin)
+	mux.Handle("GET /dashboard/login", secure(http.HandlerFunc(serveLogin)))
 	mux.Handle("GET /dashboard/", withAuth(http.HandlerFunc(serveSPA)))
 }
 
@@ -162,12 +171,7 @@ func (api *apiHandlers) createProvider(w http.ResponseWriter, r *http.Request) {
 	if p.Weight < 1 {
 		p.Weight = 1
 	}
-	if err := api.d.Store.UpsertProvider(p.toConfig()); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	// Persist any accounts bundled in the save (UI creates the default account here).
-	if err := api.syncAccounts(p.ID, p.AuthKey, p.Accounts); err != nil {
+	if err := api.saveProvider(p); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -175,40 +179,41 @@ func (api *apiHandlers) createProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, p)
 }
 
-// syncAccounts persists the provider's account pool. When the caller supplies no
-// accounts but a legacy AuthKey exists and the provider has no accounts yet,
-// synthesize a single default account — keeps first-time single-key creation and
-// imported legacy dumps working without the UI having to know about accounts.
-func (api *apiHandlers) syncAccounts(providerID, legacyKey string, supplied []config.Account) error {
-	out := make([]config.Account, 0, len(supplied))
-	for _, a := range supplied {
+// saveProvider persists the provider row and its account pool atomically. The
+// account set follows the old syncAccounts rules: supplied accounts win; when
+// none are supplied, a legacy AuthKey synthesizes a default account only if the
+// provider has no accounts yet (keeps first-time single-key creation and
+// imported legacy dumps working without the UI knowing about accounts).
+func (api *apiHandlers) saveProvider(p providerPayload) error {
+	out := make([]config.Account, 0, len(p.Accounts))
+	for _, a := range p.Accounts {
 		if a.AuthKey == "" {
 			continue
 		}
 		if a.ID == "" {
-			a.ID = providerID + ":" + shortID()
+			a.ID = p.ID + ":" + shortID()
 		}
-		a.ProviderID = providerID
+		a.ProviderID = p.ID
 		if a.Weight < 1 {
 			a.Weight = 1
 		}
 		out = append(out, a)
 	}
-	if len(out) > 0 {
-		return api.d.Store.ReplaceAccounts(providerID, out)
+	if len(out) == 0 {
+		existing, err := api.d.Store.GetProvider(p.ID)
+		if err != nil {
+			return err
+		}
+		if existing == nil || len(existing.Accounts) > 0 || p.AuthKey == "" {
+			// No account changes wanted → provider-only upsert.
+			return api.d.Store.UpsertProvider(p.toConfig())
+		}
+		out = []config.Account{{
+			ID: p.ID + ":" + shortID(), ProviderID: p.ID,
+			Label: "default", AuthKey: p.AuthKey, Enabled: true, Weight: 1,
+		}}
 	}
-	// No accounts supplied: only fill the legacy key if nothing exists yet.
-	existing, err := api.d.Store.GetProvider(providerID)
-	if err != nil {
-		return err
-	}
-	if existing != nil && len(existing.Accounts) == 0 && legacyKey != "" {
-		return api.d.Store.ReplaceAccounts(providerID, []config.Account{{
-			ID: providerID + ":" + shortID(), ProviderID: providerID,
-			Label: "default", AuthKey: legacyKey, Enabled: true, Weight: 1,
-		}})
-	}
-	return nil
+	return api.d.Store.SaveProviderWithAccounts(p.toConfig(), out)
 }
 
 func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
@@ -223,14 +228,16 @@ func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.ID = id
+	// Same required-field validation as create: saving a provider without
+	// base_url/model would silently break its endpoint.
+	if p.BaseURL == "" || p.Model == "" {
+		writeErr(w, 400, "base_url and model are required")
+		return
+	}
 	if p.Weight < 1 {
 		p.Weight = 1
 	}
-	if err := api.d.Store.UpsertProvider(p.toConfig()); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if err := api.syncAccounts(p.ID, p.AuthKey, p.Accounts); err != nil {
+	if err := api.saveProvider(p); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -705,8 +712,11 @@ func (api *apiHandlers) listLogs(w http.ResponseWriter, r *http.Request) {
 	f := config.LogFilter{
 		ProviderID: q.Get("provider"),
 		Endpoint:   q.Get("endpoint"),
-		Limit:      atoi(q.Get("limit"), 50),
-		Offset:     atoi(q.Get("offset"), 0),
+		// Clamp the page size: rows carry 4 KiB-truncated payloads, so an
+		// unbounded limit lets one request pull the entire log (and its
+		// payloads) into memory.
+		Limit:  min(max(atoi(q.Get("limit"), 50), 1), 500),
+		Offset: max(atoi(q.Get("offset"), 0), 0),
 	}
 	if q.Get("errors_only") == "1" || q.Get("errors_only") == "true" {
 		f.ErrorsOnly = true
@@ -726,7 +736,12 @@ func (api *apiHandlers) listLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	total, _ := api.d.Store.CountLogs(f)
+	total, err := api.d.Store.CountLogs(f)
+	if err != nil {
+		// Keep serving the page of rows, but don't present a misleading total.
+		slog.Warn("log count failed", "err", err)
+		total = -1
+	}
 	writeJSON(w, 200, map[string]any{"items": entries, "total": total, "limit": f.Limit, "offset": f.Offset})
 }
 
@@ -960,7 +975,7 @@ button{margin-top:12px;width:100%;padding:10px;background:#2563eb;color:#fff;bor
 <body><form class="card" onsubmit="return doLogin(event)"><h1>LLM Gateway</h1>
 <input type="password" id="pw" placeholder="Dashboard password" autofocus autocomplete="current-password">
 <button type="submit">Sign in</button><div class="err" id="err"></div></form>
-<script>async function doLogin(e){e.preventDefault();const pw=document.getElementById('pw').value;const res=await fetch('/dashboard/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(res.ok){location.href='/dashboard/'}else{const msg=(await res.text()).trim();document.getElementById('err').textContent=msg||'Invalid password'}}</script>
+<script>async function doLogin(e){e.preventDefault();const errEl=document.getElementById('err');try{const pw=document.getElementById('pw').value;const res=await fetch('/dashboard/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(res.ok){location.href='/dashboard/'}else{const msg=(await res.text()).trim();errEl.textContent=msg||'Invalid password'}}catch(err){errEl.textContent='Network error — could not reach the gateway'}}</script>
 </body></html>`
 
 func serveLogin(w http.ResponseWriter, r *http.Request) {

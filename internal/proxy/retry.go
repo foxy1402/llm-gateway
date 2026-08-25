@@ -112,20 +112,21 @@ func (rp *rotationPlan) next(reg *registry.Registry, tried map[string]bool, trie
 		return &avail[len(avail)-1]
 
 	case config.WeightedRoundRobin:
-		// Smooth WRR via registry state.
-		pid := reg.SelectWRR(rp.comboID, func(pid string) bool {
+		// Smooth WRR via registry state, keyed by full member identity so
+		// same-provider members pinned to different keys/models stay distinct.
+		key := reg.SelectWRR(rp.comboID, func(k string) bool {
 			for _, m := range rp.members {
-				if m.ProviderID == pid {
+				if memberKey(m) == k {
 					return eligible(m)
 				}
 			}
 			return false
 		})
-		if pid == "" {
+		if key == "" {
 			return nil
 		}
 		for i := range rp.members {
-			if rp.members[i].ProviderID == pid {
+			if memberKey(rp.members[i]) == key {
 				return &rp.members[i]
 			}
 		}

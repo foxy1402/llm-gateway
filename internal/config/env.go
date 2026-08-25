@@ -68,6 +68,11 @@ func LoadEnv() (*Env, error) {
 	if e.APIKey == "" {
 		return nil, fmt.Errorf("GATEWAY_API_KEY is required")
 	}
+	if len(e.APIKey) < 24 {
+		// Not fatal: it gates /v1/* only, but a short key is brute-forceable when
+		// the port is internet-exposed. Never log the key itself.
+		slog.Warn("GATEWAY_API_KEY is short — use a random 32+ character key (e.g. openssl rand -hex 32)", "length", len(e.APIKey))
+	}
 	if e.DashboardPassword == "" {
 		return nil, fmt.Errorf("DASHBOARD_PASSWORD is required")
 	}

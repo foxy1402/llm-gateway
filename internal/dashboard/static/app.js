@@ -22,7 +22,7 @@ const api = {
   del: (u) => api.req('DELETE', u),
 };
 
-const state = { providers: [], combos: [], settings: {}, currentRoute: 'overview', logRefresh: null, healthRefresh: null, logAutoRefresh: true };
+const state = { providers: [], combos: [], settings: {}, currentRoute: 'overview', logRefresh: null, healthRefresh: null, logAutoRefresh: true, renderSeq: 0 };
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
@@ -32,7 +32,7 @@ const mask = (s) => (s && s.length > 8 ? s.slice(0, 4) + '••••••' + 
 // Log stat formatters: thousands separators; duration in seconds past 1s; TPS is
 // completion tokens over the whole request (includes time-to-first-token for streams).
 const fmtNum = (n) => n == null ? '—' : Number(n).toLocaleString();
-const fmtDuration = (ms) => ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+const fmtDuration = (ms) => ms == null ? '—' : (ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms');
 const fmtTps = (ct, ms) => (ct != null && ms > 0) ? (ct * 1000 / ms).toFixed(1) : '—';
 
 function clearTimers() {
@@ -54,6 +54,10 @@ const routes = {
 
 function router() {
   clearTimers();
+  // Monotonic render generation: async render bodies captured before an await
+  // check this after each await and bail when the route changed underneath them,
+  // so a slow fetch can't scribble over the page the user already navigated to.
+  state.renderSeq++;
   let h = (location.hash || '#overview').slice(1).split('?')[0];
   if (!routes[h]) h = 'overview';
   state.currentRoute = h;
@@ -63,8 +67,10 @@ function router() {
 window.addEventListener('hashchange', router);
 
 $('#logoutBtn').addEventListener('click', async () => {
-  try { await api.post('/logout', {}); } catch (_) {}
-  location.href = '/dashboard/login';
+  // Redirect only when the server actually killed the session — otherwise the
+  // user lands on the login page with a live cookie and loops straight back in.
+  try { await api.post('/logout', {}); location.href = '/dashboard/login'; }
+  catch (e) { alert('Logout failed: ' + e.message); }
 });
 
 // --- API Endpoint popover ---
@@ -128,12 +134,14 @@ async function showEndpointPanel() {
 
 // ---------- Overview ----------
 async function renderOverview() {
+  const seq = state.renderSeq;
   const app = $('#app');
   app.innerHTML = '<div class="loading">Loading overview…</div>';
   try {
     const [ov, health, logs] = await Promise.all([
       api.get('/overview'), api.get('/health'), api.get('/logs?limit=10'),
     ]);
+    if (seq !== state.renderSeq) return;
     app.innerHTML = `
       <h1>Overview</h1>
       <div class="sub">Gateway status at a glance.</div>
@@ -144,13 +152,16 @@ async function renderOverview() {
         ${stat('Healthy providers', health.filter(h => h.available && h.enabled).length + ' / ' + health.filter(h => h.enabled).length)}
       </div>
       <div class="grid cols-2" style="margin-top:18px">
-        <div class="card"><h2>Provider health</h2>${healthTable(health)}</div>
+        <div class="card" id="healthCard"><h2>Provider health</h2>${healthTable(health)}</div>
         <div class="card"><h2>Recent requests</h2>${recentLogs(logs.items)}</div>
       </div>`;
+    if (state.healthRefresh) clearInterval(state.healthRefresh);
     state.healthRefresh = setInterval(async () => {
-      try { $('.card h2').parentElement.querySelector('table').outerHTML = healthTable(await api.get('/health')); } catch (_) {}
+      const card = $('#healthCard');
+      if (!card) return;
+      try { card.innerHTML = '<h2>Provider health</h2>' + healthTable(await api.get('/health')); } catch (_) {}
     }, 5000);
-  } catch (e) { app.innerHTML = errBox(e); }
+  } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
 }
 
 function stat(label, value) {
@@ -181,10 +192,12 @@ function recentLogs(items) {
 
 // ---------- Providers ----------
 async function renderProviders() {
+  const seq = state.renderSeq;
   const app = $('#app');
   app.innerHTML = '<div class="loading">Loading providers…</div>';
   try {
     state.providers = await api.get('/providers');
+    if (seq !== state.renderSeq) return;
     app.innerHTML = `
       <h1>Providers</h1>
       <div class="sub">Upstream LLM endpoints the gateway can route to.</div>
@@ -194,8 +207,12 @@ async function renderProviders() {
       </div>
       <div id="providerForm"></div>
       <div class="card"><div id="providerTable">${providerTable()}</div></div>`;
-  } catch (e) { app.innerHTML = errBox(e); }
+  } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
 }
+
+// Inline onclick attributes interpolate IDs through JSON.stringify so a quote
+// inside the ID can't break out of the JS string (esc() alone skips ').
+const jsq = (s) => esc(JSON.stringify(String(s ?? '')));
 
 function providerTable() {
   const ps = state.providers;
@@ -209,11 +226,11 @@ function providerTable() {
       <td>${p.weight}</td>
       <td>${(p.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('')}</td>
       <td>${p.responses_native ? '<span class="pill-ok">native</span>' : '<span class="muted">translated</span>'}</td>
-      <td><button class="btn sm ${p.enabled ? '' : 'ghost'}" onclick="toggleProvider('${esc(p.id)}')">${p.enabled ? 'On' : 'Off'}</button></td>
+      <td><button class="btn sm ${p.enabled ? '' : 'ghost'}" onclick="toggleProvider(${jsq(p.id)})">${p.enabled ? 'On' : 'Off'}</button></td>
       <td style="white-space:nowrap;text-align:right">
-        <button class="btn sm ghost" onclick="testProvider('${esc(p.id)}')">Test</button>
-        <button class="btn sm ghost" onclick="showProviderForm('${esc(p.id)}')">Edit</button>
-        <button class="btn sm danger" onclick="deleteProvider('${esc(p.id)}')">Del</button>
+        <button class="btn sm ghost" onclick="testProvider(${jsq(p.id)})">Test</button>
+        <button class="btn sm ghost" onclick="showProviderForm(${jsq(p.id)})">Edit</button>
+        <button class="btn sm danger" onclick="deleteProvider(${jsq(p.id)})">Del</button>
       </td></tr>`).join('') + `</tbody></table>`;
 }
 
@@ -222,7 +239,13 @@ function trunc(s, n) { return s && s.length > n ? s.slice(0, n - 1) + '…' : s;
 async function toggleProvider(id) {
   const p = state.providers.find(x => x.id === id);
   if (!p) return;
-  await api.put('/providers/' + encodeURIComponent(id), { ...p, enabled: !p.enabled });
+  const next = !p.enabled;
+  try {
+    await api.put('/providers/' + encodeURIComponent(id), { ...p, enabled: next });
+    // Success: mutate local state so the re-render reflects reality without a
+    // full refetch round trip.
+    p.enabled = next;
+  } catch (e) { alert('Toggle failed: ' + e.message); }
   $('#providerTable').innerHTML = providerTable();
 }
 
@@ -248,7 +271,7 @@ function showProviderForm(id) {
   const accounts = (p.accounts && p.accounts.length ? p.accounts : [{ label: 'default', auth_key: p.auth_key || '', weight: 1, enabled: true }]);
   $('#providerForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} provider</h2>
-    <form onsubmit="return saveProvider(event, '${esc(id || '')}')">
+    <form onsubmit="return saveProvider(event, ${jsq(id || '')})">
       <div class="row">
         <div><label>ID *</label><input name="id" value="${esc(p.id)}" ${id ? 'readonly' : 'required'}></div>
         <div><label>Display name</label><input name="display" value="${esc(p.display)}"></div>
@@ -302,6 +325,7 @@ function addAccountRow(a) {
   const row = document.createElement('div');
   row.className = 'acct-row';
   row.dataset.id = a.id || ''; // keep the ID so saves preserve keys (and combo pins)
+  row.dataset.enabled = a.enabled === false ? 'false' : 'true';
   row.style.cssText = 'display:flex;gap:6px;align-items:center;margin:4px 0';
   row.innerHTML = `
     <input name="acct_label" value="${esc(a.label || '')}" placeholder="label" style="width:110px">
@@ -325,7 +349,9 @@ function collectAccounts(form) {
       auth_key: key,
       model: row.querySelector('[name=acct_model]').value.trim() || '',
       weight: parseInt(row.querySelector('[name=acct_weight]').value) || 1,
-      enabled: true,
+      // Preserve the account's saved enabled state — hardcoding true silently
+      // re-enables keys the user deliberately disabled.
+      enabled: row.dataset.enabled !== 'false',
     };
     if (row.dataset.id) acct.id = row.dataset.id;
     out.push(acct);
@@ -356,12 +382,9 @@ async function fetchUpstreamModels() {
   const orig = btn.textContent;
   btn.textContent = 'Fetching…';
   try {
-    const res = await fetch('api/models/list', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ base_url: baseUrl, auth_key: authKey }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || res.statusText);
+    // Route through the shared api helper: correct /dashboard/api prefix,
+    // 401 handling, and consistent error extraction.
+    const data = await api.post('/models/list', { base_url: baseUrl, auth_key: authKey });
     if (!data.models || data.models.length === 0) {
       msg.style.display = 'block';
       msg.textContent = 'Upstream returned 0 models.';
@@ -414,17 +437,19 @@ async function saveProvider(e, id) {
 
 // ---------- Combos ----------
 async function renderCombos() {
+  const seq = state.renderSeq;
   const app = $('#app');
   app.innerHTML = '<div class="loading">Loading combos…</div>';
   try {
     [state.combos, state.providers] = await Promise.all([api.get('/combos'), api.get('/providers')]);
+    if (seq !== state.renderSeq) return;
     app.innerHTML = `
       <h1>Combos</h1>
       <div class="sub">Virtual models that fan out across providers with rotation + fallback.</div>
       <div class="toolbar"><div class="grow"></div><button class="btn" onclick="showComboForm()">+ Add combo</button></div>
       <div id="comboForm"></div>
       <div class="card"><div id="comboTable">${comboTable()}</div></div>`;
-  } catch (e) { app.innerHTML = errBox(e); }
+  } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
 }
 
 function comboTable() {
@@ -436,11 +461,11 @@ function comboTable() {
       <td>${esc(c.display_name)}</td>
       <td><span class="tag">${esc(c.rotation)}</span></td>
       <td class="small">${(c.members || []).map(m => `<span class="chip">${esc(memberLabel(m))}</span>`).join('')}</td>
-      <td><button class="btn sm ${c.enabled ? '' : 'ghost'}" onclick="toggleCombo('${esc(c.id)}')">${c.enabled ? 'On' : 'Off'}</button></td>
+      <td><button class="btn sm ${c.enabled ? '' : 'ghost'}" onclick="toggleCombo(${jsq(c.id)})">${c.enabled ? 'On' : 'Off'}</button></td>
       <td style="white-space:nowrap;text-align:right">
-        <button class="btn sm ghost" onclick="testCombo('${esc(c.id)}')">Test</button>
-        <button class="btn sm ghost" onclick="showComboForm('${esc(c.id)}')">Edit</button>
-        <button class="btn sm danger" onclick="deleteCombo('${esc(c.id)}')">Del</button>
+        <button class="btn sm ghost" onclick="testCombo(${jsq(c.id)})">Test</button>
+        <button class="btn sm ghost" onclick="showComboForm(${jsq(c.id)})">Edit</button>
+        <button class="btn sm danger" onclick="deleteCombo(${jsq(c.id)})">Del</button>
       </td></tr>`).join('') + `</tbody></table>`;
 }
 
@@ -470,9 +495,10 @@ async function testCombo(id) {
 
 // memberLabel renders a combo member as "provider[key] → model", tolerating both
 // the structured {provider_id,account_id,model} shape and a legacy plain-string ID.
+// Returns RAW text — the caller escapes once at interpolation time.
 function memberLabel(m) {
   if (m && typeof m === 'object') {
-    const acct = m.account_id ? '[' + esc(accountShortLabel(m.provider_id, m.account_id)) + ']' : '';
+    const acct = m.account_id ? '[' + accountShortLabel(m.provider_id, m.account_id) + ']' : '';
     return m.provider_id + acct + (m.model ? ' → ' + m.model : '');
   }
   return String(m);
@@ -493,7 +519,7 @@ function showComboForm(id) {
   const avail = state.providers;
   $('#comboForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} combo</h2>
-    <form onsubmit="return saveCombo(event, '${esc(id || '')}')">
+    <form onsubmit="return saveCombo(event, ${jsq(id || '')})">
       <div class="row">
         <div><label>ID *</label><input name="id" value="${esc(c.id)}" ${id ? 'readonly' : 'required'}></div>
         <div><label>Display name</label><input name="display_name" value="${esc(c.display_name)}"></div>
@@ -599,10 +625,15 @@ async function saveCombo(e, id) {
 // ---------- Logs ----------
 let logFilter = { limit: 50, offset: 0 };
 async function renderLogs() {
+  const seq = state.renderSeq;
+  // Reset pagination per visit — the module-level filter otherwise leaks
+  // across route changes (revisit mid-pagination → silent empty first page).
+  logFilter = { limit: 50, offset: 0 };
   const app = $('#app');
   app.innerHTML = '<div class="loading">Loading logs…</div>';
   try {
     state.providers = await api.get('/providers');
+    if (seq !== state.renderSeq) return;
     app.innerHTML = `
       <h1>Request Logs</h1>
       <div class="sub">Every proxied call, with filtering and hourly chart. Click a row for details.</div>
@@ -622,13 +653,16 @@ async function renderLogs() {
       <div class="card"><div id="logTable"></div><div class="pagination" id="logPager"></div></div>`;
     await loadLogs();
     await drawChart();
+    if (seq !== state.renderSeq) return;
     // Auto-refresh every 5 seconds for real-time log updates (if enabled).
+    // Clear before creating: a re-render must never stack intervals.
+    if (state.logRefresh) clearInterval(state.logRefresh);
     if (state.logAutoRefresh) {
       state.logRefresh = setInterval(async () => {
-        try { await loadLogs(); } catch (_) {}
+        try { await loadLogs(); await drawChart(); } catch (_) {}
       }, 5000);
     }
-  } catch (e) { app.innerHTML = errBox(e); }
+  } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
 }
 
 async function applyLogFilter() { logFilter.offset = 0; await loadLogs(); }
@@ -640,13 +674,13 @@ function toggleLogAutoRefresh() {
     btn.textContent = state.logAutoRefresh ? '⏸ Pause' : '▶ Live';
     btn.className = 'btn sm ' + (state.logAutoRefresh ? '' : 'ghost');
   }
+  // Never stack intervals: always clear the previous timer first.
+  if (state.logRefresh) clearInterval(state.logRefresh);
+  state.logRefresh = null;
   if (state.logAutoRefresh) {
     state.logRefresh = setInterval(async () => {
-      try { await loadLogs(); } catch (_) {}
+      try { await loadLogs(); await drawChart(); } catch (_) {}
     }, 5000);
-  } else {
-    if (state.logRefresh) clearInterval(state.logRefresh);
-    state.logRefresh = null;
   }
 }
 
@@ -695,8 +729,13 @@ function renderLogTable(data) {
 async function gotoLogPage(p) { logFilter.offset = p * logFilter.limit; await loadLogs(); }
 
 async function drawChart() {
-  const data = await api.get('/logs/chart?hours=24');
+  // Self-contained failure: a chart hiccup (or a missing canvas after the user
+  // navigated away mid-await) must not nuke the whole logs view.
   const canvas = $('#logChart');
+  if (!canvas) return;
+  let data;
+  try { data = await api.get('/logs/chart?hours=24'); } catch (_) { return; }
+  if (!$('#logChart')) return;
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height, pad = 30;
   ctx.clearRect(0, 0, W, H);
@@ -704,9 +743,11 @@ async function drawChart() {
   // Bucket into 24 consecutive hours ending this hour.
   const nowHr = Math.floor(Date.now() / 1000 / 3600) * 3600;
   const buckets = Array.from({ length: 24 }, (_, i) => nowHr - (23 - i) * 3600);
-  const byProvider = {};
+  // Prototype-less map: a provider literally named "constructor"/"toString"
+  // must not shadow builtins.
+  const byProvider = Object.create(null);
   for (const row of data || []) {
-    byProvider[row.provider] = byProvider[row.provider] || {};
+    byProvider[row.provider] = byProvider[row.provider] || Object.create(null);
     byProvider[row.provider][row.bucket] = row.count;
   }
   const providers = Object.keys(byProvider);
@@ -858,22 +899,6 @@ async function showLogDetail(row) {
   mountExpandedDetail($('#logTable').querySelector('tbody'));
 }
 
-function toggleLogAutoRefresh() {
-  state.logAutoRefresh = !state.logAutoRefresh;
-  const btn = $('#autoRefreshBtn');
-  if (state.logAutoRefresh) {
-    btn.className = 'btn sm';
-    btn.textContent = '⏸ Pause';
-    state.logRefresh = setInterval(async () => {
-      try { await loadLogs(); } catch (_) {}
-    }, 5000);
-  } else {
-    btn.className = 'btn sm ghost';
-    btn.textContent = '▶ Live';
-    if (state.logRefresh) { clearInterval(state.logRefresh); state.logRefresh = null; }
-  }
-}
-
 async function clearLogs() {
   if (!confirm('Clear ALL request logs? This cannot be undone.')) return;
   closeExpandedDetail();
@@ -881,6 +906,7 @@ async function clearLogs() {
     const res = await api.post('/logs/clear', {});
     logFilter.offset = 0;
     await loadLogs();
+    await drawChart();
     alert('Cleared ' + (res.deleted || 0) + ' log entries.');
   } catch (e) {
     alert('Failed to clear logs: ' + e.message);
@@ -889,10 +915,12 @@ async function clearLogs() {
 
 // ---------- Settings ----------
 async function renderSettings() {
+  const seq = state.renderSeq;
   const app = $('#app');
   app.innerHTML = '<div class="loading">Loading settings…</div>';
   try {
     state.settings = await api.get('/settings');
+    if (seq !== state.renderSeq) return;
     const s = state.settings;
     app.innerHTML = `
       <h1>Settings</h1><div class="sub">Health, rotation, and retention knobs. Changes apply immediately.</div>
@@ -913,7 +941,7 @@ async function renderSettings() {
         <div class="mono">${esc(s['_gateway_api_key_masked'] || '')}</div>
         <div class="small muted" style="margin-top:6px">Set via <span class="kbd">GATEWAY_API_KEY</span> env var at startup; not editable here.</div>
       </div>`;
-  } catch (e) { app.innerHTML = errBox(e); }
+  } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
 }
 
 async function saveSettings(e) {

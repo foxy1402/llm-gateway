@@ -25,17 +25,25 @@ const (
 type Dashboard struct {
 	password string
 	secret   []byte
+	// behindProxy marks the deployment as fronted by a TLS-terminating load
+	// balancer: the cookie must then be Secure based on X-Forwarded-Proto,
+	// since r.TLS is nil at the gateway even for HTTPS clients.
+	behindProxy bool
 
 	mu       sync.RWMutex
 	sessions map[string]time.Time // sessionID -> expiry
 }
 
-func NewDashboard(password, secret string) *Dashboard {
-	return &Dashboard{
+func NewDashboard(password, secret string, behindProxy ...bool) *Dashboard {
+	d := &Dashboard{
 		password: password,
 		secret:   []byte(secret),
 		sessions: map[string]time.Time{},
 	}
+	if len(behindProxy) > 0 {
+		d.behindProxy = behindProxy[0]
+	}
+	return d
 }
 
 // LoginHandler validates the posted password and sets a session cookie.
@@ -43,6 +51,9 @@ func (d *Dashboard) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Password string `json:"password"`
 	}
+	// A login attempt never needs more than a few hundred bytes; unbounded
+	// decoding would let junk POSTs pile into memory.
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	// Allow both JSON and form-encoded.
 	ct := r.Header.Get("Content-Type")
 	if strings.Contains(ct, "application/json") {
@@ -73,7 +84,7 @@ func (d *Dashboard) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(sessionTTL.Seconds()),
-		Secure:   r.TLS != nil,
+		Secure:   d.secureCookie(r),
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -97,6 +108,16 @@ func (d *Dashboard) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// secureCookie reports whether the session cookie may be marked Secure for this
+// request: directly over TLS, or — behind a trusted TLS-terminating proxy — when
+// the client-facing hop was HTTPS.
+func (d *Dashboard) secureCookie(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return d.behindProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // Middleware protects dashboard routes; HTML requests redirect to /dashboard/login.

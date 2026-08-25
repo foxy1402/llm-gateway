@@ -251,3 +251,105 @@ func TestChatToResponsesMissingUsage(t *testing.T) {
 		t.Fatalf("usage: %v", u)
 	}
 }
+
+// Responses-shaped tools must be nested into the chat-completions shape — a
+// verbatim forward makes tool-capable upstreams reject the request.
+func TestResponsesToChatConvertsToolShape(t *testing.T) {
+	in := []byte(`{"model":"x","input":"hi","tools":[
+		{"type":"function","name":"get_weather","description":"d","parameters":{"type":"object"},"strict":true},
+		{"type":"function","function":{"name":"already_chat"}},
+		{"type":"web_search_preview"}
+	]}`)
+	out, err := ResponsesToChatRequest(in, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	json.Unmarshal(out, &m)
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 2 {
+		t.Fatalf("tools: %v", m["tools"])
+	}
+	first := tools[0].(map[string]any)
+	fn, ok := first["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("responses tool not nested: %v", first)
+	}
+	if fn["name"] != "get_weather" || fn["strict"] != true {
+		t.Fatalf("function fields lost: %v", fn)
+	}
+	second := tools[1].(map[string]any)
+	if second["function"].(map[string]any)["name"] != "already_chat" {
+		t.Fatalf("chat-shaped tool mangled: %v", second)
+	}
+}
+
+// function_call / function_call_output input items must become assistant
+// tool_calls and role:tool messages — with the tool name carried so strict
+// backends (Kimi K3) can resolve the tool message.
+func TestResponsesToChatFunctionCallItems(t *testing.T) {
+	in := []byte(`{"model":"x","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"Weather in Paris?"}]},
+		{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Paris\"}"},
+		{"type":"function_call_output","call_id":"call_1","output":"sunny, 22C"}
+	]}`)
+	out, err := ResponsesToChatRequest(in, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	json.Unmarshal(out, &m)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages: %v", m["messages"])
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("function_call role: %v", asst["role"])
+	}
+	calls := asst["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("tool_calls: %v", asst["tool_calls"])
+	}
+	call := calls[0].(map[string]any)
+	if call["id"] != "call_1" {
+		t.Fatalf("call id: %v", call["id"])
+	}
+	fn := call["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["arguments"] != `{"city":"Paris"}` {
+		t.Fatalf("function payload: %v", fn)
+	}
+	tool := msgs[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" {
+		t.Fatalf("tool message: %v", tool)
+	}
+	if tool["name"] != "get_weather" {
+		t.Fatalf("tool name not resolved from call_id: %v", tool["name"])
+	}
+	if tool["content"] != "sunny, 22C" {
+		t.Fatalf("tool content: %v", tool["content"])
+	}
+}
+
+// A chat response carrying tool_calls must surface them as function_call
+// output items, not drop them.
+func TestChatToResponsesToolCalls(t *testing.T) {
+	chat := []byte(`{"id":"c1","created":123,"model":"m","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"search","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
+	out, err := ChatToResponsesResponse(chat, "client-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	json.Unmarshal(out, &m)
+	output := m["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output items: %v", m["output"])
+	}
+	item := output[0].(map[string]any)
+	if item["type"] != "function_call" || item["call_id"] != "call_9" || item["name"] != "search" {
+		t.Fatalf("function_call item: %v", item)
+	}
+	if item["arguments"] != `{"q":"x"}` {
+		t.Fatalf("arguments: %v", item["arguments"])
+	}
+}

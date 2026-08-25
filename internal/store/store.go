@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,14 @@ type Store struct {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
+	// Warn loudly when bootstrapping a brand-new database: on a PaaS with a
+	// missing/unmounted volume the gateway would otherwise start clean and
+	// silently serve "no providers" 404s, looking like a code bug rather than an
+	// ops problem. (Nonexistent parent dir also implies a fresh file.)
+	fresh := false
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		fresh = true
+	}
 	// Ensure the parent directory exists before SQLite tries to open the file —
 	// headless/distroless containers mount volumes that may be empty.
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
@@ -46,12 +55,21 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("run schema: %w", err)
 	}
+	if fresh {
+		slog.Warn("created a NEW empty database — no providers/combos from a previous deploy were found; if you expected state, check that your volume is mounted at DB_PATH", "path", path)
+	}
 	// Migrations: add detail columns to existing databases (idempotent — safe to
-	// re-run; SQLite errors on duplicate column are ignored).
+	// re-run; the ONLY tolerated error is SQLite's "duplicate column name").
 	for _, col := range []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER"} {
-		colName := strings.Fields(col)[0]
-		db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE request_log ADD COLUMN %s", col))
-		_ = colName // silence unused lint; the DDL above uses colName via col split
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE request_log ADD COLUMN %s", col)); err != nil {
+			if strings.Contains(err.Error(), "duplicate column") {
+				continue
+			}
+			// A failed migration must surface: swallowing it leaves the schema one
+			// column short and every later LogRequest insert fails mysteriously.
+			db.Close()
+			return nil, fmt.Errorf("migrate request_log add %q: %w", strings.Fields(col)[0], err)
+		}
 	}
 	s := &Store{db: db}
 	return s, nil
@@ -142,8 +160,20 @@ func (s *Store) GetProvider(id string) (*config.Provider, error) {
 }
 
 func (s *Store) UpsertProvider(p config.Provider) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertProviderTx(tx, p); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertProviderTx(tx *sql.Tx, p config.Provider) error {
 	tags := strings.Join(p.Tags, ",")
-	_, err := s.db.Exec(`INSERT INTO providers
+	_, err := tx.Exec(`INSERT INTO providers
 		(id, display, base_url, auth_key, model, weight, tags, enabled, responses_native)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -152,6 +182,25 @@ func (s *Store) UpsertProvider(p config.Provider) error {
 			enabled=excluded.enabled, responses_native=excluded.responses_native`,
 		p.ID, p.Display, p.BaseURL, p.AuthKey, p.Model, p.Weight, tags, boolToInt(p.Enabled), boolToInt(p.ResponsesNative))
 	return err
+}
+
+// SaveProviderWithAccounts upserts the provider row and swaps its account pool
+// in ONE transaction. Splitting the two (as the old create/update handlers did)
+// meant a failure between them left a provider row with no accounts — an
+// endpoint that 404s every request until someone notices.
+func (s *Store) SaveProviderWithAccounts(p config.Provider, accounts []config.Account) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertProviderTx(tx, p); err != nil {
+		return err
+	}
+	if err := replaceAccountsTx(tx, p.ID, accounts); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DeleteProvider(id string) error {
@@ -253,7 +302,13 @@ func (s *Store) ReplaceAccounts(providerID string, accounts []config.Account) er
 		return err
 	}
 	defer tx.Rollback()
+	if err := replaceAccountsTx(tx, providerID, accounts); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+func replaceAccountsTx(tx *sql.Tx, providerID string, accounts []config.Account) error {
 	keep := make(map[string]bool, len(accounts))
 	for _, a := range accounts {
 		keep[a.ID] = true
@@ -294,7 +349,7 @@ func (s *Store) ReplaceAccounts(providerID string, accounts []config.Account) er
 			return fmt.Errorf("upsert account: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ReplaceModels swaps the fetched model pool for a provider atomically.
@@ -465,7 +520,10 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY ts DESC"
+	// Secondary id key keeps pagination deterministic when several rows share a
+	// timestamp (clock-second resolution): without it OFFSET windows can repeat
+	// rows.
+	q += " ORDER BY ts DESC, id DESC"
 	if f.Limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", f.Limit)
 	}

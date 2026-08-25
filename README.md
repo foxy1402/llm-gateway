@@ -94,6 +94,7 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `REQUEST_TIMEOUT` | no | `60s` | Timeout for **connect + response headers** only (per attempt). Streaming bodies run unbounded until the client disconnects or the upstream stalls for 90s — a fixed timeout would kill long coding generations mid-edit. |
 | `MAX_REQUEST_BODY_MB` | no | `25` | Cap on the incoming `/v1/*` request body size. Raise this if you send large base64-encoded images (vision/OCR) or documents — a single high-res image can easily be 5-20MB as base64 JSON. `0` or invalid values fall back to the default. |
 | `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` | no | `10` | Self-heal ceiling: how many accounts (API keys) of **one** provider get tried within a single request before giving up on it. Default `10` covers realistic key pools in full (a provider with 5 keys tries all 5 before failing). Lower it if you'd rather fail fast than have one slow/unlucky request serially churn through a very large key pool. `0` or invalid values fall back to the default. |
+| `MODEL_ALIASES` | no | — | Comma-separated `incoming=target` fallbacks, e.g. `gpt-4o=mycoding,vercel=qwen-vercel`. When a client sends a model that matches **neither a combo nor a provider** (common with agents/CLIs that hardcode a model ID), the gateway retries with `target`. Combos and providers always win over aliases. |
 | `BAN_MAXFAIL` | no | `5` | Failed dashboard logins within `BAN_FIND_TIME` before the client IP is banned (429 + `Retry-After`). Guards the login that protects all stored provider keys. `0` disables the gate. |
 | `BAN_FIND_TIME` | no | `10m` | Failure window for the login fail-to-ban counter |
 | `BAN_TIME` | no | `30m` | Base ban duration; doubles per repeat offense |
@@ -108,6 +109,8 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 - **Left unset (`0`) but there IS a trusted reverse proxy/load balancer in front** → every request's TCP source is the proxy itself, not the real visitor, so the gate sees one IP for *all* traffic. One attacker's failed logins bans that one IP — which is also the IP everyone else's traffic comes from — locking out every legitimate user, including you.
 
 The question that actually decides it: **is there something you trust sitting between the public internet and the gateway process that itself sets/overwrites `X-Forwarded-For` (never just forwarding whatever the client sent)?**
+
+When `TRUSTED_PROXY=1`, the gate reads the **last** entry of `X-Forwarded-For`: append-style load balancers put the client IP they observed there, while every earlier entry is client-controllable and hence spoofable. Platforms that overwrite the header send a single entry, so last == correct there too.
 
 | Deployment | Set `TRUSTED_PROXY`? | Why |
 |---|---|---|

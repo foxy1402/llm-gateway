@@ -148,7 +148,8 @@ func TestClientIP(t *testing.T) {
 	}{
 		{"direct uses RemoteAddr", false, "203.0.113.7:9000", "", "203.0.113.7"},
 		{"direct ignores spoof xff", false, "203.0.113.7:9000", "6.6.6.6", "203.0.113.7"},
-		{"proxy uses first xff hop", true, "10.0.0.1:9000", "198.51.100.9, 10.0.0.1", "198.51.100.9"},
+		{"proxy uses last xff hop", true, "10.0.0.1:9000", "198.51.100.9, 10.0.0.1", "10.0.0.1"},
+		{"proxy ignores spoofed first hops", true, "10.0.0.1:9000", "1.1.1.1, 2.2.2.2, 198.51.100.9", "198.51.100.9"},
 		{"proxy falls back on malformed xff", true, "10.0.0.1:9000", "garbage", "10.0.0.1"},
 		{"proxy no headers falls back", true, "10.0.0.1:9000", "", "10.0.0.1"},
 		{"ipv6 remote", false, "[2001:db8::1]:443", "", "2001:db8::1"},

@@ -189,11 +189,53 @@ func (s *Store) ImportSQL(sqlText string) error {
 		if upper == "BEGIN TRANSACTION" || upper == "COMMIT" {
 			continue
 		}
+		// The import runs with the caller's authority but the file contents are
+		// untrusted text: an export that smuggles in DROP/ALTER/ATTACH/PRAGMA or
+		// touches request_log must not execute. Only the exact statements
+		// ExportSQL itself emits are allowed.
+		if err := validateImportStatement(st); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(st); err != nil {
 			return fmt.Errorf("execute statement %q: %w", trunc(st, 60), err)
 		}
 	}
 	return tx.Commit()
+}
+
+// importAllowedTables are the tables an export file may write. Notably absent:
+// request_log (audit data, never user-editable) and anything schema-level.
+var importAllowedTables = map[string]bool{
+	"providers":         true,
+	"provider_accounts": true,
+	"provider_models":   true,
+	"combos":            true,
+	"combo_members":     true,
+	"settings":          true,
+}
+
+// validateImportStatement accepts only the two statement shapes ExportSQL emits:
+// "DELETE FROM <table>" (whole-table replace, no WHERE) and
+// "INSERT INTO <table> (...) VALUES ...". Everything else — UPDATE, DROP,
+// ATTACH, PRAGMA, writes to request_log, … — is rejected.
+func validateImportStatement(st string) error {
+	fields := strings.Fields(st)
+	if len(fields) == 0 {
+		return &ImportError{Reason: "empty statement"}
+	}
+	switch strings.ToUpper(fields[0]) {
+	case "DELETE":
+		if len(fields) != 3 || !strings.EqualFold(fields[1], "FROM") || !importAllowedTables[strings.ToLower(fields[2])] {
+			return &ImportError{Reason: "only whole-table DELETE FROM <allowed table> is permitted, got: " + trunc(st, 60)}
+		}
+	case "INSERT":
+		if len(fields) < 4 || !strings.EqualFold(fields[1], "INTO") || !importAllowedTables[strings.ToLower(fields[2])] {
+			return &ImportError{Reason: "only INSERT INTO <allowed table> is permitted, got: " + trunc(st, 60)}
+		}
+	default:
+		return &ImportError{Reason: "disallowed statement kind: " + trunc(st, 60)}
+	}
+	return nil
 }
 
 // FinalizeImport synchronizes derived tables after an import: for any provider row

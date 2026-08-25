@@ -63,7 +63,7 @@ func registerRoutes(mux *http.ServeMux, a *app) {
 		Store: a.store,
 		Reg:   a.reg,
 		Proxy: a.px,
-		Auth:  auth.NewDashboard(a.env.DashboardPassword, a.env.DashboardSecret),
+		Auth:  auth.NewDashboard(a.env.DashboardPassword, a.env.DashboardSecret, a.env.BanCfg.BehindProxy),
 		Env:   a.env,
 	}
 	// Strict fail-to-ban on the login endpoint (BAN_MAXFAIL=0 disables).
@@ -131,6 +131,12 @@ func (a *app) adminImport(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	// Same self-heal the dashboard import path applies: legacy v1 dumps lack
+	// provider_accounts/provider_models rows.
+	if err := a.store.FinalizeImport(r.Context()); err != nil {
+		http.Error(w, "finalize import: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := a.reg.Reload(a.store); err != nil {

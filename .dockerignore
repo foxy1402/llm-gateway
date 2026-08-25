@@ -1,0 +1,15 @@
+# Keep the Docker build context small and leak-free.
+.git
+.github
+*.exe
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sql
+*.log
+smoke*
+.vscode
+.idea
+README.md
+docker-compose*.yml

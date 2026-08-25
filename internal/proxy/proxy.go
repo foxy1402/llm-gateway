@@ -322,6 +322,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		if model == "" {
 			slog.Warn("no upstream model resolved for attempt",
 				"provider", upstream.ID, "account", account.Label)
+			// Burn all three scopes: the account so a later member to the same
+			// provider can't pick the same model-less key again, plus the
+			// member/provider so unpinning layers stop re-offering it.
+			triedAccounts[account.ID] = true
 			if member != nil {
 				triedMembers[memberKey(*member)] = true
 			} else {
@@ -387,12 +391,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// stream runs unbounded. Header/connect/TLS timeouts are enforced at the
 		// transport level (ResponseHeaderTimeout etc.), so a fixed wall-clock context
 		// timeout never kills a live stream mid-generation (#1).
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+		// Non-streaming attempts are additionally bounded in total (headers + body
+		// window) because a 200-then-hang body has no other watchdog.
+		attemptCtx := r.Context()
+		if !info.Stream {
+			var cancel context.CancelFunc
+			attemptCtx, cancel = context.WithTimeout(attemptCtx, 2*p.timeout)
+			defer cancel()
+		}
+		upReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 		if err != nil {
+			// Almost always a malformed base_url (bad scheme, stray space, …).
+			// That's an endpoint-level defect, identical in effect to a transport
+			// failure — so rotate to the next combo member instead of hard-502ing
+			// the whole combo on one mistyped URL.
 			p.registry.Health().RecordFailure(upstream.ID, 0)
-			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
-			writeError(w, http.StatusBadGateway, "failed to build upstream request", "gateway_error")
-			return
+			slog.Warn("failed to build upstream request (check base_url)", "provider", logID, "url", upstreamURL, "err", err)
+			if plan == nil {
+				writeError(w, http.StatusBadGateway, "failed to build upstream request", "gateway_error")
+				p.log(info.Model, logID, endpoint, http.StatusBadGateway, 0, err.Error(), nil, nil, nil, upstreamURL, string(body), "")
+				return
+			}
+			triedProviders[upstream.ID] = true
+			continue
 		}
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("Authorization", "Bearer "+authKey)
@@ -509,14 +530,32 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// retryable error was already rotated — we only reach here on a 2xx and
 			// can safely commit the client response headers.
 			translateStream := format == StreamFormatResponses
-			promptTokens, completionTokens, cachedTokens := p.streamResponse(w, resp, format, translateStream)
-			p.log(info.Model, logID, endpoint, 200, time.Since(start), "", promptTokens, completionTokens, cachedTokens, upstreamURL, string(body), "")
+			promptTokens, completionTokens, cachedTokens, streamErr := p.streamResponse(w, resp, format, translateStream)
+			errMsg := ""
+			if streamErr != nil {
+				// The stream died after a 2xx: the success recorded above is
+				// misleading, so mark the account failed to feed the rotation/cooldown
+				// logic and keep a marker in the request log.
+				p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
+				errMsg = streamErr.Error()
+			}
+			p.log(info.Model, logID, endpoint, 200, time.Since(start), errMsg, promptTokens, completionTokens, cachedTokens, upstreamURL, string(body), "")
 			return
 		}
 
-		// Non-streaming: re-arm a body-read timeout for the response body only.
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		// Non-streaming: the attempt context (2×header-timeout bound set above) is
+		// the only body-read watchdog, and read errors must not be swallowed — a
+		// truncated body would otherwise be forwarded as a syntactically-valid
+		// 200 (client sees a cut-off JSON blob and retries nothing).
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 		resp.Body.Close()
+		if readErr != nil {
+			// Account-scoped dispatch failure: rotate to another key/member
+			// exactly like a retryable status would.
+			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
+			slog.Warn("upstream body read failed", "provider", logID, "err", readErr)
+			continue
+		}
 
 		var promptTokens, completionTokens, cachedTokens *int
 		if translateResponses && !nativeThisAttempt {
@@ -654,12 +693,16 @@ func spliceModel(body []byte, model string) ([]byte, bool) {
 }
 
 func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct, cached *int, upstreamURL string, reqPayload string, respSnippet string) {
-	// Truncate payloads to avoid storing megabytes per log entry.
+	// Truncate payloads to avoid storing megabytes per log entry. errMsg gets the
+	// same cap: upstream errors embed full JSON bodies that can dwarf a payload.
 	if len(reqPayload) > maxLogPayload {
 		reqPayload = string(reqPayload[:maxLogPayload])
 	}
 	if len(respSnippet) > maxLogPayload {
 		respSnippet = string(respSnippet[:maxLogPayload])
+	}
+	if len(errMsg) > maxLogPayload {
+		errMsg = string(errMsg[:maxLogPayload])
 	}
 	entry := config.LogEntry{
 		Timestamp:        time.Now().Unix(),

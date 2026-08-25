@@ -19,8 +19,18 @@ import (
 //     {type:"message", role, content:[...,{type:"input_image",image_url:"..."}]} →
 //     {role, content:[{type:"text",text},...,{type:"image_url",image_url:{url}}]}
 //     (chat-completions array content — see #vision).
-//   - stream, temperature, top_p, max_output_tokens, tools etc. pass through when
-//     they have a chat-completions analogue.
+//     {type:"function_call", call_id, name, arguments} → assistant message with
+//     chat-completions tool_calls (id ← call_id).
+//     {type:"function_call_output", call_id, output} → {role:"tool",
+//     tool_call_id:call_id, name:<resolved from the matching function_call>,
+//     content:output}. Strict tool backends (Kimi K3) reject tool messages whose
+//     tool name cannot be resolved, so the name is carried when known.
+//   - tools are CONVERTED from the responses shape
+//     {type:"function", name, description, parameters} to the chat shape
+//     {type:"function", function:{name, ...}} — forwarding them verbatim makes
+//     tool-capable providers reject the request or silently drop tool calling.
+//   - stream, temperature, top_p, max_output_tokens etc. pass through when they
+//     have a chat-completions analogue.
 func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 	var in map[string]json.RawMessage
 	if err := json.Unmarshal(body, &in); err != nil {
@@ -32,10 +42,16 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 	// input_image part marshals as an array so the image survives translation
 	// instead of being silently dropped (#vision).
 	type chatMessage struct {
-		Role    string `json:"role"`
-		Content any    `json:"content"`
+		Role       string `json:"role"`
+		Content    any    `json:"content"`
+		ToolCalls  any    `json:"tool_calls,omitempty"`
+		ToolCallID string `json:"tool_call_id,omitempty"`
+		Name       string `json:"name,omitempty"`
 	}
 	messages := []chatMessage{}
+	// call_id → tool name, so each tool message can carry the name strict
+	// backends (Kimi K3) need to resolve it.
+	callNames := map[string]string{}
 
 	if raw, ok := in["instructions"]; ok {
 		var s string
@@ -56,26 +72,89 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 				return nil, fmt.Errorf("input must be string or array")
 			}
 			for _, item := range arr {
-				role := "user"
-				if r, ok := item["role"]; ok {
-					_ = json.Unmarshal(r, &role)
+				var typ string
+				if t, ok := item["type"]; ok {
+					_ = json.Unmarshal(t, &typ)
 				}
-				var content any = ""
-				if c, ok := item["content"]; ok {
-					// String content.
-					var cs string
-					if err := json.Unmarshal(c, &cs); err == nil {
-						content = cs
-					} else {
-						// Array of {type:"input_text"|"text",text} or
-						// {type:"input_image",image_url,detail} parts.
-						var parts []map[string]json.RawMessage
-						if err := json.Unmarshal(c, &parts); err == nil {
-							content = translateContentParts(parts)
+				switch typ {
+				case "function_call":
+					var fc struct {
+						CallID    string `json:"call_id"`
+						ID        string `json:"id"`
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}
+					if raw, err := json.Marshal(item); err == nil {
+						_ = json.Unmarshal(raw, &fc)
+					}
+					id := fc.CallID
+					if id == "" {
+						id = fc.ID
+					}
+					messages = append(messages, chatMessage{
+						Role:    "assistant",
+						Content: nil,
+						ToolCalls: []map[string]any{{
+							"id":   id,
+							"type": "function",
+							"function": map[string]any{
+								"name":      fc.Name,
+								"arguments": fc.Arguments,
+							},
+						}},
+					})
+					if id != "" && fc.Name != "" {
+						callNames[id] = fc.Name
+					}
+				case "function_call_output":
+					var fo struct {
+						CallID string          `json:"call_id"`
+						Output json.RawMessage `json:"output"`
+					}
+					if raw, err := json.Marshal(item); err == nil {
+						_ = json.Unmarshal(raw, &fo)
+					}
+					// Chat tool messages want string content.
+					var content any = ""
+					var os string
+					if len(fo.Output) > 0 && json.Unmarshal(fo.Output, &os) == nil {
+						content = os
+					} else if len(fo.Output) > 0 {
+						content = string(fo.Output) // objects/arrays forwarded as JSON text
+					}
+					messages = append(messages, chatMessage{
+						Role:       "tool",
+						Content:    content,
+						ToolCallID: fo.CallID,
+						Name:       callNames[fo.CallID],
+					})
+				case "item_reference":
+					// References an item on OpenAI's server-side storage — no
+					// chat-completions equivalent; skip rather than emit a ghost
+					// message with empty content.
+					slog.Warn("dropping item_reference input item (server-side items have no chat-completions equivalent)")
+				default: // "", "message", or anything else carrying role/content
+					role := "user"
+					if r, ok := item["role"]; ok {
+						_ = json.Unmarshal(r, &role)
+					}
+					var content any = ""
+					if c, ok := item["content"]; ok {
+						// String content.
+						var cs string
+						if err := json.Unmarshal(c, &cs); err == nil {
+							content = cs
+						} else {
+							// Array of {type:"input_text"|"text",text} or
+							// {type:"input_image",image_url,detail} parts.
+							var parts []map[string]json.RawMessage
+							if err := json.Unmarshal(c, &parts); err == nil {
+								content = translateContentParts(parts)
+							}
 						}
 					}
+					messages = append(messages, chatMessage{Role: role, Content: content})
 				}
-				messages = append(messages, chatMessage{Role: role, Content: content})
 			}
 		}
 	}
@@ -91,12 +170,19 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 			out["stream"] = b
 		}
 	}
+	// Tools need shape conversion, not passthrough: a verbatim forward of
+	// {type:"function", name, ...} breaks every chat-completions upstream.
+	if v, ok := in["tools"]; ok {
+		if converted := convertResponsesTools(v); converted != nil {
+			out["tools"] = converted
+		}
+	}
 	// Pass-through identical-key fields. These are what IDE clients (Cursor, Copilot,
 	// etc.) rely on for tool use, structured output, and determinism — dropping them
 	// silently degrades agentic features.
 	for _, key := range []string{
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
-		"tools", "tool_choice", "parallel_tool_calls",
+		"tool_choice", "parallel_tool_calls",
 		"response_format", "logit_bias", "stop", "n", "seed", "user",
 	} {
 		if v, ok := in[key]; ok {
@@ -109,6 +195,67 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 		out["max_tokens"] = v
 	}
 	return json.Marshal(out)
+}
+
+// convertResponsesTools rewrites a Responses-API tools array into the
+// chat-completions shape:
+//
+//	{"type":"function","name":"f","description":"...","parameters":{...},"strict":true}
+//	  → {"type":"function","function":{"name":"f","description":"...","parameters":{...},"strict":true}}
+//
+// Tools already in the chat shape (nested "function" key) pass through with
+// their exact bytes. Responses-only built-in tools (web_search, file_search,
+// code_interpreter, computer_use, mcp, local_shell, image_generation) have no
+// chat-completions equivalent and are DROPPED with a warning — forwarding them
+// verbatim makes tool-capable upstreams 400 the whole request.
+// Returns nil when nothing usable remains, so the caller omits the key.
+func convertResponsesTools(raw json.RawMessage) json.RawMessage {
+	var tools []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return raw // not an array — forward untouched rather than destroy it
+	}
+	out := make([]map[string]any, 0, len(tools))
+	changed := false
+	for _, t := range tools {
+		if _, nested := t["function"]; nested {
+			m := make(map[string]any, len(t))
+			for k, v := range t {
+				m[k] = json.RawMessage(v)
+			}
+			out = append(out, m)
+			continue
+		}
+		var typ string
+		if tv, ok := t["type"]; ok {
+			_ = json.Unmarshal(tv, &typ)
+		}
+		if typ != "function" {
+			_, hasName := t["name"]
+			if !hasName {
+				slog.Warn("dropping responses built-in tool with no chat-completions equivalent", "type", typ)
+				continue
+			}
+		}
+		inner := make(map[string]any, len(t))
+		for k, v := range t {
+			if k != "type" {
+				inner[k] = json.RawMessage(v)
+			}
+		}
+		out = append(out, map[string]any{"type": "function", "function": inner})
+		changed = true
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	if !changed {
+		return raw // all chat-shaped already: keep the original bytes
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return raw
+	}
+	return b
 }
 
 // translateContentParts converts a Responses-API content-part array (input_text
@@ -233,8 +380,16 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
-				Role    string          `json:"role"`
-				Content json.RawMessage `json:"content"`
+				Role      string          `json:"role"`
+				Content   json.RawMessage `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -265,24 +420,59 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 		id = "resp_" + id
 	}
 
+	// Emit one output item per function call, plus the text message item when
+	// there is text. Dropping tool_calls here is what made agent clients on
+	// /v1/responses never see the calls a chat-only upstream returned.
+	output := []any{}
+	if text != "" {
+		output = append(output, map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "output_text",
+					"text": text,
+				},
+			},
+		})
+	}
+	if len(chat.Choices) > 0 {
+		for _, tc := range chat.Choices[0].Message.ToolCalls {
+			callID := tc.ID
+			if callID == "" {
+				callID = "call_" + randomRespID()
+			}
+			output = append(output, map[string]any{
+				"id":        "fc_" + randomRespID(),
+				"type":      "function_call",
+				"status":    "completed",
+				"call_id":   callID,
+				"name":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+			})
+		}
+	}
+	if len(output) == 0 {
+		// Response object must never carry an empty output array.
+		output = append(output, map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "output_text",
+					"text": "",
+				},
+			},
+		})
+	}
+
 	out := map[string]any{
 		"id":         id,
 		"object":     "response",
 		"created_at": created,
 		"model":      originalModel,
 		"status":     "completed",
-		"output": []any{
-			map[string]any{
-				"type": "message",
-				"role": "assistant",
-				"content": []any{
-					map[string]any{
-						"type": "output_text",
-						"text": text,
-					},
-				},
-			},
-		},
+		"output":     output,
 	}
 	usageObj := map[string]any{
 		"input_tokens":  chat.Usage.PromptTokens,

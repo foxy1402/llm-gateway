@@ -17,6 +17,10 @@ import (
 // persisted, so a redeploy doesn't reset brute-force progress.
 const BanSettingsKey = "failban:state"
 
+// maxTrackedIPs bounds the in-memory (and persisted) map so a botnet spraying
+// failures from fresh IPs can't grow it without limit.
+const maxTrackedIPs = 10000
+
 // ipState is the per-client record. Fails holds unix-second timestamps of
 // recent failures; Until is the ban deadline; Level is the escalation strike
 // count, kept across bans so slow brute force locks itself out harder.
@@ -60,6 +64,9 @@ func NewFailBan(cfg config.BanConfig, initial string, save func(string) error) *
 	f.cfg = cfg
 	if initial != "" {
 		_ = json.Unmarshal([]byte(initial), &f.ips) // corrupt state starts fresh
+		f.mu.Lock()
+		f.sweepLocked() // drop entries that decayed during the downtime
+		f.mu.Unlock()
 	}
 	return f
 }
@@ -93,11 +100,17 @@ func (f *FailBan) Guard(next http.Handler) http.Handler {
 // ClientIP resolves the caller's IP. Direct deployments use RemoteAddr; behind
 // a PaaS load balancer (BehindProxy) the platform's X-Forwarded-For carries the
 // real client — trust it only there, or spoofed headers would evade bans.
+//
+// When trusted, the LAST XFF entry is used: append-style load balancers append
+// the client IP they observed to whatever the client sent, so every earlier
+// entry is attacker-controllable (leftmost would let a brute-forcer rotate a
+// spoofed first hop and never accumulate failures). Platforms that overwrite
+// XFF entirely send a single entry, where rightmost is that entry anyway.
 func (f *FailBan) ClientIP(r *http.Request) string {
 	if f.cfg.BehindProxy {
 		if v := r.Header.Get("X-Forwarded-For"); v != "" {
-			ip, _, _ := strings.Cut(v, ",")
-			if p := net.ParseIP(strings.TrimSpace(ip)); p != nil {
+			parts := strings.Split(v, ",")
+			if p := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); p != nil {
 				return p.String()
 			}
 		}
@@ -146,6 +159,14 @@ func (f *FailBan) fail(ip string) {
 	now := f.now()
 	st := f.ips[ip]
 	if st == nil {
+		if len(f.ips) >= maxTrackedIPs {
+			f.sweepLocked()
+			if len(f.ips) >= maxTrackedIPs {
+				// Refusing to track a new IP only means the spray isn't counted;
+				// every banned IP already in the map stays banned.
+				return
+			}
+		}
 		st = &ipState{}
 		f.ips[ip] = st
 	}
@@ -193,6 +214,19 @@ func (f *FailBan) persistLocked() {
 		return
 	}
 	_ = f.save(string(b)) // persistence is best-effort; in-memory state still bans
+}
+
+// sweepLocked drops fully-decayed entries (no ban, no recent failures, no
+// escalation level) so the map stays bounded by addresses that still matter.
+// Level-bearing entries are kept: they were earned by real ban cycles.
+func (f *FailBan) sweepLocked() {
+	now := f.now()
+	for ip, st := range f.ips {
+		st.prune(now, f.cfg.FindTime)
+		if st.Until <= now.Unix() && len(st.Fails) == 0 && st.Level == 0 {
+			delete(f.ips, ip)
+		}
+	}
 }
 
 func (s *ipState) prune(now time.Time, window time.Duration) {

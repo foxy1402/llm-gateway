@@ -19,9 +19,19 @@ const (
 )
 
 type wrrEntry struct {
+	// key is the full member identity (provider|account|model) so duplicate
+	// members that share a provider but pin different keys/models stay distinct
+	// rotation slots — keying by provider alone collapses them and strands the
+	// sibling when the first one burns.
+	key        string
 	providerID string
 	weight     int
 	current    int
+}
+
+// comboMemberKey mirrors proxy.memberKey; kept local to avoid an import cycle.
+func comboMemberKey(m config.ComboMember) string {
+	return m.ProviderID + "|" + m.AccountID + "|" + m.Model
 }
 
 type Registry struct {
@@ -93,7 +103,7 @@ func (r *Registry) Reload(st *store.Store) error {
 				if w < 1 {
 					w = 1
 				}
-				entries = append(entries, wrrEntry{providerID: m.ProviderID, weight: w})
+				entries = append(entries, wrrEntry{key: comboMemberKey(m), providerID: m.ProviderID, weight: w})
 			}
 		}
 		// Preserve current weights if the member set is unchanged.
@@ -141,10 +151,10 @@ func sameMembers(a, b []wrrEntry) bool {
 	}
 	ka := map[string]int{}
 	for _, e := range a {
-		ka[e.providerID] = e.weight
+		ka[e.key] = e.weight
 	}
 	for _, e := range b {
-		if ka[e.providerID] != e.weight {
+		if ka[e.key] != e.weight {
 			return false
 		}
 	}
@@ -344,9 +354,11 @@ func (r *Registry) AccountsForLog(providerID string) []string {
 	return out
 }
 
-// SelectWRR runs smooth weighted round-robin over the combo's members.
-// Returns "" if no member is eligible.
-func (r *Registry) SelectWRR(comboID string, eligible func(pid string) bool) string {
+// SelectWRR runs smooth weighted round-robin over the combo's members. The
+// eligibility callback and the return value use the member key
+// (provider|account|model), so same-provider members pinned to different keys
+// never alias. Returns "" if no member is eligible.
+func (r *Registry) SelectWRR(comboID string, eligible func(memberKey string) bool) string {
 	r.wrrMu.Lock()
 	defer r.wrrMu.Unlock()
 	entries, ok := r.wrrState[comboID]
@@ -360,7 +372,7 @@ func (r *Registry) SelectWRR(comboID string, eligible func(pid string) bool) str
 	best := -1
 	for i := range entries {
 		entries[i].current += entries[i].weight
-		if eligible(entries[i].providerID) {
+		if eligible(entries[i].key) {
 			if best == -1 || entries[i].current > entries[best].current {
 				best = i
 			}
@@ -370,7 +382,7 @@ func (r *Registry) SelectWRR(comboID string, eligible func(pid string) bool) str
 		return ""
 	}
 	entries[best].current -= total
-	return entries[best].providerID
+	return entries[best].key
 }
 
 // --- settings helpers ---

@@ -14,14 +14,9 @@ services:
     volumes:
       - gateway_data:/data
     restart: unless-stopped
-    healthcheck:
-      # distroless has no shell/curl; use the HTTP probe with wget if present,
-      # otherwise rely on the tcp check below. Adjust to your tooling.
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
+    # No healthcheck: the distroless image has no shell, wget, or curl to probe
+    # with. If your platform supports raw TCP/HTTP health checks, point it at
+    # GET /healthz on port 8080 instead.
 
 volumes:
   gateway_data:

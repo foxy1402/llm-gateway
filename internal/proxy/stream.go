@@ -31,7 +31,13 @@ const streamStallTimeout = 90 * time.Second
 // Returns (promptTokens, completionTokens, cachedTokens) extracted from the terminal
 // usage frame so the caller can log real token counts for streaming requests (#12);
 // nil when the upstream did not report usage.
-func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, format StreamFormat, translate bool) (*int, *int, *int) {
+//
+// The returned error is non-nil when the stream died uncleanly — upstream read
+// error or stall timeout — so the caller can record an account failure instead of
+// letting a provider that 200s then hangs keep a perfect health record. A clean
+// EOF (with or without a [DONE] sentinel) is not an error: some providers close
+// the body instead of sending the sentinel.
+func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, format StreamFormat, translate bool) (*int, *int, *int, error) {
 	// SSE headers.
 	// Note: if translate is false, we forward chat-completions stream bytes as-is.
 	h := w.Header()
@@ -41,10 +47,12 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(upstream.StatusCode)
 
-	flusher, _ := w.(http.Flusher)
-	if flusher != nil {
-		flusher.Flush()
-	}
+	// Flush via ResponseController so wrapping middleware (the request logger's
+	// statusWriter, the fail-ban statusCapture) can never silently swallow
+	// streaming flushes again — a direct w.(http.Flusher) assertion returns nil
+	// through those wrappers and tokens arrive in 2 KiB bursts.
+	rc := http.NewResponseController(w)
+	_ = rc.Flush()
 
 	src := bufio.NewReaderSize(upstream.Body, 4096)
 	var out bytes.Buffer
@@ -83,6 +91,13 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	stall := time.NewTimer(streamStallTimeout)
 	defer stall.Stop()
 
+	// Buffered chat tool_call deltas (responses translation only). Chat-completions
+	// streams tool calls as per-index deltas with no responses equivalent that can
+	// be forwarded statelessly, so they accumulate here and are emitted as
+	// function_call events when [DONE] arrives.
+	toolOrder := []int{}
+	toolBuf := map[int]*bufferedToolCall{}
+
 	for {
 		var rr readResult
 		select {
@@ -92,8 +107,9 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			}
 			stall.Reset(streamStallTimeout)
 		case <-stall.C:
-			// Upstream stalled: terminate the stream gracefully.
-			return promptTokens, completionTokens, cachedTokens
+			// Upstream stalled mid-response: the client got a truncated stream and
+			// the account must not keep a clean health record for it.
+			return promptTokens, completionTokens, cachedTokens, fmt.Errorf("upstream stalled for %s mid-stream", streamStallTimeout)
 		}
 		line, err := rr.line, rr.err
 		if len(line) > 0 {
@@ -116,8 +132,11 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 				}
 				if bytes.Equal(payload, []byte("[DONE]")) {
 					if translate && format == StreamFormatResponses {
-						// Emit terminal response.completed.
-						completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage)
+						// Emit buffered tool calls as function_call events…
+						writeFunctionCallEvents(&out, toolOrder, toolBuf)
+						// …then the terminal response.completed carrying them in
+						// the output array.
+						completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage, functionCallOutputItems(toolOrder, toolBuf))
 						out.WriteString("event: response.completed\n")
 						out.WriteString("data: ")
 						out.Write(completed)
@@ -127,7 +146,7 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 					}
 				} else {
 					if translate && format == StreamFormatResponses {
-						translated, model, usage, details, ok := translateChatChunk(payload)
+						translated, model, usage, details, toolDeltas, ok := translateChatChunk(payload)
 						if model != "" {
 							respModel = model
 						}
@@ -137,6 +156,21 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 						}
 						if details != nil {
 							lastUsageDetails = *details
+						}
+						for _, td := range toolDeltas {
+							buf, seen := toolBuf[td.Index]
+							if !seen {
+								buf = &bufferedToolCall{}
+								toolBuf[td.Index] = buf
+								toolOrder = append(toolOrder, td.Index)
+							}
+							if td.ID != "" {
+								buf.id = td.ID
+							}
+							if td.Name != "" {
+								buf.name = td.Name
+							}
+							buf.args += td.Arguments
 						}
 						if ok {
 							for _, evt := range translated {
@@ -159,20 +193,19 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			if out.Len() > 0 {
 				_, _ = w.Write(out.Bytes())
 				out.Reset()
-				if flusher != nil {
-					flusher.Flush()
-				}
+				_ = rc.Flush()
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
-				// Best-effort: if nothing committed yet the caller could retry, but we
-				// already wrote 200, so just end the stream.
+				// Headers are long committed, so the client only sees an abrupt end;
+				// report it so the caller can mark the account unhealthy.
+				return promptTokens, completionTokens, cachedTokens, fmt.Errorf("upstream stream read error: %w", err)
 			}
 			break
 		}
 	}
-	return promptTokens, completionTokens, cachedTokens
+	return promptTokens, completionTokens, cachedTokens, nil
 }
 
 // extractChunkUsage pulls prompt/completion/cached token counts from a single
@@ -205,6 +238,95 @@ type sseEvent struct {
 	data  []byte
 }
 
+// toolCallDelta is one streaming fragment of a chat-completions tool_call.
+type toolCallDelta struct {
+	Index               int
+	ID, Name, Arguments string
+}
+
+// bufferedToolCall accumulates one chat-completions streaming tool_call (deltas
+// keyed by index) until the terminal [DONE] frame.
+type bufferedToolCall struct {
+	id, name, args string
+}
+
+// writeFunctionCallEvents emits the Responses-API event sequence for each
+// buffered tool call: output_item.added → function_call_arguments.delta →
+// function_call_arguments.done → output_item.done. Argument deltas arrive
+// once (in full) at [DONE] rather than token-by-token — correctness over
+// streaming latency: chat tool_call fragments can't be mapped incrementally
+// without inventing item ids.
+func writeFunctionCallEvents(out *bytes.Buffer, order []int, buf map[int]*bufferedToolCall) {
+	for n, idx := range order {
+		tc := buf[idx]
+		itemID, callID := toolCallItemIDs(tc)
+		added, _ := json.Marshal(map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": n,
+			"item": map[string]any{
+				"id": itemID, "type": "function_call", "call_id": callID,
+				"name": tc.name, "arguments": "",
+			},
+		})
+		delta, _ := json.Marshal(map[string]any{
+			"type":    "response.function_call_arguments.delta",
+			"item_id": itemID, "output_index": n, "delta": tc.args,
+		})
+		done, _ := json.Marshal(map[string]any{
+			"type":    "response.function_call_arguments.done",
+			"item_id": itemID, "output_index": n, "arguments": tc.args,
+		})
+		itemDone, _ := json.Marshal(map[string]any{
+			"type":         "response.output_item.done",
+			"output_index": n,
+			"item": map[string]any{
+				"id": itemID, "type": "function_call", "call_id": callID,
+				"name": tc.name, "arguments": tc.args, "status": "completed",
+			},
+		})
+		for _, evt := range []sseEvent{
+			{"response.output_item.added", added},
+			{"response.function_call_arguments.delta", delta},
+			{"response.function_call_arguments.done", done},
+			{"response.output_item.done", itemDone},
+		} {
+			out.WriteString("event: ")
+			out.WriteString(evt.event)
+			out.WriteString("\ndata: ")
+			out.Write(evt.data)
+			out.WriteString("\n\n")
+		}
+	}
+}
+
+// functionCallOutputItems builds the function_call entries for the terminal
+// response.completed event's output array (nil when no tool calls streamed).
+func functionCallOutputItems(order []int, buf map[int]*bufferedToolCall) []any {
+	if len(order) == 0 {
+		return nil
+	}
+	items := make([]any, 0, len(order))
+	for _, idx := range order {
+		tc := buf[idx]
+		itemID, callID := toolCallItemIDs(tc)
+		items = append(items, map[string]any{
+			"id": itemID, "type": "function_call", "status": "completed",
+			"call_id": callID, "name": tc.name, "arguments": tc.args,
+		})
+	}
+	return items
+}
+
+// toolCallItemIDs derives stable responses-API ids from the chat tool_call id
+// (falling back to a random one when the upstream omitted it).
+func toolCallItemIDs(tc *bufferedToolCall) (itemID, callID string) {
+	callID = tc.id
+	if callID == "" {
+		callID = "call_" + randomID()
+	}
+	return "fc_" + callID, callID
+}
+
 // usageDetails carries the prompt/completion token detail objects (cached_tokens,
 // reasoning tokens, audio tokens…). Kept as raw JSON so we forward provider-specific
 // fields verbatim instead of needing a struct for every vendor's variant.
@@ -214,18 +336,28 @@ type usageDetails struct {
 }
 
 // translateChatChunk converts one chat-completions SSE data payload into one or
-// more responses-format events.
+// more responses-format events. toolDeltas carries any streamed tool_call
+// fragments for the caller to buffer (they can't be translated statelessly).
 func translateChatChunk(payload []byte) (events []sseEvent, model string, usage *struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
-}, details *usageDetails, ok bool) {
+}, details *usageDetails, toolDeltas []toolCallDelta, ok bool) {
 	var chunk struct {
 		Model   string `json:"model"`
 		Choices []struct {
 			Delta struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
+				Role      string `json:"role"`
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					Index    int    `json:"index"`
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"delta"`
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
@@ -238,7 +370,7 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
-		return nil, "", nil, nil, false
+		return nil, "", nil, nil, nil, false
 	}
 	model = chunk.Model
 	if chunk.Usage != nil {
@@ -264,6 +396,14 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 			})
 			events = append(events, sseEvent{event: "response.output_text.delta", data: b})
 		}
+		for _, tc := range ch.Delta.ToolCalls {
+			toolDeltas = append(toolDeltas, toolCallDelta{
+				Index:     tc.Index,
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
 		if ch.FinishReason != nil && *ch.FinishReason != "" && usage == nil {
 			// Some providers signal end without a usage frame; emit a final event placeholder.
 			b, _ := json.Marshal(map[string]any{
@@ -273,20 +413,23 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 			events = append(events, sseEvent{event: "response.output_text.done", data: b})
 		}
 	}
-	return events, model, usage, details, len(events) > 0
+	return events, model, usage, details, toolDeltas, len(events) > 0
 }
 
 func buildResponseCompleted(model string, usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
-}, details *usageDetails, sawUsage bool) []byte {
+}, details *usageDetails, sawUsage bool, outputItems []any) []byte {
 	body := map[string]any{
 		"id":         "resp_" + randomID(),
 		"object":     "response",
 		"created_at": time.Now().Unix(),
 		"model":      model,
 		"status":     "completed",
+	}
+	if len(outputItems) > 0 {
+		body["output"] = outputItems
 	}
 	if sawUsage {
 		// Emit scalars plus any provider detail blobs (cached_tokens etc.) so IDEs
