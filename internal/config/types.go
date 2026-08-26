@@ -15,6 +15,10 @@ type Account struct {
 	// like Vercel AI Gateway / OpenRouter where every key can call many models).
 	// Empty = fall back to the combo member model, then the provider default.
 	Model string `json:"model,omitempty"`
+	// TokenParamMode optionally forces "max_tokens" or "max_completion_tokens"
+	// for this key's requests, overriding the provider default and skipping
+	// smart-mode auto-detection entirely. Empty = inherit (see Provider.TokenParamMode).
+	TokenParamMode string `json:"token_param_mode,omitempty"`
 }
 
 // Provider is an upstream endpoint plus the pool of accounts and known models the
@@ -34,6 +38,12 @@ type Provider struct {
 	ResponsesNative bool      `json:"responses_native"`
 	Accounts        []Account `json:"accounts,omitempty"`
 	Models          []string  `json:"models,omitempty"`
+	// TokenParamMode manually pins this provider to always send "max_tokens" or
+	// "max_completion_tokens", skipping the smart-mode auto-detect-and-heal
+	// round trip entirely (see internal/proxy/token_param.go). Empty (default)
+	// means "auto": pass through whatever the client sent, and self-heal via
+	// detection + a learned per-account cache if the model rejects it.
+	TokenParamMode string `json:"token_param_mode,omitempty"`
 }
 
 type RotationPolicy string
@@ -53,6 +63,9 @@ type ComboMember struct {
 	ProviderID string `json:"provider_id"`
 	AccountID  string `json:"account_id"`
 	Model      string `json:"model"`
+	// TokenParamMode overrides both the account's and the provider's setting for
+	// this member only. Empty = inherit (see Provider.TokenParamMode).
+	TokenParamMode string `json:"token_param_mode,omitempty"`
 }
 
 // Combo is a virtual model ID that routes across provider members.

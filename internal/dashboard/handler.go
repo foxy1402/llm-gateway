@@ -135,13 +135,14 @@ type providerPayload struct {
 	Enabled         bool             `json:"enabled"`
 	ResponsesNative bool             `json:"responses_native"`
 	Accounts        []config.Account `json:"accounts,omitempty"`
+	TokenParamMode  string           `json:"token_param_mode,omitempty"`
 }
 
 func (pp providerPayload) toConfig() config.Provider {
 	return config.Provider{
 		ID: pp.ID, Display: pp.Display, BaseURL: pp.BaseURL, AuthKey: pp.AuthKey,
 		Model: pp.Model, Weight: pp.Weight, Tags: pp.Tags, Enabled: pp.Enabled,
-		ResponsesNative: pp.ResponsesNative,
+		ResponsesNative: pp.ResponsesNative, TokenParamMode: pp.TokenParamMode,
 	}
 }
 
@@ -171,12 +172,31 @@ func (api *apiHandlers) createProvider(w http.ResponseWriter, r *http.Request) {
 	if p.Weight < 1 {
 		p.Weight = 1
 	}
+	if err := validateTokenParamModes(p); err != "" {
+		writeErr(w, 400, err)
+		return
+	}
 	if err := api.saveProvider(p); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	api.reload()
 	writeJSON(w, 201, p)
+}
+
+// validateTokenParamModes rejects a typo'd token_param_mode instead of
+// silently storing a value that smart mode will never recognize (see
+// proxy.ValidTokenParamMode; only "", "max_tokens", "max_completion_tokens").
+func validateTokenParamModes(p providerPayload) string {
+	if !proxy.ValidTokenParamMode(p.TokenParamMode) {
+		return fmt.Sprintf("invalid token_param_mode %q on provider: must be \"\", \"max_tokens\", or \"max_completion_tokens\"", p.TokenParamMode)
+	}
+	for _, a := range p.Accounts {
+		if !proxy.ValidTokenParamMode(a.TokenParamMode) {
+			return fmt.Sprintf("invalid token_param_mode %q on account %q", a.TokenParamMode, a.Label)
+		}
+	}
+	return ""
 }
 
 // saveProvider persists the provider row and its account pool atomically. The
@@ -236,6 +256,10 @@ func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.Weight < 1 {
 		p.Weight = 1
+	}
+	if err := validateTokenParamModes(p); err != "" {
+		writeErr(w, 400, err)
+		return
 	}
 	if err := api.saveProvider(p); err != nil {
 		writeErr(w, 500, err.Error())
@@ -572,9 +596,10 @@ func (c *capture) Flush() {}
 // comboMemberPayload is one provider(+key)+model binding in a combo. AccountID
 // pins the member to one API key of the provider ("" = rotate across its keys).
 type comboMemberPayload struct {
-	ProviderID string `json:"provider_id"`
-	AccountID  string `json:"account_id"`
-	Model      string `json:"model"`
+	ProviderID     string `json:"provider_id"`
+	AccountID      string `json:"account_id"`
+	Model          string `json:"model"`
+	TokenParamMode string `json:"token_param_mode,omitempty"`
 }
 
 type comboPayload struct {
@@ -591,7 +616,7 @@ func (cp comboPayload) toConfig() config.Combo {
 		if m.ProviderID == "" {
 			continue
 		}
-		members = append(members, config.ComboMember{ProviderID: m.ProviderID, AccountID: m.AccountID, Model: m.Model})
+		members = append(members, config.ComboMember{ProviderID: m.ProviderID, AccountID: m.AccountID, Model: m.Model, TokenParamMode: m.TokenParamMode})
 	}
 	return config.Combo{
 		ID: cp.ID, DisplayName: cp.DisplayName, Rotation: config.RotationPolicy(cp.Rotation),
@@ -663,6 +688,9 @@ func (api *apiHandlers) validateCombo(c comboPayload) string {
 		p := api.d.Reg.GetProvider(m.ProviderID)
 		if p == nil {
 			return "unknown provider in members: " + m.ProviderID
+		}
+		if !proxy.ValidTokenParamMode(m.TokenParamMode) {
+			return fmt.Sprintf("invalid token_param_mode %q on member for provider %q", m.TokenParamMode, m.ProviderID)
 		}
 		if m.AccountID != "" {
 			found := false

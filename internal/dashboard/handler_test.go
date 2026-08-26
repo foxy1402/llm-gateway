@@ -116,4 +116,37 @@ func TestComboAccountValidation(t *testing.T) {
 	}}); msg == "" {
 		t.Fatal("cross-provider pin must fail validation")
 	}
+
+	// A bogus token_param_mode must be rejected too, not silently stored as a
+	// value smart mode will never match.
+	if msg := api.validateCombo(comboPayload{ID: "bad-mode", Members: []comboMemberPayload{
+		{ProviderID: "vercel", TokenParamMode: "maxTokensPlz"},
+	}}); msg == "" {
+		t.Fatal("invalid token_param_mode on a member must fail validation")
+	}
+	if msg := api.validateCombo(comboPayload{ID: "good-mode", Members: []comboMemberPayload{
+		{ProviderID: "vercel", TokenParamMode: "max_completion_tokens"},
+	}}); msg != "" {
+		t.Fatalf("valid token_param_mode rejected: %s", msg)
+	}
+}
+
+// TestValidateTokenParamModes covers the provider-create/update guard: a
+// typo'd token_param_mode on the provider itself or on any of its accounts
+// must be rejected with a clear 400 instead of silently stored.
+func TestValidateTokenParamModes(t *testing.T) {
+	valid := []string{"", "max_tokens", "max_completion_tokens"}
+	for _, v := range valid {
+		if msg := validateTokenParamModes(providerPayload{TokenParamMode: v}); msg != "" {
+			t.Fatalf("valid mode %q rejected: %s", v, msg)
+		}
+	}
+	if msg := validateTokenParamModes(providerPayload{TokenParamMode: "maxTokens"}); msg == "" {
+		t.Fatal("invalid provider-level mode must be rejected")
+	}
+	if msg := validateTokenParamModes(providerPayload{
+		Accounts: []config.Account{{Label: "k1", TokenParamMode: "bogus"}},
+	}); msg == "" {
+		t.Fatal("invalid account-level mode must be rejected")
+	}
 }

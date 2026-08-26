@@ -59,16 +59,29 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		slog.Warn("created a NEW empty database — no providers/combos from a previous deploy were found; if you expected state, check that your volume is mounted at DB_PATH", "path", path)
 	}
 	// Migrations: add detail columns to existing databases (idempotent — safe to
-	// re-run; the ONLY tolerated error is SQLite's "duplicate column name").
-	for _, col := range []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER"} {
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE request_log ADD COLUMN %s", col)); err != nil {
-			if strings.Contains(err.Error(), "duplicate column") {
-				continue
+	// re-run; the ONLY tolerated error is SQLite's "duplicate column name"). A
+	// fresh DB already has these via schema.sql above; this only matters for a
+	// database created before the column existed.
+	columnMigrations := []struct {
+		table   string
+		columns []string
+	}{
+		{"request_log", []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER"}},
+		{"providers", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
+		{"provider_accounts", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
+		{"combo_members", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
+	}
+	for _, mig := range columnMigrations {
+		for _, col := range mig.columns {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", mig.table, col)); err != nil {
+				if strings.Contains(err.Error(), "duplicate column") {
+					continue
+				}
+				// A failed migration must surface: swallowing it leaves the schema one
+				// column short and every later insert/select against it fails mysteriously.
+				db.Close()
+				return nil, fmt.Errorf("migrate %s add %q: %w", mig.table, strings.Fields(col)[0], err)
 			}
-			// A failed migration must surface: swallowing it leaves the schema one
-			// column short and every later LogRequest insert fails mysteriously.
-			db.Close()
-			return nil, fmt.Errorf("migrate request_log add %q: %w", strings.Fields(col)[0], err)
 		}
 	}
 	s := &Store{db: db}
@@ -86,7 +99,7 @@ func scanProvider(row interface{ Scan(...any) error }) (config.Provider, error) 
 	var p config.Provider
 	var tags string
 	var enabled, native int
-	err := row.Scan(&p.ID, &p.Display, &p.BaseURL, &p.AuthKey, &p.Model, &p.Weight, &tags, &enabled, &native)
+	err := row.Scan(&p.ID, &p.Display, &p.BaseURL, &p.AuthKey, &p.Model, &p.Weight, &tags, &enabled, &native, &p.TokenParamMode)
 	if err != nil {
 		return config.Provider{}, err
 	}
@@ -100,7 +113,7 @@ func scanProvider(row interface{ Scan(...any) error }) (config.Provider, error) 
 	return p, nil
 }
 
-const providerCols = "id, display, base_url, auth_key, model, weight, tags, enabled, responses_native"
+const providerCols = "id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode"
 
 func (s *Store) ListProviders() ([]config.Provider, error) {
 	rows, err := s.db.Query("SELECT " + providerCols + " FROM providers ORDER BY id")
@@ -174,13 +187,14 @@ func (s *Store) UpsertProvider(p config.Provider) error {
 func upsertProviderTx(tx *sql.Tx, p config.Provider) error {
 	tags := strings.Join(p.Tags, ",")
 	_, err := tx.Exec(`INSERT INTO providers
-		(id, display, base_url, auth_key, model, weight, tags, enabled, responses_native)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			display=excluded.display, base_url=excluded.base_url, auth_key=excluded.auth_key,
 			model=excluded.model, weight=excluded.weight, tags=excluded.tags,
-			enabled=excluded.enabled, responses_native=excluded.responses_native`,
-		p.ID, p.Display, p.BaseURL, p.AuthKey, p.Model, p.Weight, tags, boolToInt(p.Enabled), boolToInt(p.ResponsesNative))
+			enabled=excluded.enabled, responses_native=excluded.responses_native,
+			token_param_mode=excluded.token_param_mode`,
+		p.ID, p.Display, p.BaseURL, p.AuthKey, p.Model, p.Weight, tags, boolToInt(p.Enabled), boolToInt(p.ResponsesNative), p.TokenParamMode)
 	return err
 }
 
@@ -210,12 +224,12 @@ func (s *Store) DeleteProvider(id string) error {
 
 // --- Provider accounts & models ---
 
-const accountCols = "id, provider_id, label, auth_key, model, enabled, position, weight"
+const accountCols = "id, provider_id, label, auth_key, model, enabled, position, weight, token_param_mode"
 
 func scanAccount(row interface{ Scan(...any) error }) (config.Account, error) {
 	var a config.Account
 	var enabled int
-	err := row.Scan(&a.ID, &a.ProviderID, &a.Label, &a.AuthKey, &a.Model, &enabled, &a.Position, &a.Weight)
+	err := row.Scan(&a.ID, &a.ProviderID, &a.Label, &a.AuthKey, &a.Model, &enabled, &a.Position, &a.Weight, &a.TokenParamMode)
 	if err != nil {
 		return config.Account{}, err
 	}
@@ -340,12 +354,13 @@ func replaceAccountsTx(tx *sql.Tx, providerID string, accounts []config.Account)
 	}
 	for i, a := range accounts {
 		if _, err := tx.Exec(`INSERT INTO provider_accounts
-			(id, provider_id, label, auth_key, model, enabled, position, weight)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			(id, provider_id, label, auth_key, model, enabled, position, weight, token_param_mode)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				label = excluded.label, auth_key = excluded.auth_key, model = excluded.model,
-				enabled = excluded.enabled, position = excluded.position, weight = excluded.weight`,
-			a.ID, providerID, a.Label, a.AuthKey, a.Model, boolToInt(a.Enabled), i, max(a.Weight, 1)); err != nil {
+				enabled = excluded.enabled, position = excluded.position, weight = excluded.weight,
+				token_param_mode = excluded.token_param_mode`,
+			a.ID, providerID, a.Label, a.AuthKey, a.Model, boolToInt(a.Enabled), i, max(a.Weight, 1), a.TokenParamMode); err != nil {
 			return fmt.Errorf("upsert account: %w", err)
 		}
 	}
@@ -429,7 +444,7 @@ func (s *Store) GetCombo(id string) (*config.Combo, error) {
 }
 
 func (s *Store) listComboMembers(comboID string) ([]config.ComboMember, error) {
-	rows, err := s.db.Query("SELECT provider_id, COALESCE(account_id, ''), model FROM combo_members WHERE combo_id = ? ORDER BY position", comboID)
+	rows, err := s.db.Query("SELECT provider_id, COALESCE(account_id, ''), model, token_param_mode FROM combo_members WHERE combo_id = ? ORDER BY position", comboID)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +452,7 @@ func (s *Store) listComboMembers(comboID string) ([]config.ComboMember, error) {
 	out := []config.ComboMember{}
 	for rows.Next() {
 		var m config.ComboMember
-		if err := rows.Scan(&m.ProviderID, &m.AccountID, &m.Model); err != nil {
+		if err := rows.Scan(&m.ProviderID, &m.AccountID, &m.Model, &m.TokenParamMode); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -467,8 +482,8 @@ func (s *Store) UpsertCombo(c config.Combo) error {
 		if m.AccountID != "" {
 			accountID = m.AccountID
 		}
-		if _, err := tx.Exec("INSERT INTO combo_members (combo_id, provider_id, account_id, model, position) VALUES (?, ?, ?, ?, ?)",
-			c.ID, m.ProviderID, accountID, m.Model, i); err != nil {
+		if _, err := tx.Exec("INSERT INTO combo_members (combo_id, provider_id, account_id, model, token_param_mode, position) VALUES (?, ?, ?, ?, ?, ?)",
+			c.ID, m.ProviderID, accountID, m.Model, m.TokenParamMode, i); err != nil {
 			return fmt.Errorf("insert member: %w", err)
 		}
 	}

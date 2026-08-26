@@ -379,6 +379,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			body = rewritten
 		}
 
+		// Smart max_tokens/max_completion_tokens mode, proactive half: if this
+		// exact account already has an explicit pin OR a previously LEARNED
+		// preference (from a prior live auto-heal, see tryTokenParamHeal below),
+		// apply it now so this attempt skips the failing first round trip
+		// entirely instead of paying it again on every request.
+		if mode := p.resolveTokenParamMode(upstream, account, member); mode != "" {
+			if fixed, ok := applyTokenParamMode(body, mode); ok {
+				body = fixed
+			}
+		}
+
 		// Dispatch. base_url is the full OpenAI-compatible root including its own
 		// version (https://api.groq.com/openai/v1, https://generativelanguage.googleapis.com/v1beta/openai,
 		// https://open.bigmodel.cn/api/paas/v4…). We append the endpoint name
@@ -444,6 +455,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 			triedProviders[upstream.ID] = true
 			continue
+		}
+
+		// Smart max_tokens/max_completion_tokens mode: some models (OpenAI's
+		// reasoning tier and upstreams that mirror it, e.g. Lightning AI's
+		// "openai/gpt-5.6-sol") hard-reject whichever of these two field names
+		// the client didn't use — every OTHER model on the same provider is
+		// usually fine with the client's original field, so this can't be fixed
+		// with a provider-wide setting without breaking those. Auto-detect the
+		// mismatch from the error response and transparently redispatch once
+		// with the field renamed, on the exact same account/URL — this is a
+		// request-shape problem, not an account-scoped failure, so it must not
+		// burn the key into cooldown or consume a self-heal rotation attempt.
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+				resp, body = healedResp, healedBody
+			}
 		}
 
 		// Retryable upstream status → record and rotate within this provider's pool.

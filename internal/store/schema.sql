@@ -13,19 +13,23 @@ CREATE TABLE IF NOT EXISTS providers (
     tags             TEXT NOT NULL DEFAULT '',
     enabled          INTEGER NOT NULL DEFAULT 1,
     responses_native INTEGER NOT NULL DEFAULT 0,
+    -- '' (auto, default) | 'max_tokens' | 'max_completion_tokens' — manual pin
+    -- for the max_tokens/max_completion_tokens smart mode (see internal/proxy/token_param.go).
+    token_param_mode TEXT NOT NULL DEFAULT '',
     created_at       INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS provider_accounts (
-    id          TEXT PRIMARY KEY,
-    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-    label       TEXT NOT NULL DEFAULT '',
-    auth_key    TEXT NOT NULL,
-    model       TEXT NOT NULL DEFAULT '',
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    position    INTEGER NOT NULL DEFAULT 0,
-    weight      INTEGER NOT NULL DEFAULT 1,
-    created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+    id               TEXT PRIMARY KEY,
+    provider_id      TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    label            TEXT NOT NULL DEFAULT '',
+    auth_key         TEXT NOT NULL,
+    model            TEXT NOT NULL DEFAULT '',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    position         INTEGER NOT NULL DEFAULT 0,
+    weight           INTEGER NOT NULL DEFAULT 1,
+    token_param_mode TEXT NOT NULL DEFAULT '', -- overrides the provider's setting; '' = inherit
+    created_at       INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS provider_models (
@@ -48,11 +52,12 @@ CREATE TABLE IF NOT EXISTS combos (
 -- falls back to key rotation when the pinned account is removed. Members are always
 -- rewritten with sequential positions on save, so (combo_id, position) is the PK.
 CREATE TABLE IF NOT EXISTS combo_members (
-    combo_id    TEXT NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
-    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-    account_id  TEXT REFERENCES provider_accounts(id) ON DELETE SET NULL,
-    model       TEXT NOT NULL DEFAULT '',
-    position    INTEGER NOT NULL DEFAULT 0,
+    combo_id         TEXT NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
+    provider_id      TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    account_id       TEXT REFERENCES provider_accounts(id) ON DELETE SET NULL,
+    model            TEXT NOT NULL DEFAULT '',
+    token_param_mode TEXT NOT NULL DEFAULT '', -- overrides account/provider settings; '' = inherit
+    position         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (combo_id, position)
 );
 

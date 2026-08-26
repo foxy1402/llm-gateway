@@ -181,6 +181,16 @@ When an upstream returns a retryable status (default `402, 429, 500, 502, 503, 5
 
 **Self-heal within one request**: a direct provider call or an unpinned combo member automatically rotates across that provider's *other* healthy keys — up to `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` of them — before the request fails, so a single client call transparently survives one or more keys being rate-limited or out of credit. Pinned combo members (a member bound to one specific key) don't have siblings to fall back to *within that member*, but a same-provider sibling pinned to a **different** key on another combo member still rotates in normally.
 
+### Smart mode: `max_tokens` vs `max_completion_tokens`
+
+Some models — OpenAI's reasoning tier, and any OpenAI-compatible upstream that mirrors that behavior (observed live against Lightning AI's `openai/gpt-5.6-sol`) — hard-reject whichever of `max_tokens` / `max_completion_tokens` the client didn't send, e.g. `"this model is not supported MaxTokens, please use MaxCompletionTokens"`. This can't be a provider-wide setting by default, because every *other* model on that same provider is usually fine with whichever field the client used — so out of the box, smart mode is fully automatic and needs no configuration:
+
+1. **Reactive heal (zero config)**: the gateway detects this specific error shape from the upstream's response (matching on both field names appearing together, regardless of status code or exact wording — seen as both `400` and `500` in the wild) and transparently retries **once**, on the exact same key/URL, with the field renamed. Because this is a request-shape mismatch and not an account-scoped failure, the healed retry never burns the key into cooldown and never consumes a self-heal rotation attempt — a single-key provider heals just as well as a five-key one.
+2. **Learned cache (removes the extra round trip after the first request)**: once a heal succeeds for a given account, the gateway remembers which field that account's model wants (in memory; cleared on restart) and applies it *proactively* on every later request for that same account — so only the very first request to a newly-added quirky key ever pays the extra round trip. If a provider's bound model later changes and the learned preference turns out to be stale, step 1 above still runs as a safety net and re-learns the correct answer.
+3. **Manual override (zero round trips, ever)**: if you already know a key needs a specific field, set it explicitly and skip auto-detection entirely — a `token_param_mode` of `""` (auto, default), `max_tokens`, or `max_completion_tokens` can be set on a provider, on an individual account/key (overrides the provider), or on a combo member (overrides both). Precedence is most-specific-wins: combo member → account → provider → learned cache → auto passthrough. In the dashboard this is the "max_tokens field" dropdown next to each provider's Upstream model and each combo member row.
+
+If the body already has neither or both fields, or a healed/overridden retry fails for an unrelated reason, the real upstream response passes straight through to the client as usual.
+
 ## API examples
 
 ### List models
@@ -305,6 +315,7 @@ internal/middleware/ logging + panic recovery
 |---|---|
 | Upstream 402 / 429 / 5xx | Rotate to the next account (same provider first, then next combo member), apply per-account cooldown |
 | Upstream 404/405 on any endpoint | Mark provider unsupported for that endpoint, rotate |
+| Upstream rejects `max_tokens`/`max_completion_tokens` (wrong one for that model) | Auto-corrected and retried once on the same key, transparent to the client (see [Smart mode](#smart-mode-max_tokens-vs-max_completion_tokens)) |
 | Every account/combo member exhausted after a 402/429/5xx | Surface the last real upstream status (e.g. `429`) instead of a generic error |
 | Every account/combo member exhausted with no upstream response at all | `502` with OpenAI-shaped error |
 | Upstream connect/header timeout | Rotate |

@@ -45,6 +45,16 @@ SERVERS = [
         },
         "models": ["selfheal-model"],
     },
+    {
+        # Smart mode smoke check: mirrors the live Lightning AI reproduction —
+        # a model that hard-rejects max_tokens (500, plain-text, dual-keyword
+        # wording) and only accepts max_completion_tokens. A client sending the
+        # legacy max_tokens field must still get a transparent 200.
+        "name": "smartmode-mock",
+        "port": 19874,
+        "keys": {"sm-k1": "reject_max_tokens"},
+        "models": ["openai/gpt-5.6-sol"],
+    },
 ]
 
 LOG_PATH = sys.argv[1] if len(sys.argv) > 1 else "requests.log"
@@ -112,6 +122,8 @@ def make_handler(cfg):
                 "body_len": length,
                 "image_count": image_count,
                 "image_len": image_len,
+                "has_max_tokens": "max_tokens" in payload,
+                "has_max_completion_tokens": "max_completion_tokens" in payload,
             })
             if behavior is None:
                 self._send_json(401, {"error": {"message": "invalid api key", "type": "auth_error"}})
@@ -121,6 +133,16 @@ def make_handler(cfg):
                 return
             if behavior == "402":
                 self._send_json(402, {"error": {"message": "insufficient credits", "type": "payment_required"}})
+                return
+            if behavior == "reject_max_tokens" and "max_tokens" in payload:
+                # Mirrors Lightning AI's real observed response: 500, plain text,
+                # not JSON, mentioning both field names.
+                body = b"this model is not supported MaxTokens, please use MaxCompletionTokens"
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             model = payload.get("model", "?")
             resp = {

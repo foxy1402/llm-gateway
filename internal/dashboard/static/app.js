@@ -267,7 +267,7 @@ async function testProvider(id) {
 }
 
 function showProviderForm(id) {
-  const p = id ? state.providers.find(x => x.id === id) : { id: '', display: '', base_url: '', auth_key: '', model: '', weight: 1, tags: [], enabled: true, responses_native: false, accounts: [] };
+  const p = id ? state.providers.find(x => x.id === id) : { id: '', display: '', base_url: '', auth_key: '', model: '', weight: 1, tags: [], enabled: true, responses_native: false, accounts: [], token_param_mode: '' };
   const accounts = (p.accounts && p.accounts.length ? p.accounts : [{ label: 'default', auth_key: p.auth_key || '', weight: 1, enabled: true }]);
   $('#providerForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} provider</h2>
@@ -287,6 +287,14 @@ function showProviderForm(id) {
             <button class="btn ghost sm" type="button" id="fetchModelsBtn" title="Fetch available model IDs from the upstream's /models">Fetch</button>
           </div>
           <div id="fetchModelsMsg" class="ep-hint" style="margin-top:4px;display:none"></div>
+        </div>
+        <div style="flex:1">
+          <label title="Some models hard-reject whichever of max_tokens/max_completion_tokens the client didn't send. Auto detects and self-heals on the fly (and remembers the answer); pin it here only if you want to skip that detection round trip entirely.">max_tokens field</label>
+          <select name="token_param_mode">
+            <option value="" ${!p.token_param_mode ? 'selected' : ''}>Auto (recommended)</option>
+            <option value="max_tokens" ${p.token_param_mode === 'max_tokens' ? 'selected' : ''}>Force max_tokens</option>
+            <option value="max_completion_tokens" ${p.token_param_mode === 'max_completion_tokens' ? 'selected' : ''}>Force max_completion_tokens</option>
+          </select>
         </div>
       </div>
       <div>
@@ -331,6 +339,11 @@ function addAccountRow(a) {
     <input name="acct_label" value="${esc(a.label || '')}" placeholder="label" style="width:110px">
     <input name="acct_key" type="password" value="${esc(a.auth_key || '')}" placeholder="API key *" autocomplete="new-password" style="flex:1" required>
     <input name="acct_model" list="acctModelPool" value="${esc(a.model || '')}" placeholder="model (optional pin)" style="width:200px" title="Pin this key to one upstream model; empty = provider/member default">
+    <select name="acct_token_param_mode" style="width:150px" title="Override the provider's max_tokens field setting for this key only; empty = inherit">
+      <option value="" ${!a.token_param_mode ? 'selected' : ''}>max_tokens: inherit</option>
+      <option value="max_tokens" ${a.token_param_mode === 'max_tokens' ? 'selected' : ''}>force max_tokens</option>
+      <option value="max_completion_tokens" ${a.token_param_mode === 'max_completion_tokens' ? 'selected' : ''}>force max_completion_tokens</option>
+    </select>
     <input name="acct_weight" type="number" min="1" value="${a.weight || 1}" title="weight" style="width:64px">
     <button type="button" class="btn sm danger" onclick="this.closest('.acct-row').remove()">×</button>`;
   wrap.appendChild(row);
@@ -348,6 +361,7 @@ function collectAccounts(form) {
       label: row.querySelector('[name=acct_label]').value.trim() || 'acct-' + (i + 1),
       auth_key: key,
       model: row.querySelector('[name=acct_model]').value.trim() || '',
+      token_param_mode: row.querySelector('[name=acct_token_param_mode]').value || '',
       weight: parseInt(row.querySelector('[name=acct_weight]').value) || 1,
       // Preserve the account's saved enabled state — hardcoding true silently
       // re-enables keys the user deliberately disabled.
@@ -423,6 +437,7 @@ async function saveProvider(e, id) {
     auth_key: accounts[0].auth_key, model: f.get('model'), weight: parseInt(f.get('weight')) || 1,
     tags: (f.get('tags') || '').split(',').map(s => s.trim()).filter(Boolean),
     enabled: f.get('enabled') === 'on', responses_native: f.get('responses_native') === 'on',
+    token_param_mode: f.get('token_param_mode') || '',
     accounts: accounts,
   };
   try {
@@ -499,7 +514,8 @@ async function testCombo(id) {
 function memberLabel(m) {
   if (m && typeof m === 'object') {
     const acct = m.account_id ? '[' + accountShortLabel(m.provider_id, m.account_id) + ']' : '';
-    return m.provider_id + acct + (m.model ? ' → ' + m.model : '');
+    const tp = m.token_param_mode ? ' (' + m.token_param_mode + ')' : '';
+    return m.provider_id + acct + (m.model ? ' → ' + m.model : '') + tp;
   }
   return String(m);
 }
@@ -538,7 +554,7 @@ function showComboForm(id) {
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelComboForm()">Cancel</button></div>
     </form></div>`;
   // Render each existing member as a provider+account+model row.
-  (c.members || []).forEach(m => addMemberRow(normProvider(m), normAccount(m), m.model || ''));
+  (c.members || []).forEach(m => addMemberRow(normProvider(m), normAccount(m), m.model || '', (m && m.token_param_mode) || ''));
   enableDrag();
 }
 function cancelComboForm() { $('#comboForm').innerHTML = ''; }
@@ -549,7 +565,7 @@ function normAccount(m) { return (m && typeof m === 'object' && m.account_id) ? 
 // addMemberRow appends a draggable member row: provider name, a key dropdown fed
 // by the provider's account pool (or "any key" = keep rotating), and a model
 // select fed by the provider's fetched model pool (free text still allowed).
-function addMemberRow(providerID, accountID, model) {
+function addMemberRow(providerID, accountID, model, tokenParamMode) {
   const prov = state.providers.find(p => p.id === providerID);
   const li = document.createElement('li');
   li.draggable = true;
@@ -564,6 +580,11 @@ function addMemberRow(providerID, accountID, model) {
     <select class="acctSel" title="Key pinned to this member">${acctOpts.join('')}</select>
     <input class="modelSel" list="${dl}" placeholder="model (default: key/provider)" value="${esc(model || '')}">
     <datalist id="${dl}"></datalist>
+    <select class="tokenParamSel" title="Override max_tokens field for this member only; empty = inherit account/provider setting">
+      <option value="" ${!tokenParamMode ? 'selected' : ''}>max_tokens: inherit</option>
+      <option value="max_tokens" ${tokenParamMode === 'max_tokens' ? 'selected' : ''}>force max_tokens</option>
+      <option value="max_completion_tokens" ${tokenParamMode === 'max_completion_tokens' ? 'selected' : ''}>force max_completion_tokens</option>
+    </select>
     <span class="spacer"></span>
     <button type="button" class="btn sm danger" onclick="this.closest('li').remove()">×</button>`;
   const dlEl = li.querySelector('datalist');
@@ -578,7 +599,7 @@ function addMemberRow(providerID, accountID, model) {
 function addMember() {
   const sel = $('#memberPicker');
   if (!sel.value) return;
-  addMemberRow(sel.value, '', '');
+  addMemberRow(sel.value, '', '', '');
   enableDrag();
 }
 
@@ -607,6 +628,7 @@ async function saveCombo(e, id) {
     provider_id: li.dataset.provider,
     account_id: (li.querySelector('.acctSel') || {}).value || '',
     model: (li.querySelector('.modelSel') || {}).value || '',
+    token_param_mode: (li.querySelector('.tokenParamSel') || {}).value || '',
   })).filter(m => m.provider_id);
   const payload = {
     id: f.get('id'), display_name: f.get('display_name'), rotation: f.get('rotation'),

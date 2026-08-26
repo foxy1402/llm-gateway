@@ -24,6 +24,15 @@ type HealthTracker struct {
 	cooldown   time.Duration
 	errorCodes map[int]bool
 	codeMu     sync.RWMutex
+
+	// tokenParam caches, per account, which max_tokens/max_completion_tokens
+	// field name was proven to work by a live smart-mode auto-heal (see
+	// proxy.tryTokenParamHeal). This is in-memory only and reset on restart —
+	// it's a pure latency optimization (skip the known-failing first attempt),
+	// never a correctness requirement, since the reactive heal is still checked
+	// on every response regardless.
+	tokenParamMu sync.RWMutex
+	tokenParam   map[string]string
 }
 
 // defaultRetryableCodes: 429 (rate limited) and 5xx (upstream trouble) always
@@ -55,6 +64,7 @@ func NewHealthTracker() *HealthTracker {
 		states:     map[string]*providerHealth{},
 		cooldown:   60 * time.Second,
 		errorCodes: m,
+		tokenParam: map[string]string{},
 	}
 }
 
@@ -164,6 +174,28 @@ func (h *HealthTracker) RecordAccountSuccess(providerID, accountID string) {
 // IsAccountAvailable reports whether a single account is currently eligible.
 func (h *HealthTracker) IsAccountAvailable(providerID, accountID string) bool {
 	return h.IsAvailable(accountKey(providerID, accountID))
+}
+
+// LearnTokenParam records that fieldName ("max_tokens" or
+// "max_completion_tokens") is the one this account's model actually accepts,
+// discovered live by a smart-mode auto-heal. Future requests for the same
+// account apply it proactively instead of re-discovering it every time.
+func (h *HealthTracker) LearnTokenParam(providerID, accountID, fieldName string) {
+	h.tokenParamMu.Lock()
+	defer h.tokenParamMu.Unlock()
+	if h.tokenParam == nil {
+		h.tokenParam = map[string]string{}
+	}
+	h.tokenParam[accountKey(providerID, accountID)] = fieldName
+}
+
+// LearnedTokenParam returns the previously learned field name for an account,
+// or "" if nothing has been learned yet (the common case: most models accept
+// whichever field the client sent, so there's nothing to remember).
+func (h *HealthTracker) LearnedTokenParam(providerID, accountID string) string {
+	h.tokenParamMu.RLock()
+	defer h.tokenParamMu.RUnlock()
+	return h.tokenParam[accountKey(providerID, accountID)]
 }
 
 // SupportsEndpoint reports whether the provider can handle the given endpoint.

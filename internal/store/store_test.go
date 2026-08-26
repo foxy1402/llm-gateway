@@ -287,6 +287,53 @@ func TestLogCachedTokensRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTokenParamModeRoundTrip guards the max_tokens/max_completion_tokens
+// smart-mode override at all three levels it can be set — provider, account,
+// and combo member — surviving a save/reload exactly like Model already does.
+func TestTokenParamModeRoundTrip(t *testing.T) {
+	st := open(t)
+	if err := st.UpsertProvider(config.Provider{
+		ID: "p1", BaseURL: "https://x", AuthKey: "k", Model: "m", Weight: 1, Enabled: true,
+		TokenParamMode: "max_completion_tokens",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.GetProvider("p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p == nil || p.TokenParamMode != "max_completion_tokens" {
+		t.Fatalf("provider token_param_mode lost: %+v", p)
+	}
+
+	if err := st.ReplaceAccounts("p1", []config.Account{
+		{ID: "p1:a1", ProviderID: "p1", Label: "a1", AuthKey: "k1", Enabled: true, Weight: 1, TokenParamMode: "max_tokens"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err = st.GetProvider("p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Accounts) != 1 || p.Accounts[0].TokenParamMode != "max_tokens" {
+		t.Fatalf("account token_param_mode lost: %+v", p.Accounts)
+	}
+
+	if err := st.UpsertCombo(config.Combo{
+		ID: "c1", DisplayName: "c1", Rotation: config.RoundRobin, Enabled: true,
+		Members: []config.ComboMember{{ProviderID: "p1", AccountID: "p1:a1", TokenParamMode: "max_completion_tokens"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := st.GetCombo("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Members) != 1 || c.Members[0].TokenParamMode != "max_completion_tokens" {
+		t.Fatalf("combo member token_param_mode lost: %+v", c.Members)
+	}
+}
+
 func TestSettingsRoundTrip(t *testing.T) {
 	st := open(t)
 	if err := st.SetSetting("k", "v"); err != nil {
