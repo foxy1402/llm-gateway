@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -233,6 +234,188 @@ func TestAutoHealDoesNotBurnAccountOrRotationBudget(t *testing.T) {
 	}
 	if !reg.Health().IsAccountAvailable("solo", "solo:default") {
 		t.Fatal("the account must NOT be put in cooldown by a field-name mismatch — it's not an account-scoped failure")
+	}
+}
+
+// lightningTooSmallWording is the real wording captured live from Lightning
+// AI's "openai/gpt-5.6-sol" when max_tokens/max_completion_tokens is too small
+// for a reasoning-tier model to emit any output (e.g. a client's max_tokens: 1
+// "does this key work" connection probe).
+const lightningTooSmallWording = "Could not finish the message because max_tokens or model output limit was reached. Please try again with higher max_tokens."
+
+func TestLooksLikeTokenBudgetTooSmall(t *testing.T) {
+	positive := []string{
+		lightningTooSmallWording,
+		`{"error":"max_tokens or model output limit was reached"}`,
+		`{"error":"please try again with higher max_completion_tokens"}`,
+	}
+	for _, body := range positive {
+		if !looksLikeTokenBudgetTooSmall([]byte(body)) {
+			t.Errorf("expected match for: %s", body)
+		}
+	}
+	negative := []string{
+		lightningAIWording, // field-name mismatch, not a budget problem
+		`{"error":{"message":"invalid api key"}}`,
+		`{"error":{"message":"rate limit exceeded"}}`,
+		"",
+	}
+	for _, body := range negative {
+		if looksLikeTokenBudgetTooSmall([]byte(body)) {
+			t.Errorf("unexpected match for: %s", body)
+		}
+	}
+}
+
+func TestBumpTokenFloor(t *testing.T) {
+	t.Run("bumps a too-small max_tokens", func(t *testing.T) {
+		out, old, ok := bumpTokenFloor([]byte(`{"model":"m","max_tokens":1}`), 16)
+		if !ok || old != 1 {
+			t.Fatalf("expected bump from 1, got old=%v ok=%v", old, ok)
+		}
+		var m map[string]json.RawMessage
+		_ = json.Unmarshal(out, &m)
+		if string(m["max_tokens"]) != "16" {
+			t.Fatalf("max_tokens = %s, want 16", m["max_tokens"])
+		}
+	})
+	t.Run("bumps a too-small max_completion_tokens", func(t *testing.T) {
+		out, old, ok := bumpTokenFloor([]byte(`{"max_completion_tokens":1}`), 16)
+		if !ok || old != 1 {
+			t.Fatalf("expected bump from 1, got old=%v ok=%v", old, ok)
+		}
+		var m map[string]json.RawMessage
+		_ = json.Unmarshal(out, &m)
+		if string(m["max_completion_tokens"]) != "16" {
+			t.Fatalf("max_completion_tokens = %s, want 16", m["max_completion_tokens"])
+		}
+	})
+	t.Run("already at/above floor: no-op", func(t *testing.T) {
+		_, _, ok := bumpTokenFloor([]byte(`{"max_tokens":16}`), 16)
+		if ok {
+			t.Fatal("expected no-op when already at the floor")
+		}
+	})
+	t.Run("neither field present: no-op", func(t *testing.T) {
+		_, _, ok := bumpTokenFloor([]byte(`{"messages":[]}`), 16)
+		if ok {
+			t.Fatal("expected no-op when neither field is present")
+		}
+	})
+	t.Run("both fields present: ambiguous, no-op", func(t *testing.T) {
+		_, _, ok := bumpTokenFloor([]byte(`{"max_tokens":1,"max_completion_tokens":1}`), 16)
+		if ok {
+			t.Fatal("expected no-op when both fields are present")
+		}
+	})
+}
+
+// TestChainedHealFieldNameThenTooSmallBudget reproduces the exact live bug: a
+// client probes with max_tokens: 1 (a common "does this key work" connection
+// test). The field-name heal fires first (max_tokens -> max_completion_tokens)
+// but the model STILL can't finish because 1 is too small for a reasoning-tier
+// model to emit anything — a second, independent heal must bump the value and
+// retry again, all within one attempt, so the client sees a transparent 200.
+func TestChainedHealFieldNameThenTooSmallBudget(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		mu.Lock()
+		defer mu.Unlock()
+		if raw, ok := b["max_tokens"]; ok {
+			calls = append(calls, "max_tokens="+string(raw))
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(lightningAIWording))
+			return
+		}
+		var n float64
+		_ = json.Unmarshal(b["max_completion_tokens"], &n)
+		calls = append(calls, fmt.Sprintf("max_completion_tokens=%v", n))
+		if n < 16 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(lightningTooSmallWording))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"model":"gpt-5.6-sol","choices":[{"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "lightning", BaseURL: upstream.URL, AuthKey: "k", Model: "openai/gpt-5.6-sol", Weight: 1, Enabled: true}}
+	px, _, _ := newTestStack(t, upstream, provs, nil)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"lightning","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req, registry.EndpointChatCompletions)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected transparent success after chained heal, got %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("expected exactly 3 upstream calls (original + field heal + budget heal), got %d: %v", len(calls), calls)
+	}
+	if calls[0] != "max_tokens=1" || calls[1] != "max_completion_tokens=1" || calls[2] != "max_completion_tokens=16" {
+		t.Fatalf("unexpected call sequence: %v", calls)
+	}
+}
+
+// TestMinTokensHealDoesNotBurnRotationBudget proves this is a request-shape
+// fix, not an account-scoped one: a single-key provider (no sibling to rotate
+// to) must still self-heal, and the key must not be cooled down afterward.
+func TestMinTokensHealDoesNotBurnRotationBudget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		var n float64
+		_ = json.Unmarshal(b["max_tokens"], &n)
+		if n < 16 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(lightningTooSmallWording))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"model":"m","choices":[{"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "solo", BaseURL: upstream.URL, AuthKey: "only-key", Model: "m", Weight: 1, Enabled: true}}
+	px, _, reg := newTestStack(t, upstream, provs, nil)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"solo","messages":[],"max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req, registry.EndpointChatCompletions)
+	if rec.Code != 200 {
+		t.Fatalf("single-key provider should still self-heal via budget bump, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !reg.Health().IsAccountAvailable("solo", "solo:default") {
+		t.Fatal("the account must NOT be put in cooldown by a too-small budget — it's not an account-scoped failure")
+	}
+}
+
+// TestMinCompletionTokensZeroDisablesHeal: an operator who wants raw upstream
+// errors surfaced instead of a silently-bumped budget can opt out entirely.
+func TestMinCompletionTokensZeroDisablesHeal(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(lightningTooSmallWording))
+	}))
+	defer upstream.Close()
+
+	provs := []config.Provider{{ID: "solo", BaseURL: upstream.URL, AuthKey: "only-key", Model: "m", Weight: 1, Enabled: true}}
+	px, _, _ := newTestStack(t, upstream, provs, nil)
+	px.SetMinCompletionTokens(0)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"solo","messages":[],"max_tokens":1}`))
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req, registry.EndpointChatCompletions)
+	if rec.Code == 200 {
+		t.Fatal("expected the heal to be disabled and the raw error to surface")
 	}
 }
 

@@ -21,6 +21,7 @@ type Env struct {
 	BanCfg                        BanConfig
 	MaxRequestBodyMB              int
 	MaxAccountAttemptsPerProvider int
+	MinCompletionTokens           int
 }
 
 // BanConfig controls the dashboard-login fail-to-ban gate.
@@ -65,6 +66,13 @@ func LoadEnv() (*Env, error) {
 	if e.MaxAccountAttemptsPerProvider <= 0 {
 		e.MaxAccountAttemptsPerProvider = 10
 	}
+	// Floor for the too-small max_tokens/max_completion_tokens self-heal: some
+	// reasoning-tier models (e.g. Lightning AI's "openai/gpt-5.6-sol") can't
+	// emit any output within a tiny budget like max_tokens: 1, a value clients
+	// commonly send as a cheap "does this API key work" connection probe.
+	// Default 16 fixes that without materially changing real completions. Set
+	// to 0 to disable the heal and let the raw upstream error pass through.
+	e.MinCompletionTokens = getEnvInt("MIN_COMPLETION_TOKENS", 16)
 	if e.APIKey == "" {
 		return nil, fmt.Errorf("GATEWAY_API_KEY is required")
 	}

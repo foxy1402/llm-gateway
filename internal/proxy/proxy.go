@@ -57,6 +57,11 @@ type Proxy struct {
 	// defaultMaxAccountsPerProviderCap; overridden via SetMaxAccountsPerProviderCap
 	// (env.MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER).
 	maxAccountsPerProviderCap int
+	// minCompletionTokens is the floor tryMinTokensHeal bumps a too-small
+	// max_tokens/max_completion_tokens value up to. Defaults to
+	// minTokenFloorDefault; overridden via SetMinCompletionTokens
+	// (env.MIN_COMPLETION_TOKENS). 0 disables the heal entirely.
+	minCompletionTokens int
 }
 
 func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy {
@@ -81,6 +86,7 @@ func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy 
 		timeout:                   timeout,
 		maxBodyBytes:              defaultMaxBodyBytes,
 		maxAccountsPerProviderCap: defaultMaxAccountsPerProviderCap,
+		minCompletionTokens:       minTokenFloorDefault,
 	}
 }
 
@@ -103,6 +109,20 @@ func (p *Proxy) SetMaxAccountsPerProviderCap(n int) {
 		p.maxAccountsPerProviderCap = n
 	}
 }
+
+// SetMinCompletionTokens overrides the too-small-max_tokens heal floor
+// (MIN_COMPLETION_TOKENS). n < 0 is ignored (keeps the default); n == 0
+// explicitly disables the heal, since some deployments may want to see the
+// raw upstream error instead of a silently-bumped budget.
+func (p *Proxy) SetMinCompletionTokens(n int) {
+	if n >= 0 {
+		p.minCompletionTokens = n
+	}
+}
+
+// minTokenFloor returns the configured heal floor, or 0 (disabled) — kept as
+// a method so the call site doesn't need to know the field name.
+func (p *Proxy) minTokenFloor() int { return p.minCompletionTokens }
 
 // enabledAccountCount returns how many accounts of a provider could plausibly
 // serve a request: real enabled rows, or 1 for legacy single-key providers
@@ -390,6 +410,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 		}
 
+		// Reasoning-tier tool-call quirk, proactive half: if this exact account
+		// was previously LEARNED to need reasoning_effort forced to "none" for
+		// tool-call requests (see tryReasoningEffortHeal below), apply it now so
+		// this attempt skips the failing first round trip entirely.
+		if p.resolveReasoningEffortNone(upstream.ID, account.ID) {
+			if fixed, ok := applyReasoningEffortNone(body); ok {
+				body = fixed
+			}
+		}
+
 		// Dispatch. base_url is the full OpenAI-compatible root including its own
 		// version (https://api.groq.com/openai/v1, https://generativelanguage.googleapis.com/v1beta/openai,
 		// https://open.bigmodel.cn/api/paas/v4…). We append the endpoint name
@@ -471,6 +501,40 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
 				resp, body = healedResp, healedBody
 			}
+			// A second, independent heal: the field-name fix above can succeed and
+			// still leave a fresh rejection because the *value* (e.g. max_tokens: 1,
+			// a common "does this key work" connection probe) is too small for a
+			// reasoning-tier model to emit anything. Chained so both quirks can be
+			// fixed within the same attempt instead of needing two round trips
+			// through the account-rotation loop (which wouldn't even help here,
+			// since every sibling account fails on the same too-small value).
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				if healedResp, healedBody, healed := p.tryMinTokensHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID, p.minTokenFloor()); healed {
+					resp, body = healedResp, healedBody
+				}
+			}
+			// A third, independent heal: some models (Lightning AI's
+			// "openai/gpt-5.6-sol") reject tool calls on /v1/chat/completions
+			// outright, no matter what request fields are tweaked — the upstream's
+			// own error names the real fix: use /v1/responses instead. Reroute this
+			// exact request through /v1/responses (buffered, then translated back
+			// to chat-completions shape) rather than burning the account/rotating —
+			// again a request-shape problem identical across every sibling account.
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				if healedResp, healedBody, healed := p.tryResponsesRerouteHeal(attemptCtx, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream); healed {
+					resp, body = healedResp, healedBody
+				}
+			}
+			// A fourth, independent heal: a reasoning-tier model can reject
+			// tool-call requests unless reasoning_effort is explicitly "none" — on
+			// SOME upstreams this is the accurate fix (unlike Lightning above,
+			// where the reroute heal already handles it); kept as a fallback for
+			// those. Same request-shape reasoning as the others.
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				if healedResp, healedBody, healed := p.tryReasoningEffortHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+					resp, body = healedResp, healedBody
+				}
+			}
 		}
 
 		// Retryable upstream status → record and rotate within this provider's pool.
@@ -483,6 +547,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// straight to the client on the very first retryable response and never
 		// gave sibling keys a chance.
 		if p.registry.Health().IsRetryable(resp.StatusCode) {
+			peek, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
 			resp.Body.Close()
 			// Account-scoped failure only: one burned key doesn't take the whole
 			// pool out of rotation (that's the entire point of multi-account). The
@@ -491,7 +556,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// endpoint itself is unreachable and ALL keys would fail identically.
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			lastFailStatus, lastFailLogID = resp.StatusCode, logID
-			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode)
+			// Body snippet (not the request we sent, which may hold the caller's
+			// prompt) logged here because this attempt is otherwise invisible: the
+			// per-attempt failure below skips writing a request_log row (that would
+			// be one row per rotated key per request), so this is the only place
+			// the actual upstream rejection reason surfaces for debugging.
+			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode, "body", strings.TrimSpace(string(peek)))
 			// NOTE: provider is NOT dropped from triedProviders — NextAccount will
 			// yield a different key next time plan.next (or the plan==nil direct
 			// path, which always re-targets the same provider) re-selects it.

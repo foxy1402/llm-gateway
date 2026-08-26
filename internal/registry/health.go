@@ -33,6 +33,13 @@ type HealthTracker struct {
 	// on every response regardless.
 	tokenParamMu sync.RWMutex
 	tokenParam   map[string]string
+
+	// reasoningEffortNone caches, per account, that requests carrying a "tools"
+	// array need reasoning_effort forced to "none" for this account's model to
+	// accept them (see proxy.tryReasoningEffortHeal). Same in-memory,
+	// reset-on-restart, latency-only nature as tokenParam above.
+	reasoningEffortMu sync.RWMutex
+	reasoningEffort   map[string]bool
 }
 
 // defaultRetryableCodes: 429 (rate limited) and 5xx (upstream trouble) always
@@ -196,6 +203,27 @@ func (h *HealthTracker) LearnedTokenParam(providerID, accountID string) string {
 	h.tokenParamMu.RLock()
 	defer h.tokenParamMu.RUnlock()
 	return h.tokenParam[accountKey(providerID, accountID)]
+}
+
+// LearnReasoningEffortNone records that this account's model rejects tool
+// calls unless reasoning_effort is explicitly "none", discovered live by
+// tryReasoningEffortHeal. Future requests-with-tools for the same account
+// apply it proactively instead of paying the failing round trip every time.
+func (h *HealthTracker) LearnReasoningEffortNone(providerID, accountID string) {
+	h.reasoningEffortMu.Lock()
+	defer h.reasoningEffortMu.Unlock()
+	if h.reasoningEffort == nil {
+		h.reasoningEffort = map[string]bool{}
+	}
+	h.reasoningEffort[accountKey(providerID, accountID)] = true
+}
+
+// LearnedReasoningEffortNone reports whether this account was previously
+// learned to need reasoning_effort: "none" forced on tool-call requests.
+func (h *HealthTracker) LearnedReasoningEffortNone(providerID, accountID string) bool {
+	h.reasoningEffortMu.RLock()
+	defer h.reasoningEffortMu.RUnlock()
+	return h.reasoningEffort[accountKey(providerID, accountID)]
 }
 
 // SupportsEndpoint reports whether the provider can handle the given endpoint.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -491,6 +492,321 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 	out["usage"] = usageObj
 	if len(chat.Choices) > 0 && chat.Choices[0].FinishReason != "" {
 		out["finish_reason"] = chat.Choices[0].FinishReason
+	}
+	return json.Marshal(out)
+}
+
+// ChatRequestToResponsesRequest converts a /v1/chat/completions request body
+// into a /v1/responses body targeting the same model — the mirror image of
+// ResponsesToChatRequest, used by proxy.tryResponsesRerouteHeal for
+// models/upstreams whose chat-completions endpoint rejects tool calls
+// outright (observed live: Lightning AI's "openai/gpt-5.6-sol"). stream is
+// always forced false: the reroute always dispatches non-streaming upstream
+// regardless of what the client asked for (see chatResponseToSingleShotSSE).
+func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
+	var full map[string]json.RawMessage
+	if err := json.Unmarshal(body, &full); err != nil {
+		return nil, fmt.Errorf("parse chat request: %w", err)
+	}
+	var in struct {
+		Model    string            `json:"model"`
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		return nil, fmt.Errorf("parse chat request: %w", err)
+	}
+
+	type chatToolCall struct {
+		ID       string `json:"id"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	type chatMsg struct {
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content"`
+		ToolCalls  []chatToolCall  `json:"tool_calls"`
+		ToolCallID string          `json:"tool_call_id"`
+	}
+
+	var instructions []string
+	input := []any{}
+	for _, raw := range in.Messages {
+		var m chatMsg
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+		switch m.Role {
+		case "system":
+			if s := extractChatMessageText(m.Content); s != "" {
+				instructions = append(instructions, s)
+			}
+		case "tool":
+			var content any = ""
+			var s string
+			if json.Unmarshal(m.Content, &s) == nil {
+				content = s
+			} else if len(m.Content) > 0 {
+				content = string(m.Content)
+			}
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": m.ToolCallID,
+				"output":  content,
+			})
+		default: // "user", "assistant"
+			if len(m.ToolCalls) > 0 {
+				for _, tc := range m.ToolCalls {
+					input = append(input, map[string]any{
+						"type":      "function_call",
+						"call_id":   tc.ID,
+						"name":      tc.Function.Name,
+						"arguments": tc.Function.Arguments,
+					})
+				}
+				continue
+			}
+			textType := "input_text"
+			if m.Role == "assistant" {
+				textType = "output_text"
+			}
+			input = append(input, map[string]any{
+				"type":    "message",
+				"role":    m.Role,
+				"content": chatContentToResponsesParts(m.Content, textType),
+			})
+		}
+	}
+
+	out := map[string]any{
+		"model":  in.Model,
+		"input":  input,
+		"stream": false,
+	}
+	if len(instructions) > 0 {
+		out["instructions"] = strings.Join(instructions, "\n")
+	}
+	if v, ok := full["tools"]; ok {
+		if converted := convertChatToolsToResponses(v); converted != nil {
+			out["tools"] = converted
+		}
+	}
+	for _, key := range []string{"tool_choice", "temperature", "top_p", "parallel_tool_calls", "user"} {
+		if v, ok := full[key]; ok {
+			out[key] = json.RawMessage(v)
+		}
+	}
+	if v, ok := full["max_completion_tokens"]; ok {
+		out["max_output_tokens"] = v
+	} else if v, ok := full["max_tokens"]; ok {
+		out["max_output_tokens"] = v
+	}
+	return json.Marshal(out)
+}
+
+// chatContentToResponsesParts converts a chat-completions message "content"
+// field (string or array of {type:"text"}/{type:"image_url"} parts) into a
+// Responses-API content-part array. textType is "input_text" for user/system
+// messages or "output_text" for assistant messages being replayed as prior
+// conversation turns — the Responses API distinguishes the two.
+func chatContentToResponsesParts(raw json.RawMessage, textType string) any {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return []any{map[string]any{"type": textType, "text": s}}
+	}
+	var parts []map[string]json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return []any{map[string]any{"type": textType, "text": ""}}
+	}
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		var typ string
+		if t, ok := part["type"]; ok {
+			_ = json.Unmarshal(t, &typ)
+		}
+		if typ == "image_url" {
+			var iu struct {
+				URL    string `json:"url"`
+				Detail string `json:"detail"`
+			}
+			if u, ok := part["image_url"]; ok {
+				_ = json.Unmarshal(u, &iu)
+			}
+			item := map[string]any{"type": "input_image", "image_url": iu.URL}
+			if iu.Detail != "" {
+				item["detail"] = iu.Detail
+			}
+			out = append(out, item)
+			continue
+		}
+		var txt string
+		if t, ok := part["text"]; ok {
+			_ = json.Unmarshal(t, &txt)
+		}
+		out = append(out, map[string]any{"type": textType, "text": txt})
+	}
+	return out
+}
+
+// convertChatToolsToResponses rewrites a chat-completions tools array
+// ({"type":"function","function":{name,description,parameters,...}}) into the
+// Responses-API shape ({"type":"function",name,description,parameters,...})
+// — the mirror image of convertResponsesTools. Tools already flat (no nested
+// "function" key) pass through verbatim. Returns nil when nothing usable
+// remains, so the caller omits the key.
+func convertChatToolsToResponses(raw json.RawMessage) json.RawMessage {
+	var tools []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return raw
+	}
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		fnRaw, hasFn := t["function"]
+		if !hasFn {
+			m := make(map[string]any, len(t))
+			for k, v := range t {
+				m[k] = json.RawMessage(v)
+			}
+			out = append(out, m)
+			continue
+		}
+		var fn map[string]json.RawMessage
+		if err := json.Unmarshal(fnRaw, &fn); err != nil {
+			continue
+		}
+		item := map[string]any{"type": "function"}
+		for k, v := range fn {
+			item[k] = json.RawMessage(v)
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return raw
+	}
+	return b
+}
+
+// ResponsesResponseToChatResponse converts a /v1/responses JSON response into
+// a /v1/chat/completions-shaped payload — the mirror image of
+// ChatToResponsesResponse, used by proxy.tryResponsesRerouteHeal so the
+// client (which called chat.completions) never sees the Responses shape.
+func ResponsesResponseToChatResponse(body []byte) ([]byte, error) {
+	var resp struct {
+		ID        string `json:"id"`
+		CreatedAt int64  `json:"created_at"`
+		Model     string `json:"model"`
+		Output    []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			TotalTokens        int `json:"total_tokens"`
+			InputTokensDetails *struct {
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
+			} `json:"input_tokens_details"`
+			OutputTokensDetails *struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"output_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse responses response: %w", err)
+	}
+
+	text := ""
+	var toolCalls []map[string]any
+	for _, item := range resp.Output {
+		switch item.Type {
+		case "message":
+			for _, c := range item.Content {
+				if c.Text == "" {
+					continue
+				}
+				if text != "" {
+					text += "\n"
+				}
+				text += c.Text
+			}
+		case "function_call":
+			callID := item.CallID
+			if callID == "" {
+				callID = "call_" + randomRespID()
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   callID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      item.Name,
+					"arguments": item.Arguments,
+				},
+			})
+		}
+	}
+
+	created := resp.CreatedAt
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	id := resp.ID
+	switch {
+	case strings.HasPrefix(id, "resp_"):
+		id = "chatcmpl-" + id[len("resp_"):]
+	case id == "":
+		id = "chatcmpl-" + randomRespID()
+	}
+
+	finishReason := "stop"
+	message := map[string]any{"role": "assistant", "content": text}
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+		message["tool_calls"] = toolCalls
+		message["content"] = nil
+	}
+
+	usageObj := map[string]any{
+		"prompt_tokens":     resp.Usage.InputTokens,
+		"completion_tokens": resp.Usage.OutputTokens,
+		"total_tokens":      resp.Usage.TotalTokens,
+	}
+	// Translate the Responses-API cache/reasoning detail blocks into their
+	// chat-completions equivalents — dropping these here would silently hide
+	// prompt-cache savings (cached_tokens) and reasoning-token accounting for
+	// every request this reroute heal touches, even though the upstream
+	// reported them (see tryResponsesRerouteHeal).
+	if d := resp.Usage.InputTokensDetails; d != nil {
+		details := map[string]any{"cached_tokens": d.CachedTokens}
+		if d.CacheWriteTokens > 0 {
+			details["cache_write_tokens"] = d.CacheWriteTokens
+		}
+		usageObj["prompt_tokens_details"] = details
+	}
+	if d := resp.Usage.OutputTokensDetails; d != nil {
+		usageObj["completion_tokens_details"] = map[string]any{"reasoning_tokens": d.ReasoningTokens}
+	}
+
+	out := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   resp.Model,
+		"choices": []any{
+			map[string]any{"index": 0, "message": message, "finish_reason": finishReason},
+		},
+		"usage": usageObj,
 	}
 	return json.Marshal(out)
 }

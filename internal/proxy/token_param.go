@@ -124,6 +124,116 @@ func (p *Proxy) tryTokenParamHeal(ctx context.Context, resp *http.Response, upst
 	return newResp, fixedBody, true
 }
 
+// minTokenFloorDefault is the smallest completion budget we'll accept before
+// proactively/reactively bumping it. Some reasoning-tier models (OpenAI's o-
+// series and mirrors like Lightning AI's "openai/gpt-5.6-sol") spend part of
+// the max_tokens/max_completion_tokens budget on hidden reasoning tokens
+// before emitting any visible output, so a client probe like max_tokens: 1
+// (a common "does this API key work" connection test) can never finish and
+// the upstream errors instead of just truncating. 1 is enough for ordinary
+// models but never enough for a reasoning model to say anything at all, so a
+// small floor fixes the probe case without materially changing real requests.
+const minTokenFloorDefault = 16
+
+// tryMinTokensHeal is the reactive safety net for the "budget too small to
+// finish" error class (see looksLikeTokenBudgetTooSmall). Unlike
+// tryTokenParamHeal this can fire as a *second* heal on the same attempt: the
+// field-name heal above may successfully rename max_tokens->max_completion_tokens
+// and still get a fresh, unrelated rejection because the value itself (e.g. 1)
+// is too small for this model to produce a single token of visible output.
+// Bumping the value and redispatching once, on the same account/URL, is a
+// request-shape fix exactly like the field-name heal: it must not burn the
+// key into cooldown or consume a rotation attempt, since every sibling
+// account would fail identically on the same too-small value.
+func (p *Proxy) tryMinTokensHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string, floor int) (*http.Response, []byte, bool) {
+	const peekCap = 8 << 10
+	peeked, _ := io.ReadAll(io.LimitReader(resp.Body, peekCap))
+	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peeked), resp.Body))
+	if !looksLikeTokenBudgetTooSmall(peeked) {
+		return resp, reqBody, false
+	}
+	fixedBody, oldVal, ok := bumpTokenFloor(reqBody, floor)
+	if !ok {
+		return resp, reqBody, false
+	}
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(fixedBody))
+	if err != nil {
+		return resp, reqBody, false
+	}
+	upReq.Header.Set("Content-Type", "application/json")
+	upReq.Header.Set("Authorization", "Bearer "+authKey)
+	upReq.Header.Set("Accept", "text/event-stream, application/json")
+	upReq.Header.Set("X-Accel-Buffering", "no")
+	newResp, err := p.client.Do(upReq)
+	if err != nil {
+		return resp, reqBody, false
+	}
+	resp.Body.Close()
+	slog.Info("auto-bumped too-small max_tokens/max_completion_tokens and retried",
+		"provider", providerID, "account", accountID, "from", oldVal, "to", floor,
+		"status_before", resp.StatusCode, "status_after", newResp.StatusCode)
+	return newResp, fixedBody, true
+}
+
+// looksLikeTokenBudgetTooSmall detects the "couldn't finish generating within
+// the given token budget" error class — distinct from looksLikeTokenParamMismatch
+// (wrong field name): the field name is right, but the value is too small for
+// this model to emit anything. Seen from Lightning AI as: "Could not finish
+// the message because max_tokens or model output limit was reached. Please
+// try again with higher max_tokens." Matched loosely (mentions the token
+// field plus "reached"/"limit" wording) since exact phrasing varies by vendor.
+func looksLikeTokenBudgetTooSmall(body []byte) bool {
+	norm := strings.ReplaceAll(strings.ToLower(string(body)), "_", "")
+	if !strings.Contains(norm, "maxtokens") && !strings.Contains(norm, "maxcompletiontokens") {
+		return false
+	}
+	return strings.Contains(norm, "output limit was reached") ||
+		strings.Contains(norm, "could not finish the message") ||
+		strings.Contains(norm, "try again with higher")
+}
+
+// bumpTokenFloor raises whichever of max_tokens/max_completion_tokens is
+// present to floor, IF its current value is below floor. oldVal is the
+// previous numeric value (for logging). ok=false means there's nothing to
+// bump: neither field is present, both are (ambiguous), the value isn't a
+// plain number, or it's already >= floor (guessing a bigger number wouldn't
+// be based on anything and could mask a real "genuinely needs way more" case).
+func bumpTokenFloor(body []byte, floor int) (out []byte, oldVal float64, ok bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, 0, false
+	}
+	tokVal, hasTok := m[TokenParamMaxTokens]
+	compVal, hasComp := m[TokenParamMaxCompletion]
+	var field string
+	var raw json.RawMessage
+	switch {
+	case hasTok && !hasComp:
+		field, raw = TokenParamMaxTokens, tokVal
+	case hasComp && !hasTok:
+		field, raw = TokenParamMaxCompletion, compVal
+	default:
+		return nil, 0, false
+	}
+	var n float64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return nil, 0, false
+	}
+	if n >= float64(floor) {
+		return nil, 0, false
+	}
+	b, err := json.Marshal(floor)
+	if err != nil {
+		return nil, 0, false
+	}
+	m[field] = b
+	out, err = json.Marshal(m)
+	if err != nil {
+		return nil, 0, false
+	}
+	return out, n, true
+}
+
 // looksLikeTokenParamMismatch detects the "wrong max_tokens/max_completion_tokens
 // field name" error class across providers. Wording varies — OpenAI: "Unsupported
 // parameter: 'max_tokens' is not supported with this model. Use

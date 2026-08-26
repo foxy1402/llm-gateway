@@ -52,6 +52,7 @@ func run() error {
 	}
 	px.SetMaxBodyBytes(int64(env.MaxRequestBodyMB) << 20)
 	px.SetMaxAccountsPerProviderCap(env.MaxAccountAttemptsPerProvider)
+	px.SetMinCompletionTokens(env.MinCompletionTokens)
 
 	a := &app{env: env, store: st, reg: reg, px: px}
 
