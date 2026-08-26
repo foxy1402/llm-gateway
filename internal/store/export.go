@@ -41,12 +41,12 @@ func (s *Store) ExportSQL() (string, error) {
 	b.WriteString("DELETE FROM settings;\n\n")
 
 	if len(provs) > 0 {
-		b.WriteString("INSERT INTO providers (id, display, base_url, auth_key, model, weight, tags, enabled, responses_native) VALUES\n")
+		b.WriteString("INSERT INTO providers (id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode) VALUES\n")
 		for i, p := range provs {
 			tags := strings.Join(p.Tags, ",")
-			fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %s, %d, %d)",
+			fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %s, %d, %d, %s)",
 				q(p.ID), q(p.Display), q(p.BaseURL), q(p.AuthKey), q(p.Model),
-				p.Weight, q(tags), boolToInt(p.Enabled), boolToInt(p.ResponsesNative))
+				p.Weight, q(tags), boolToInt(p.Enabled), boolToInt(p.ResponsesNative), q(p.TokenParamMode))
 			if i == len(provs)-1 {
 				b.WriteString(";\n\n")
 			} else {
@@ -59,14 +59,14 @@ func (s *Store) ExportSQL() (string, error) {
 		for _, p := range provs {
 			for pos, a := range p.Accounts {
 				if first {
-					b.WriteString("INSERT INTO provider_accounts (id, provider_id, label, auth_key, model, enabled, position, weight) VALUES\n")
+					b.WriteString("INSERT INTO provider_accounts (id, provider_id, label, auth_key, model, enabled, position, weight, token_param_mode) VALUES\n")
 					first = false
 				} else {
 					b.WriteString(",\n")
 				}
-				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %d, %d)",
+				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %d, %d, %s)",
 					q(a.ID), q(p.ID), q(a.Label), q(a.AuthKey), q(a.Model),
-					boolToInt(a.Enabled), pos, max(a.Weight, 1))
+					boolToInt(a.Enabled), pos, max(a.Weight, 1), q(a.TokenParamMode))
 			}
 		}
 		if !first {
@@ -107,7 +107,7 @@ func (s *Store) ExportSQL() (string, error) {
 		for _, c := range combos {
 			for pos, m := range c.Members {
 				if first {
-					b.WriteString("INSERT INTO combo_members (combo_id, provider_id, account_id, model, position) VALUES\n")
+					b.WriteString("INSERT INTO combo_members (combo_id, provider_id, account_id, model, token_param_mode, position) VALUES\n")
 					first = false
 				} else {
 					b.WriteString(",\n")
@@ -116,7 +116,7 @@ func (s *Store) ExportSQL() (string, error) {
 				if m.AccountID != "" {
 					acct = q(m.AccountID)
 				}
-				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %d)", q(c.ID), q(m.ProviderID), acct, q(m.Model), pos)
+				fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d)", q(c.ID), q(m.ProviderID), acct, q(m.Model), q(m.TokenParamMode), pos)
 			}
 		}
 		if !first {

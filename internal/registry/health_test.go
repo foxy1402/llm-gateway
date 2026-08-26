@@ -63,3 +63,30 @@ func TestSnapshotSorted(t *testing.T) {
 		}
 	}
 }
+
+// Learned reasoning_effort pins must be forgettable (un-learn hook) and pruned
+// when an account disappears from the config (Reload prune).
+func TestReasoningEffortLearnForgetPrune(t *testing.T) {
+	h := NewHealthTracker()
+	h.LearnReasoningEffortNone("p", "a")
+	if !h.LearnedReasoningEffortNone("p", "a") {
+		t.Fatal("learned pin not found")
+	}
+	h.ForgetReasoningEffortNone("p", "a")
+	if h.LearnedReasoningEffortNone("p", "a") {
+		t.Fatal("pin should be forgotten after Forget")
+	}
+
+	// Prune keeps live accounts, drops dead ones, across both learned maps.
+	h.LearnReasoningEffortNone("p", "alive")
+	h.LearnReasoningEffortNone("p", "dead")
+	h.LearnTokenParam("p", "alive", "max_tokens")
+	h.LearnTokenParam("p", "dead", "max_tokens")
+	h.PruneLearnedAccounts(map[string]bool{accountKey("p", "alive"): true})
+	if !h.LearnedReasoningEffortNone("p", "alive") || h.LearnedReasoningEffortNone("p", "dead") {
+		t.Fatal("reasoning-effort prune wrong")
+	}
+	if h.LearnedTokenParam("p", "alive") != "max_tokens" || h.LearnedTokenParam("p", "dead") != "" {
+		t.Fatal("token-param prune wrong")
+	}
+}

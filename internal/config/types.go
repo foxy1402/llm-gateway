@@ -92,6 +92,7 @@ type LogEntry struct {
 	UpstreamURL      string `json:"upstream_url,omitempty"`
 	RequestPayload   string `json:"request_payload,omitempty"`
 	ResponseSnippet  string `json:"response_snippet,omitempty"`
+	HealNote         string `json:"heal_note,omitempty"` // which smart-heal rewrote this request (empty = untouched)
 }
 
 type LogFilter struct {

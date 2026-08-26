@@ -34,7 +34,7 @@ func looksLikeNeedsResponsesEndpoint(body []byte) bool {
 // SAME account/base_url, and translates the reply back into
 // chat-completions shape so the client — which called chat.completions and
 // has no idea any of this happened — sees a normal, transparent success.
-// Like the other two heals in this package, this is a request-shape problem
+// Like the other heals in this package, this is a request-shape problem
 // identical across every account on this provider, not an account-scoped
 // one: rotating keys would just fail the same way on each of them.
 //
@@ -45,46 +45,59 @@ func looksLikeNeedsResponsesEndpoint(body []byte) bool {
 // path, which isn't worth it for what should be a rare, model-specific edge
 // case. Every tool-call request to an affected account pays one extra round
 // trip; that's the accepted trade-off for now.
-func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, resp *http.Response, baseURL, authKey string, reqBody []byte, providerID, accountID string, wantStream bool) (*http.Response, []byte, bool) {
-	const peekCap = 8 << 10
-	peeked, _ := io.ReadAll(io.LimitReader(resp.Body, peekCap))
-	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peeked), resp.Body))
+//
+// Returns the healed response, the Responses-shaped request body actually
+// sent (so the request log matches the URL it went to), and a note describing
+// the heal for the request log.
+func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, resp *http.Response, baseURL, authKey string, reqBody []byte, providerID, accountID string, wantStream bool, originalModel string) (*http.Response, []byte, string, bool) {
+	peeked := healPeek(resp)
 	if !looksLikeNeedsResponsesEndpoint(peeked) {
-		return resp, reqBody, false
+		return resp, reqBody, "", false
 	}
 	responsesBody, err := ChatRequestToResponsesRequest(reqBody)
 	if err != nil {
-		return resp, reqBody, false
+		return resp, reqBody, "", false
 	}
+	if ctx.Err() != nil {
+		return resp, reqBody, "", false // client already gone; don't burn a redispatch
+	}
+	// Watchdog for the buffered hop: streaming callers run on an intentionally
+	// unbounded context and this path bypasses streamResponse's stall detector,
+	// so without a bound a trickling /responses body would hang the handler for
+	// as long as the client stays connected. 2× the header timeout covers a
+	// full non-streamed generation the same way the non-stream attempt bound
+	// does; a live chat stream would have had no such per-hop bound either.
+	readCtx, cancelRead := context.WithTimeout(ctx, 2*p.timeout)
+	defer cancelRead()
 	responsesURL := buildUpstreamURL(baseURL, "/responses")
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, responsesURL, bytes.NewReader(responsesBody))
+	upReq, err := http.NewRequestWithContext(readCtx, http.MethodPost, responsesURL, bytes.NewReader(responsesBody))
 	if err != nil {
-		return resp, reqBody, false
+		return resp, reqBody, "", false
 	}
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("Authorization", "Bearer "+authKey)
 	upReq.Header.Set("Accept", "application/json")
 	newResp, err := p.client.Do(upReq)
 	if err != nil {
-		return resp, reqBody, false
+		return resp, reqBody, "", false
 	}
 	respBody, readErr := io.ReadAll(io.LimitReader(newResp.Body, 10<<20))
 	newResp.Body.Close()
 	if readErr != nil {
-		return resp, reqBody, false
+		return resp, reqBody, "", false
 	}
 	if newResp.StatusCode < 200 || newResp.StatusCode >= 300 {
-		// The /v1/responses reroute itself failed too — surface its (more
-		// specific, more recent) error instead of the original chat-completions
-		// one, but don't claim this was healed since nothing actually succeeded.
+		// The reroute itself failed — keep the ORIGINAL chat-completions
+		// rejection (the shape the client actually requested) and don't claim a
+		// heal; the caller's ladder handles the original response normally.
 		slog.Warn("responses-endpoint reroute also failed", "provider", providerID, "account", accountID, "status", newResp.StatusCode)
-		return &http.Response{StatusCode: newResp.StatusCode, Body: io.NopCloser(bytes.NewReader(respBody)), Header: newResp.Header}, responsesBody, false
+		return resp, reqBody, "", false
 	}
 
-	chatBody, err := ResponsesResponseToChatResponse(respBody)
+	chatBody, err := ResponsesResponseToChatResponse(respBody, originalModel)
 	if err != nil {
 		slog.Error("responses->chat response translation failed after reroute heal", "err", err)
-		return resp, reqBody, false
+		return resp, reqBody, "", false
 	}
 
 	finalResp := &http.Response{StatusCode: 200, Header: http.Header{}}
@@ -98,7 +111,7 @@ func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, resp *http.Response
 
 	slog.Info("auto-rerouted tool-call request through /v1/responses and translated the reply back",
 		"provider", providerID, "account", accountID, "status_before", resp.StatusCode)
-	return finalResp, responsesBody, true
+	return finalResp, responsesBody, "rerouted via /v1/responses (upstream chat endpoint rejected tool calls)", true
 }
 
 // chatResponseToSingleShotSSE wraps an already-complete chat-completions JSON
@@ -131,12 +144,13 @@ func chatResponseToSingleShotSSE(chatJSON []byte) []byte {
 	choice := parsed.Choices[0]
 
 	delta := map[string]any{"role": "assistant"}
-	var text string
-	if len(choice.Message.Content) > 0 && json.Unmarshal(choice.Message.Content, &text) == nil && text != "" {
+	// extractChatMessageText tolerates both plain-string and array-of-parts
+	// content shapes, so no text is silently dropped from the delta.
+	if text := extractChatMessageText(choice.Message.Content); text != "" {
 		delta["content"] = text
 	}
 	if len(choice.Message.ToolCalls) > 0 {
-		delta["tool_calls"] = choice.Message.ToolCalls
+		delta["tool_calls"] = withToolCallIndexes(choice.Message.ToolCalls)
 	}
 	chunk1 := cloneMap(base)
 	chunk1["choices"] = []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}
@@ -160,6 +174,31 @@ func chatResponseToSingleShotSSE(chatJSON []byte) []byte {
 	}
 	buf.WriteString("data: [DONE]\n\n")
 	return buf.Bytes()
+}
+
+// withToolCallIndexes adds "index": i to each tool_call. Non-streaming chat
+// responses omit index, but streaming chunk deltas ACCUMULATE tool calls keyed
+// by it — without indices, parallel tool calls collapse into one corrupted call
+// in strict SDK parsers (precisely the traffic this reroute exists for).
+func withToolCallIndexes(toolCalls json.RawMessage) json.RawMessage {
+	var calls []map[string]json.RawMessage
+	if json.Unmarshal(toolCalls, &calls) != nil {
+		return toolCalls
+	}
+	out := make([]map[string]any, 0, len(calls))
+	for i, c := range calls {
+		m := make(map[string]any, len(c)+1)
+		for k, v := range c {
+			m[k] = json.RawMessage(v)
+		}
+		m["index"] = i
+		out = append(out, m)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return toolCalls
+	}
+	return b
 }
 
 func cloneMap(m map[string]any) map[string]any {

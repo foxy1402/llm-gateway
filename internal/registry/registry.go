@@ -141,6 +141,20 @@ func (r *Registry) Reload(st *store.Store) error {
 			delete(r.rrCounters, id)
 		}
 	}
+	// Same hygiene for the learned heal caches: entries reference accounts that
+	// may have been deleted or renamed, and nothing else ever prunes them.
+	liveAccounts := map[string]bool{}
+	for _, p := range provs {
+		if len(p.Accounts) > 0 {
+			for _, a := range p.Accounts {
+				liveAccounts[accountKey(p.ID, a.ID)] = true
+			}
+		} else {
+			// Legacy single-key providers synthesize the :default account.
+			liveAccounts[accountKey(p.ID, p.ID+":default")] = true
+		}
+	}
+	r.health.PruneLearnedAccounts(liveAccounts)
 	r.wrrMu.Unlock()
 	return nil
 }

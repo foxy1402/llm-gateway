@@ -328,7 +328,8 @@ internal/middleware/ logging + panic recovery
 | Scenario | Behavior |
 |---|---|
 | Upstream 402 / 429 / 5xx | Rotate to the next account (same provider first, then next combo member), apply per-account cooldown |
-| Upstream 404/405 on any endpoint | Mark provider unsupported for that endpoint, rotate |
+| Upstream 404/405 on an *optional* endpoint (legacy `/v1/completions`, `/v1/embeddings`, native `/v1/responses`) | Mark provider unsupported for that endpoint, rotate |
+| Upstream 404/405 on `/v1/chat/completions` | Surface the real upstream body unchanged — chat.completions is mandatory for every provider, so a 404 there means a bad base_url/auth/body, not a missing endpoint |
 | Upstream rejects `max_tokens`/`max_completion_tokens` (wrong one for that model) | Auto-corrected and retried once on the same key, transparent to the client (see [Smart mode](#smart-mode-max_tokens-vs-max_completion_tokens)) |
 | Every account/combo member exhausted after a 402/429/5xx | Surface the last real upstream status (e.g. `429`) instead of a generic error |
 | Every account/combo member exhausted with no upstream response at all | `502` with OpenAI-shaped error |

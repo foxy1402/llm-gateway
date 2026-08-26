@@ -49,6 +49,9 @@ if ($content -notmatch "token=sm-k1") {
 Write-Host "PASS: max_tokens request auto-healed to max_completion_tokens and succeeded with a single client-visible 200"
 
 Step "verify the dashboard logged a SUCCESSFUL attempt, not the intermediate 500"
+# The request log is written by an async goroutine (p.log fires and forgets),
+# so a brief settle prevents racing the write that the next step asserts on.
+Start-Sleep -Milliseconds 400
 $logs = Dash Get "logs?limit=5"
 $hit = $logs.items | Where-Object { $_.provider_used -like "smartmode*" -and $_.status -eq 200 } | Select-Object -First 1
 if (-not $hit) { Write-Host "FAIL: no successful smartmode log row found (client must never see the intermediate 500)"; exit 1 }

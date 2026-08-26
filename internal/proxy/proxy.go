@@ -399,24 +399,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			body = rewritten
 		}
 
-		// Smart max_tokens/max_completion_tokens mode, proactive half: if this
-		// exact account already has an explicit pin OR a previously LEARNED
-		// preference (from a prior live auto-heal, see tryTokenParamHeal below),
-		// apply it now so this attempt skips the failing first round trip
-		// entirely instead of paying it again on every request.
-		if mode := p.resolveTokenParamMode(upstream, account, member); mode != "" {
-			if fixed, ok := applyTokenParamMode(body, mode); ok {
-				body = fixed
+		// Proactive smart-mode applies (below) rewrite chat-completions field
+		// names; a native Responses-shape body has different fields
+		// (max_output_tokens, reasoning.effort) and must be left untouched.
+		if !nativeThisAttempt {
+			// Smart max_tokens/max_completion_tokens mode, proactive half: if this
+			// exact account already has an explicit pin OR a previously LEARNED
+			// preference (from a prior live auto-heal, see tryTokenParamHeal below),
+			// apply it now so this attempt skips the failing first round trip
+			// entirely instead of paying it again on every request.
+			if mode := p.resolveTokenParamMode(upstream, account, member); mode != "" {
+				if fixed, ok := applyTokenParamMode(body, mode); ok {
+					body = fixed
+				}
 			}
-		}
 
-		// Reasoning-tier tool-call quirk, proactive half: if this exact account
-		// was previously LEARNED to need reasoning_effort forced to "none" for
-		// tool-call requests (see tryReasoningEffortHeal below), apply it now so
-		// this attempt skips the failing first round trip entirely.
-		if p.resolveReasoningEffortNone(upstream.ID, account.ID) {
-			if fixed, ok := applyReasoningEffortNone(body); ok {
-				body = fixed
+			// Reasoning-tier tool-call quirk, proactive half: if this exact account
+			// was previously LEARNED to need reasoning_effort forced to "none" for
+			// tool-call requests (see tryReasoningEffortHeal below), apply it now so
+			// this attempt skips the failing first round trip entirely.
+			if p.resolveReasoningEffortNone(upstream.ID, account.ID) {
+				if fixed, ok := applyReasoningEffortNone(body); ok {
+					body = fixed
+				}
 			}
 		}
 
@@ -450,7 +455,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			slog.Warn("failed to build upstream request (check base_url)", "provider", logID, "url", upstreamURL, "err", err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "failed to build upstream request", "gateway_error")
-				p.log(info.Model, logID, endpoint, http.StatusBadGateway, 0, err.Error(), nil, nil, nil, upstreamURL, string(body), "")
+				p.log(info.Model, logID, endpoint, http.StatusBadGateway, 0, err.Error(), nil, nil, nil, upstreamURL, string(body), "", "")
 				return
 			}
 			triedProviders[upstream.ID] = true
@@ -480,26 +485,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			slog.Warn("upstream dispatch failed", "provider", logID, "err", err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "upstream request failed", "gateway_error")
-				p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), "")
+				p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), "", "")
 				return
 			}
 			triedProviders[upstream.ID] = true
 			continue
 		}
 
-		// Smart max_tokens/max_completion_tokens mode: some models (OpenAI's
-		// reasoning tier and upstreams that mirror it, e.g. Lightning AI's
-		// "openai/gpt-5.6-sol") hard-reject whichever of these two field names
-		// the client didn't use — every OTHER model on the same provider is
-		// usually fine with the client's original field, so this can't be fixed
-		// with a provider-wide setting without breaking those. Auto-detect the
-		// mismatch from the error response and transparently redispatch once
-		// with the field renamed, on the exact same account/URL — this is a
-		// request-shape problem, not an account-scoped failure, so it must not
-		// burn the key into cooldown or consume a self-heal rotation attempt.
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
-				resp, body = healedResp, healedBody
+		// Reactive smart-mode heal ladder (chat.completions only). All four heal
+		// classes are request-shape quirks of chat-completions bodies:
+		// embeddings/completions/legacy endpoints have no max_tokens-family or
+		// tools fields, and native /v1/responses uses different field names
+		// entirely — peeking those error bodies against chat-shaped matchers
+		// can only produce false positives. Each heal fires at most once per
+		// attempt and redispatches on the same account/URL, so one attempt
+		// costs at most 5 upstream dispatches (1 + 4 heals) in the worst case
+		// where every heal matches but none fully fixes the request.
+		var healNote, healURL string
+		if endpoint == registry.EndpointChatCompletions {
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+					resp, body, healNote = healedResp, healedBody, "healed max_tokens field"
+				}
 			}
 			// A second, independent heal: the field-name fix above can succeed and
 			// still leave a fresh rejection because the *value* (e.g. max_tokens: 1,
@@ -510,7 +517,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// since every sibling account fails on the same too-small value).
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				if healedResp, healedBody, healed := p.tryMinTokensHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID, p.minTokenFloor()); healed {
-					resp, body = healedResp, healedBody
+					resp, body, healNote = healedResp, healedBody, "healed max_tokens floor"
 				}
 			}
 			// A third, independent heal: some models (Lightning AI's
@@ -521,8 +528,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// to chat-completions shape) rather than burning the account/rotating —
 			// again a request-shape problem identical across every sibling account.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryResponsesRerouteHeal(attemptCtx, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream); healed {
-					resp, body = healedResp, healedBody
+				if healedResp, healedBody, note, healed := p.tryResponsesRerouteHeal(attemptCtx, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream, info.Model); healed {
+					resp, body, healNote = healedResp, healedBody, note
+					healURL = buildUpstreamURL(upstream.BaseURL, "/responses")
 				}
 			}
 			// A fourth, independent heal: a reasoning-tier model can reject
@@ -532,9 +540,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// those. Same request-shape reasoning as the others.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				if healedResp, healedBody, healed := p.tryReasoningEffortHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
-					resp, body = healedResp, healedBody
+					resp, body, healNote = healedResp, healedBody, "healed reasoning_effort"
 				}
 			}
+			// Un-learn hook: if reasoning_effort was already forced to "none"
+			// proactively for this account and the upstream STILL rejects with
+			// the same conflict wording, the learned pin is wrong for the
+			// current model — drop it so the next request starts from scratch
+			// instead of paying a wasted rewrite on every tool call.
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				if p.resolveReasoningEffortNone(upstream.ID, account.ID) &&
+					looksLikeReasoningEffortToolsConflict(healPeek(resp)) {
+					p.registry.Health().ForgetReasoningEffortNone(upstream.ID, account.ID)
+				}
+			}
+		}
+		// healNote/healURL feed the request log below; when the reroute heal
+		// fired, the logged URL must be the /responses URL the body actually
+		// went to, not the original chat-completions URL.
+		logURL := upstreamURL
+		if healURL != "" {
+			logURL = healURL
 		}
 
 		// Retryable upstream status → record and rotate within this provider's pool.
@@ -548,6 +574,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// gave sibling keys a chance.
 		if p.registry.Health().IsRetryable(resp.StatusCode) {
 			peek, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+			_, _ = io.Copy(io.Discard, resp.Body) // drain so the socket can be reused
 			resp.Body.Close()
 			// Account-scoped failure only: one burned key doesn't take the whole
 			// pool out of rotation (that's the entire point of multi-account). The
@@ -577,11 +604,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			endpoint == registry.EndpointEmbeddings ||
 			(nativeThisAttempt && endpoint == registry.EndpointResponses)
 		if (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) && optional {
+			_, _ = io.Copy(io.Discard, resp.Body) // drain so the socket can be reused
 			resp.Body.Close()
 			p.registry.Health().MarkUnsupported(upstream.ID, endpoint)
 			if plan == nil {
 				writeError(w, resp.StatusCode, fmt.Sprintf("provider does not support %s", endpoint), "invalid_request_error")
-				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil, nil, upstreamURL, string(body), "")
+				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil, nil, upstreamURL, string(body), "", "")
 				return
 			}
 			triedProviders[upstream.ID] = true
@@ -592,6 +620,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// visible instead of masquerading as "unsupported endpoint".
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_, _ = io.Copy(io.Discard, resp.Body) // drain remainder so the socket can be reused
 			resp.Body.Close()
 			for k, v := range resp.Header {
 				if strings.HasPrefix(k, "Content-") {
@@ -600,13 +629,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(bodyBytes)
-			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, upstreamURL, string(body), string(bodyBytes))
+			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, logURL, string(body), string(bodyBytes), "")
 			return
 		}
 
 		// Non-2xx other than the above → surface to caller (e.g. 400 from upstream).
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_, _ = io.Copy(io.Discard, resp.Body) // drain remainder so the socket can be reused
 			resp.Body.Close()
 			for k, v := range resp.Header {
 				if strings.HasPrefix(k, "Content-") {
@@ -615,7 +645,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			}
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(bodyBytes)
-			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, upstreamURL, string(body), string(bodyBytes))
+			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, logURL, string(body), string(bodyBytes), "")
 			return
 		}
 
@@ -636,7 +666,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 				p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 				errMsg = streamErr.Error()
 			}
-			p.log(info.Model, logID, endpoint, 200, time.Since(start), errMsg, promptTokens, completionTokens, cachedTokens, upstreamURL, string(body), "")
+			p.log(info.Model, logID, endpoint, 200, time.Since(start), errMsg, promptTokens, completionTokens, cachedTokens, logURL, string(body), "", healNote)
 			return
 		}
 
@@ -660,7 +690,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			if err != nil {
 				slog.Error("chat->responses translation failed", "err", err)
 				writeError(w, http.StatusInternalServerError, "responses translation failed", "gateway_error")
-				p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), string(respBody))
+				p.log(info.Model, logID, endpoint, 500, time.Since(start), err.Error(), nil, nil, nil, logURL, string(body), string(respBody), healNote)
 				return
 			}
 			respBody = translated
@@ -675,17 +705,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens, cachedTokens, upstreamURL, string(body), string(respBody))
+		p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "", promptTokens, completionTokens, cachedTokens, logURL, string(body), string(respBody), healNote)
 		return
 	}
 
 	if lastFailStatus != 0 {
 		writeUpstreamError(w, lastFailStatus)
-		p.log(info.Model, lastFailLogID, endpoint, lastFailStatus, 0, fmt.Sprintf("all accounts exhausted, last status %d", lastFailStatus), nil, nil, nil, "", "", "")
+		p.log(info.Model, lastFailLogID, endpoint, lastFailStatus, 0, fmt.Sprintf("all accounts exhausted, last status %d", lastFailStatus), nil, nil, nil, "", "", "", "")
 		return
 	}
 	writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
-	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, nil, "", "", "")
+	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, nil, "", "", "", "")
 }
 
 func upstreamPathFor(endpoint string, nativeResponses bool) string {
@@ -789,7 +819,7 @@ func spliceModel(body []byte, model string) ([]byte, bool) {
 	return nil, false
 }
 
-func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct, cached *int, upstreamURL string, reqPayload string, respSnippet string) {
+func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency time.Duration, errMsg string, pt, ct, cached *int, upstreamURL string, reqPayload string, respSnippet string, healNote string) {
 	// Truncate payloads to avoid storing megabytes per log entry. errMsg gets the
 	// same cap: upstream errors embed full JSON bodies that can dwarf a payload.
 	if len(reqPayload) > maxLogPayload {
@@ -815,6 +845,7 @@ func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency ti
 		UpstreamURL:      upstreamURL,
 		RequestPayload:   reqPayload,
 		ResponseSnippet:  respSnippet,
+		HealNote:         healNote,
 	}
 	// Async to avoid blocking the response path.
 	go func() {

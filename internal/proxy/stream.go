@@ -440,11 +440,15 @@ func buildResponseCompleted(model string, usage struct {
 			"total_tokens":  usage.TotalTokens,
 		}
 		if details != nil {
+			// Responses-API bodies name the detail blocks input_tokens_details /
+			// output_tokens_details (NOT the chat-shaped prompt_/completion_
+			// names) — the raw chunks arrive chat-shaped from the upstream, so
+			// translate the keys here for Responses-native clients.
 			if len(details.PromptTokensDetails) > 0 {
-				usageObj["prompt_tokens_details"] = details.PromptTokensDetails
+				usageObj["input_tokens_details"] = details.PromptTokensDetails
 			}
 			if len(details.CompletionTokensDetails) > 0 {
-				usageObj["completion_tokens_details"] = details.CompletionTokensDetails
+				usageObj["output_tokens_details"] = details.CompletionTokensDetails
 			}
 		}
 		body["usage"] = usageObj

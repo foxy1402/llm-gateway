@@ -725,7 +725,7 @@ function renderLogTable(data) {
       <td class="mono small">${esc(l.model_in)}</td>
       <td class="mono small">${esc(l.provider_used)}</td>
       <td class="small muted">${esc(l.endpoint)}</td>
-      <td><span class="badge ${l.status < 400 ? 'ok' : 'err'}">${l.status}</span>${l.error ? ' <span class="small pill-bad" title="' + esc(l.error) + '">!</span>' : ''}</td>
+      <td><span class="badge ${l.status < 400 ? 'ok' : 'err'}">${l.status}</span>${l.error ? ' <span class="small pill-bad" title="' + esc(l.error) + '">!</span>' : ''}${l.heal_note ? ' <span class="small pill-warn" title="' + esc(l.heal_note) + '">heal</span>' : ''}</td>
       <td class="small">${fmtNum(l.prompt_tokens)}/${fmtNum(l.completion_tokens)}</td>
       <td class="small">${fmtNum(l.cached_tokens)}</td>
       <td class="small">${fmtTps(l.completion_tokens, l.latency_ms)}</td>
@@ -899,6 +899,7 @@ async function showLogDetail(row) {
         <div class="log-detail-label">Upstream URL</div>
         <pre class="log-detail-code">${esc(detail.upstream_url || '—')}</pre>
       </div>
+      ${detail.heal_note ? `<div class="log-detail-section"><div class="log-detail-label" style="color:var(--warn,#e0a83a)">Smart heal</div><pre class="log-detail-code">${esc(detail.heal_note)}</pre></div>` : ''}
       <div class="log-detail-section">
         <div class="log-detail-label">Request Payload</div>
         <pre class="log-detail-code">${fmtJson(detail.request_payload)}</pre>

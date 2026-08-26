@@ -68,10 +68,11 @@ func NewHealthTracker() *HealthTracker {
 		m[k] = v
 	}
 	return &HealthTracker{
-		states:     map[string]*providerHealth{},
-		cooldown:   60 * time.Second,
-		errorCodes: m,
-		tokenParam: map[string]string{},
+		states:          map[string]*providerHealth{},
+		cooldown:        60 * time.Second,
+		errorCodes:      m,
+		tokenParam:      map[string]string{},
+		reasoningEffort: map[string]bool{},
 	}
 }
 
@@ -224,6 +225,39 @@ func (h *HealthTracker) LearnedReasoningEffortNone(providerID, accountID string)
 	h.reasoningEffortMu.RLock()
 	defer h.reasoningEffortMu.RUnlock()
 	return h.reasoningEffort[accountKey(providerID, accountID)]
+}
+
+// ForgetReasoningEffortNone drops a learned reasoning_effort pin — the
+// un-learn path that keeps the cache self-correcting: when a tool request
+// succeeds WITHOUT the forced field, the model no longer needs it and the
+// stale pin (which degrades reasoning quality) must go. Token-param needs no
+// such method: its reactive heal re-verifies the symmetric swap on every
+// error, so a wrong value flips itself.
+func (h *HealthTracker) ForgetReasoningEffortNone(providerID, accountID string) {
+	h.reasoningEffortMu.Lock()
+	defer h.reasoningEffortMu.Unlock()
+	delete(h.reasoningEffort, accountKey(providerID, accountID))
+}
+
+// PruneLearnedAccounts drops learned-cache entries whose (provider, account)
+// no longer exists, mirroring Reload's rrCounter pruning so dashboard churn
+// (delete/rename) doesn't grow the maps without bound. accountKeys is the set
+// of live keys in accountKey(providerID, accountID) form.
+func (h *HealthTracker) PruneLearnedAccounts(accountKeys map[string]bool) {
+	h.tokenParamMu.Lock()
+	for k := range h.tokenParam {
+		if !accountKeys[k] {
+			delete(h.tokenParam, k)
+		}
+	}
+	h.tokenParamMu.Unlock()
+	h.reasoningEffortMu.Lock()
+	for k := range h.reasoningEffort {
+		if !accountKeys[k] {
+			delete(h.reasoningEffort, k)
+		}
+	}
+	h.reasoningEffortMu.Unlock()
 }
 
 // SupportsEndpoint reports whether the provider can handle the given endpoint.

@@ -115,6 +115,13 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 					if raw, err := json.Marshal(item); err == nil {
 						_ = json.Unmarshal(raw, &fo)
 					}
+					if fo.CallID == "" {
+						// A tool output with no call_id cannot be matched to a
+						// function_call — forwarding it would make the upstream
+						// 400 the whole translation, so drop the orphan.
+						slog.Warn("dropping function_call_output with empty call_id")
+						continue
+					}
 					// Chat tool messages want string content.
 					var content any = ""
 					var os string
@@ -138,6 +145,11 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 					role := "user"
 					if r, ok := item["role"]; ok {
 						_ = json.Unmarshal(r, &role)
+					}
+					// Responses' "developer" is chat-completions' "system" under a
+					// newer name — many chat-only upstreams only accept "system".
+					if role == "developer" {
+						role = "system"
 					}
 					var content any = ""
 					if c, ok := item["content"]; ok {
@@ -183,11 +195,35 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 	// silently degrades agentic features.
 	for _, key := range []string{
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
-		"tool_choice", "parallel_tool_calls",
+		"parallel_tool_calls",
 		"response_format", "logit_bias", "stop", "n", "seed", "user",
+		"metadata", "service_tier",
 	} {
 		if v, ok := in[key]; ok {
 			out[key] = json.RawMessage(v)
+		}
+	}
+	// tool_choice needs shape conversion, not passthrough: Responses'
+	// specific-function form {"type":"function","name":f} is invalid in
+	// chat-completions, which nests the name under "function".
+	if v, ok := in["tool_choice"]; ok {
+		out["tool_choice"] = convertResponsesToolChoiceToChat(v)
+	}
+	// Responses' reasoning block maps back to chat's flat reasoning_effort;
+	// dropping it would make reasoning-tier upstreams run at default effort.
+	if v, ok := in["reasoning"]; ok {
+		var r struct {
+			Effort string `json:"effort"`
+		}
+		if json.Unmarshal(v, &r) == nil && r.Effort != "" {
+			out["reasoning_effort"] = r.Effort
+		}
+	}
+	// Surface fields that cannot be represented in chat-completions — silently
+	// dropping them would degrade translated requests with no trace.
+	for _, key := range []string{"min_tokens", "top_logprobs"} {
+		if _, ok := in[key]; ok {
+			slog.Warn("responses->chat translation drops field with no chat-completions equivalent", "field", key)
 		}
 	}
 	if v, ok := in["max_output_tokens"]; ok {
@@ -253,6 +289,38 @@ func convertResponsesTools(raw json.RawMessage) json.RawMessage {
 		return raw // all chat-shaped already: keep the original bytes
 	}
 	b, err := json.Marshal(out)
+	if err != nil {
+		return raw
+	}
+	return b
+}
+
+// convertResponsesToolChoiceToChat rewrites a Responses-API tool_choice into
+// the chat-completions shape. Responses uses {"type":"function","name":"f"}
+// to target a specific function; chat-completions nests it under "function":
+// {"type":"function","function":{"name":"f"}}. The auto/required/none strings
+// pass through unchanged. Unparseable input forwards untouched.
+func convertResponsesToolChoiceToChat(raw json.RawMessage) json.RawMessage {
+	var obj struct {
+		Type     string          `json:"type"`
+		Name     string          `json:"name"`
+		Function json.RawMessage `json:"function"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return raw // string like "auto"/"required"/"none" — valid in both APIs
+	}
+	name := obj.Name
+	if name == "" && len(obj.Function) > 0 {
+		// Hybrid nested shape — already chat-shaped; forward untouched.
+		return raw
+	}
+	if name == "" {
+		return raw // no specific function pin; nothing to rewrite
+	}
+	b, err := json.Marshal(map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": name},
+	})
 	if err != nil {
 		return raw
 	}
@@ -395,9 +463,11 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens            int             `json:"prompt_tokens"`
-			CompletionTokens        int             `json:"completion_tokens"`
-			TotalTokens             int             `json:"total_tokens"`
+			// float64 (not int): some mirrors emit usage as JSON floats ("123.0"),
+			// which fails to unmarshal into int and would zero the whole block.
+			PromptTokens            float64         `json:"prompt_tokens"`
+			CompletionTokens        float64         `json:"completion_tokens"`
+			TotalTokens             float64         `json:"total_tokens"`
 			PromptTokensDetails     json.RawMessage `json:"prompt_tokens_details"`
 			CompletionTokensDetails json.RawMessage `json:"completion_tokens_details"`
 		} `json:"usage"`
@@ -476,22 +546,31 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 		"output":     output,
 	}
 	usageObj := map[string]any{
-		"input_tokens":  chat.Usage.PromptTokens,
-		"output_tokens": chat.Usage.CompletionTokens,
-		"total_tokens":  chat.Usage.TotalTokens,
+		"input_tokens":  int(chat.Usage.PromptTokens),
+		"output_tokens": int(chat.Usage.CompletionTokens),
+		"total_tokens":  int(chat.Usage.TotalTokens),
 	}
 	// Preserve cache/reasoning detail blobs (cached_tokens for OpenAI-compatible
 	// billing visibility; reasoning_tokens; audio_tokens…). Raw forward so any
-	// vendor-specific key under the details objects survives translation.
+	// vendor-specific key under the details objects survives translation. The
+	// Responses-API spec names these input_tokens_details / output_tokens_details
+	// — emitting the chat-shaped names here would make Responses-native clients
+	// ignore the details entirely.
 	if len(chat.Usage.PromptTokensDetails) > 0 {
-		usageObj["prompt_tokens_details"] = chat.Usage.PromptTokensDetails
+		usageObj["input_tokens_details"] = chat.Usage.PromptTokensDetails
 	}
 	if len(chat.Usage.CompletionTokensDetails) > 0 {
-		usageObj["completion_tokens_details"] = chat.Usage.CompletionTokensDetails
+		usageObj["output_tokens_details"] = chat.Usage.CompletionTokensDetails
 	}
 	out["usage"] = usageObj
 	if len(chat.Choices) > 0 && chat.Choices[0].FinishReason != "" {
 		out["finish_reason"] = chat.Choices[0].FinishReason
+		// Chat's "length" finish reason maps to Responses' status "incomplete":
+		// the response stopped early because the token budget ran out. Leaving
+		// status "completed" would mislead Responses clients that check it.
+		if chat.Choices[0].FinishReason == "length" {
+			out["status"] = "incomplete"
+		}
 	}
 	return json.Marshal(out)
 }
@@ -538,11 +617,21 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 			continue
 		}
 		switch m.Role {
-		case "system":
+		case "system", "developer":
+			// Responses' instructions slot corresponds to both chat's "system"
+			// and "developer" roles — developer is just system under a newer name.
 			if s := extractChatMessageText(m.Content); s != "" {
 				instructions = append(instructions, s)
 			}
 		case "tool":
+			if m.ToolCallID == "" {
+				// A tool output with no call_id cannot be matched to any
+				// function_call — forwarding it would make the upstream 400 the
+				// whole request, so drop the orphan instead of poisoning the
+				// reroute.
+				slog.Warn("dropping chat tool message with empty tool_call_id in chat->responses reroute")
+				continue
+			}
 			var content any = ""
 			var s string
 			if json.Unmarshal(m.Content, &s) == nil {
@@ -556,7 +645,21 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 				"output":  content,
 			})
 		default: // "user", "assistant"
+			textType := "input_text"
+			if m.Role == "assistant" {
+				textType = "output_text"
+			}
+			// Text and tool_calls are independent parts of one assistant turn —
+			// emit BOTH (previously the text was dropped whenever tool_calls
+			// were present, losing the model's accompanying narration).
 			if len(m.ToolCalls) > 0 {
+				if text := extractChatMessageText(m.Content); text != "" {
+					input = append(input, map[string]any{
+						"type":    "message",
+						"role":    m.Role,
+						"content": []any{map[string]any{"type": textType, "text": text}},
+					})
+				}
 				for _, tc := range m.ToolCalls {
 					input = append(input, map[string]any{
 						"type":      "function_call",
@@ -567,10 +670,8 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 				}
 				continue
 			}
-			textType := "input_text"
-			if m.Role == "assistant" {
-				textType = "output_text"
-			}
+			// No tool_calls: forward the content as-is through the part
+			// converter, which handles plain strings, text arrays, and images.
 			input = append(input, map[string]any{
 				"type":    "message",
 				"role":    m.Role,
@@ -592,9 +693,30 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 			out["tools"] = converted
 		}
 	}
-	for _, key := range []string{"tool_choice", "temperature", "top_p", "parallel_tool_calls", "user"} {
+	// tool_choice needs shape conversion, not passthrough: chat-completions
+	// nests the function name ({"type":"function","function":{"name":f}}) while
+	// Responses flattens it ({"type":"function","name":f}) — forwarding the
+	// nested shape makes the upstream reject the request.
+	if v, ok := full["tool_choice"]; ok {
+		out["tool_choice"] = convertChatToolChoiceToResponses(v)
+	}
+	// Chat's flat reasoning_effort maps into Responses' nested reasoning block.
+	if v, ok := full["reasoning_effort"]; ok {
+		out["reasoning"] = map[string]any{"effort": json.RawMessage(v)}
+	}
+	for _, key := range []string{"temperature", "top_p", "parallel_tool_calls", "user"} {
 		if v, ok := full[key]; ok {
 			out[key] = json.RawMessage(v)
+		}
+	}
+	// Surface chat fields with no Responses equivalent instead of silently
+	// dropping them (min_completion_tokens, logprobs and response_format have
+	// no Responses-API analogue — structured output there goes through
+	// text.format, a different mechanism, and guessing a "min_tokens" field
+	// would risk upstream rejection).
+	for _, key := range []string{"logprobs", "top_logprobs", "response_format", "min_completion_tokens"} {
+		if _, ok := full[key]; ok {
+			slog.Warn("chat->responses reroute drops field with no Responses-API equivalent", "field", key)
 		}
 	}
 	if v, ok := full["max_completion_tokens"]; ok {
@@ -603,6 +725,33 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 		out["max_output_tokens"] = v
 	}
 	return json.Marshal(out)
+}
+
+// convertChatToolChoiceToResponses rewrites a chat-completions tool_choice
+// into the Responses-API shape: {"type":"function","function":{"name":"f"}} →
+// {"type":"function","name":"f"}. The auto/required/none strings and the
+// "required" value pass through unchanged. Unparseable input forwards untouched.
+func convertChatToolChoiceToResponses(raw json.RawMessage) json.RawMessage {
+	var obj struct {
+		Type     string `json:"type"`
+		Function *struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return raw // string like "auto"/"required"/"none" — valid in both APIs
+	}
+	if obj.Function == nil || obj.Function.Name == "" {
+		return raw // no specific function pin; already Responses-compatible
+	}
+	b, err := json.Marshal(map[string]any{
+		"type": "function",
+		"name": obj.Function.Name,
+	})
+	if err != nil {
+		return raw
+	}
+	return b
 }
 
 // chatContentToResponsesParts converts a chat-completions message "content"
@@ -692,15 +841,22 @@ func convertChatToolsToResponses(raw json.RawMessage) json.RawMessage {
 }
 
 // ResponsesResponseToChatResponse converts a /v1/responses JSON response into
-// a /v1/chat/completions-shaped payload — the mirror image of
-// ChatToResponsesResponse, used by proxy.tryResponsesRerouteHeal so the
-// client (which called chat.completions) never sees the Responses shape.
-func ResponsesResponseToChatResponse(body []byte) ([]byte, error) {
+// a /v1/chat/completions-shaped payload addressed to originalModel — the
+// mirror image of ChatToResponsesResponse, used by proxy.tryResponsesRerouteHeal
+// so the client (which called chat.completions) never sees the Responses shape.
+func ResponsesResponseToChatResponse(body []byte, originalModel string) ([]byte, error) {
 	var resp struct {
 		ID        string `json:"id"`
 		CreatedAt int64  `json:"created_at"`
 		Model     string `json:"model"`
-		Output    []struct {
+		Status    string `json:"status"`
+		// incomplete_details.reason ("max_output_tokens" | "content_filter") is
+		// how the Responses API reports a truncated response — without it the
+		// chat finish_reason falls back to "stop" and clients retry endlessly.
+		IncompleteDetails struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		Output []struct {
 			Type    string `json:"type"`
 			Content []struct {
 				Type string `json:"type"`
@@ -711,9 +867,11 @@ func ResponsesResponseToChatResponse(body []byte) ([]byte, error) {
 			Arguments string `json:"arguments"`
 		} `json:"output"`
 		Usage struct {
-			InputTokens        int `json:"input_tokens"`
-			OutputTokens       int `json:"output_tokens"`
-			TotalTokens        int `json:"total_tokens"`
+			// float64 (not int): some mirrors emit usage as JSON floats
+			// ("123.0"), which fails to unmarshal into int and zeros the block.
+			InputTokens        float64 `json:"input_tokens"`
+			OutputTokens       float64 `json:"output_tokens"`
+			TotalTokens        float64 `json:"total_tokens"`
 			InputTokensDetails *struct {
 				CachedTokens     int `json:"cached_tokens"`
 				CacheWriteTokens int `json:"cache_write_tokens"`
@@ -770,17 +928,31 @@ func ResponsesResponseToChatResponse(body []byte) ([]byte, error) {
 	}
 
 	finishReason := "stop"
+	incomplete := resp.Status == "incomplete"
+	if incomplete {
+		finishReason = "length"
+		if resp.IncompleteDetails.Reason == "content_filter" {
+			finishReason = "content_filter"
+		}
+	}
+	// Text and tool_calls are independent parts of one assistant turn — the
+	// previous version nulled content whenever tool_calls were present, losing
+	// the model's accompanying narration.
 	message := map[string]any{"role": "assistant", "content": text}
 	if len(toolCalls) > 0 {
-		finishReason = "tool_calls"
 		message["tool_calls"] = toolCalls
-		message["content"] = nil
+		// tool_calls only wins the finish_reason when the response actually
+		// COMPLETED — an incomplete response got truncated mid-generation, and
+		// "length"/"content_filter" is the more accurate reason in that case.
+		if !incomplete {
+			finishReason = "tool_calls"
+		}
 	}
 
 	usageObj := map[string]any{
-		"prompt_tokens":     resp.Usage.InputTokens,
-		"completion_tokens": resp.Usage.OutputTokens,
-		"total_tokens":      resp.Usage.TotalTokens,
+		"prompt_tokens":     int(resp.Usage.InputTokens),
+		"completion_tokens": int(resp.Usage.OutputTokens),
+		"total_tokens":      int(resp.Usage.TotalTokens),
 	}
 	// Translate the Responses-API cache/reasoning detail blocks into their
 	// chat-completions equivalents — dropping these here would silently hide
@@ -802,7 +974,7 @@ func ResponsesResponseToChatResponse(body []byte) ([]byte, error) {
 		"id":      id,
 		"object":  "chat.completion",
 		"created": created,
-		"model":   resp.Model,
+		"model":   originalModel,
 		"choices": []any{
 			map[string]any{"index": 0, "message": message, "finish_reason": finishReason},
 		},

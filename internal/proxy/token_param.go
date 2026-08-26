@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -94,9 +92,7 @@ func applyTokenParamMode(body []byte, mode string) (out []byte, ok bool) {
 // provider's model can change) and this is what self-corrects instead of
 // wedging a wrong setting in place forever.
 func (p *Proxy) tryTokenParamHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string) (*http.Response, []byte, bool) {
-	const peekCap = 8 << 10 // error bodies are always tiny; this is generous
-	peeked, _ := io.ReadAll(io.LimitReader(resp.Body, peekCap))
-	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peeked), resp.Body))
+	peeked := healPeek(resp)
 	if !looksLikeTokenParamMismatch(peeked) {
 		return resp, reqBody, false
 	}
@@ -104,20 +100,20 @@ func (p *Proxy) tryTokenParamHeal(ctx context.Context, resp *http.Response, upst
 	if !ok {
 		return resp, reqBody, false
 	}
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(fixedBody))
-	if err != nil {
-		return resp, reqBody, false
+	if ctx.Err() != nil {
+		return resp, reqBody, false // client already gone; don't burn a redispatch
 	}
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+authKey)
-	upReq.Header.Set("Accept", "text/event-stream, application/json")
-	upReq.Header.Set("X-Accel-Buffering", "no")
-	newResp, err := p.client.Do(upReq)
+	newResp, err := p.healRedispatch(ctx, upstreamURL, authKey, fixedBody)
 	if err != nil {
 		return resp, reqBody, false
 	}
 	resp.Body.Close()
-	p.registry.Health().LearnTokenParam(providerID, accountID, healedField)
+	// Learn ONLY when the retry actually succeeded: the swap is symmetric and
+	// self-corrects on a later mismatch, but a 500 redispatch proves nothing
+	// about the field name itself.
+	if healSucceeded(newResp) {
+		p.registry.Health().LearnTokenParam(providerID, accountID, healedField)
+	}
 	slog.Info("auto-corrected max_tokens/max_completion_tokens field and retried, remembering for next time",
 		"provider", providerID, "account", accountID, "field", healedField,
 		"status_before", resp.StatusCode, "status_after", newResp.StatusCode)
@@ -146,9 +142,10 @@ const minTokenFloorDefault = 16
 // key into cooldown or consume a rotation attempt, since every sibling
 // account would fail identically on the same too-small value.
 func (p *Proxy) tryMinTokensHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string, floor int) (*http.Response, []byte, bool) {
-	const peekCap = 8 << 10
-	peeked, _ := io.ReadAll(io.LimitReader(resp.Body, peekCap))
-	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peeked), resp.Body))
+	if floor <= 0 {
+		return resp, reqBody, false // MIN_COMPLETION_TOKENS=0 disables this heal
+	}
+	peeked := healPeek(resp)
 	if !looksLikeTokenBudgetTooSmall(peeked) {
 		return resp, reqBody, false
 	}
@@ -156,15 +153,10 @@ func (p *Proxy) tryMinTokensHeal(ctx context.Context, resp *http.Response, upstr
 	if !ok {
 		return resp, reqBody, false
 	}
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(fixedBody))
-	if err != nil {
-		return resp, reqBody, false
+	if ctx.Err() != nil {
+		return resp, reqBody, false // client already gone; don't burn a redispatch
 	}
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+authKey)
-	upReq.Header.Set("Accept", "text/event-stream, application/json")
-	upReq.Header.Set("X-Accel-Buffering", "no")
-	newResp, err := p.client.Do(upReq)
+	newResp, err := p.healRedispatch(ctx, upstreamURL, authKey, fixedBody)
 	if err != nil {
 		return resp, reqBody, false
 	}
@@ -217,6 +209,11 @@ func bumpTokenFloor(body []byte, floor int) (out []byte, oldVal float64, ok bool
 	}
 	var n float64
 	if err := json.Unmarshal(raw, &n); err != nil {
+		return nil, 0, false
+	}
+	if n < 0 {
+		// A negative budget is a client bug, not a too-small one — bumping it
+		// would silently change the request's meaning instead of surfacing it.
 		return nil, 0, false
 	}
 	if n >= float64(floor) {

@@ -66,7 +66,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		table   string
 		columns []string
 	}{
-		{"request_log", []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER"}},
+		{"request_log", []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER", "heal_note TEXT DEFAULT ''"}},
 		{"providers", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
 		{"provider_accounts", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
 		{"combo_members", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
@@ -502,10 +502,10 @@ func (s *Store) LogRequest(e config.LogEntry) error {
 		e.Timestamp = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`INSERT INTO request_log
-		(ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, error, upstream_url, request_payload, response_snippet)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, error, upstream_url, request_payload, response_snippet, heal_note)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Timestamp, e.ModelIn, e.ProviderUsed, e.Endpoint, e.Status, e.LatencyMs, e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.Error,
-		e.UpstreamURL, e.RequestPayload, e.ResponseSnippet)
+		e.UpstreamURL, e.RequestPayload, e.ResponseSnippet, e.HealNote)
 	return err
 }
 
@@ -531,7 +531,7 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 		where = append(where, "ts < ?")
 		args = append(args, f.Until)
 	}
-	q := "SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log"
+	q := "SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,''), COALESCE(heal_note,'') FROM request_log"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -554,7 +554,7 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 	for rows.Next() {
 		var e config.LogEntry
 		var prompt, completion, cached sql.NullInt64
-		if err := rows.Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &cached, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet); err != nil {
+		if err := rows.Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &cached, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet, &e.HealNote); err != nil {
 			return nil, err
 		}
 		if prompt.Valid {
@@ -579,9 +579,9 @@ func (s *Store) GetLog(id int64) (*config.LogEntry, error) {
 	var e config.LogEntry
 	var prompt, completion, cached sql.NullInt64
 	err := s.db.QueryRow(
-		"SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,'') FROM request_log WHERE id = ?",
+		"SELECT id, ts, model_in, provider_used, endpoint, status, latency_ms, prompt_tokens, completion_tokens, cached_tokens, COALESCE(error,''), COALESCE(upstream_url,''), COALESCE(request_payload,''), COALESCE(response_snippet,''), COALESCE(heal_note,'') FROM request_log WHERE id = ?",
 		id,
-	).Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &cached, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet)
+	).Scan(&e.ID, &e.Timestamp, &e.ModelIn, &e.ProviderUsed, &e.Endpoint, &e.Status, &e.LatencyMs, &prompt, &completion, &cached, &e.Error, &e.UpstreamURL, &e.RequestPayload, &e.ResponseSnippet, &e.HealNote)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

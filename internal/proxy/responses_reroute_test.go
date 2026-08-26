@@ -252,7 +252,7 @@ func TestChatRequestToResponsesRequest(t *testing.T) {
 func TestResponsesResponseToChatResponse(t *testing.T) {
 	t.Run("text output", func(t *testing.T) {
 		in := `{"id":"resp_abc","created_at":1700000000,"model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}`
-		out, err := ResponsesResponseToChatResponse([]byte(in))
+		out, err := ResponsesResponseToChatResponse([]byte(in), "client-model")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -263,6 +263,9 @@ func TestResponsesResponseToChatResponse(t *testing.T) {
 		}
 		if parsed["id"] != "chatcmpl-abc" {
 			t.Errorf("id = %v, want chatcmpl-abc", parsed["id"])
+		}
+		if parsed["model"] != "client-model" {
+			t.Errorf("model = %v, want client-model (the alias the client requested, not the upstream's raw model)", parsed["model"])
 		}
 		choices := parsed["choices"].([]any)
 		msg := choices[0].(map[string]any)["message"].(map[string]any)
@@ -282,7 +285,7 @@ func TestResponsesResponseToChatResponse(t *testing.T) {
 		// savings from the dashboard's cost/usage tracking (extractChatUsage
 		// reads prompt_tokens_details.cached_tokens from exactly this shape).
 		in := `{"id":"resp_abc","model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":27478,"output_tokens":44,"total_tokens":27522,"input_tokens_details":{"cached_tokens":27000,"cache_write_tokens":0},"output_tokens_details":{"reasoning_tokens":10}}}`
-		out, err := ResponsesResponseToChatResponse([]byte(in))
+		out, err := ResponsesResponseToChatResponse([]byte(in), "m")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -314,7 +317,7 @@ func TestResponsesResponseToChatResponse(t *testing.T) {
 	})
 	t.Run("function_call output", func(t *testing.T) {
 		in := `{"id":"resp_abc","model":"m","output":[{"type":"function_call","call_id":"call_1","name":"add","arguments":"{\"a\":1}"}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}`
-		out, err := ResponsesResponseToChatResponse([]byte(in))
+		out, err := ResponsesResponseToChatResponse([]byte(in), "m")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

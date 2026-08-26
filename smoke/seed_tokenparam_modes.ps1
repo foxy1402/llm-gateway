@@ -9,10 +9,11 @@
 #      because the gateway learned the answer from request #1.
 #   3. A combo member's token_param_mode overrides the account/provider.
 #
-# Prereqs: mock_server.py running (127.0.0.1:19874 = smartmode-mock), gateway
-# running on :18089 with GATEWAY_API_KEY=smoke-secret,
-# DASHBOARD_PASSWORD=smoke-dashboard, DASHBOARD_SECRET (>=32 chars), and a
-# FRESH database.
+# Prereqs: mock_server.py running (127.0.0.1:19874 = smartmode-mock), launched
+# from the repo root as `python smoke/mock_server.py smoke/requests.log` so its
+# request log lands where CountCalls() reads it. Gateway running on :18089 with
+# GATEWAY_API_KEY=smoke-secret, DASHBOARD_PASSWORD=smoke-dashboard,
+# DASHBOARD_SECRET (>=32 chars), and a FRESH database.
 $ErrorActionPreference = "Stop"
 $base = "http://127.0.0.1:18089"
 $H = @{ Authorization = "Bearer smoke-secret"; "Content-Type" = "application/json" }
@@ -33,8 +34,14 @@ function Dash($method, $path, $bodyObj = $null) {
 }
 
 function CountCalls($token) {
-  if (-not (Test-Path "smoke\requests.log")) { return 0 }
-  return (Get-Content "smoke\requests.log" | Where-Object { $_ -match "`"token`": `"$token`"" }).Count
+  # mock_server.py writes its JSON-lines log to <argv1> (default "requests.log"
+  # in ITS own CWD). To keep the mock and this script agreeing on one file no
+  # matter where either is launched from, resolve relative to this script's
+  # directory and require the mock be started from the repo root as:
+  #     python smoke/mock_server.py smoke/requests.log
+  $log = Join-Path $PSScriptRoot "requests.log"
+  if (-not (Test-Path $log)) { return 0 }
+  return (Get-Content $log | Where-Object { $_ -match "`"token`": `"$token`"" }).Count
 }
 
 Step "1) manual override: provider 'sm-manual' pinned to max_completion_tokens"
@@ -86,5 +93,31 @@ if ($req2Calls -ne 1) {
   exit 1
 }
 Write-Host "PASS: learned cache eliminated the extra round trip starting from request #2"
+
+Step "3) combo member's token_param_mode overrides account/provider"
+# sm-auto has NO explicit mode anywhere except the combo member pin, so the
+# member's max_completion_tokens override must be what makes the first call
+# succeed in exactly 1 upstream dispatch (no reactive heal round trip).
+$combo = @{
+  id = "sm-combo"; display_name = "Member Pin"; rotation = "all"
+  enabled = $true
+  members = @(@{
+    provider_id = "sm-auto"; model = "openai/gpt-5.6-sol"
+    token_param_mode = "max_completion_tokens"
+  })
+}
+try { Dash Delete "combos/sm-combo" | Out-Null } catch {}
+Dash Post "combos" $combo | Out-Null
+$before3 = CountCalls "sm-k1"
+$body3 = @{ model = "sm-combo"; messages = @(@{ role = "user"; content = "hi" }); max_tokens = 16 } | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Method Post -Uri "$base/v1/chat/completions" -Headers $H -Body $body3 | Out-Null
+$after3 = CountCalls "sm-k1"
+$req3Calls = $after3 - $before3
+Write-Host "combo request upstream calls: $req3Calls"
+if ($req3Calls -ne 1) {
+  Write-Host "FAIL: combo member override should cost exactly 1 call, got $req3Calls"
+  exit 1
+}
+Write-Host "PASS: combo member token_param_mode override skipped the heal round trip"
 
 Write-Host "`nALL TOKEN-PARAM MODE SMOKE CHECKS PASSED"

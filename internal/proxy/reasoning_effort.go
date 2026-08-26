@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -57,10 +55,32 @@ func applyReasoningEffortNone(body []byte) (out []byte, ok bool) {
 // To use function tools, use /v1/responses or set reasoning_effort to
 // 'none'." Matched loosely (mentions both "reasoning_effort" and "tool"
 // together) since exact phrasing will vary by vendor, mirroring the other two
-// heals in this package.
+// heals in this package. Word boundaries around "tool" keep errors that merely
+// list "tools" among supported parameters from injecting reasoning_effort.
 func looksLikeReasoningEffortToolsConflict(body []byte) bool {
 	norm := strings.ToLower(string(body))
-	return strings.Contains(norm, "reasoning_effort") && strings.Contains(norm, "tool")
+	if !strings.Contains(norm, "reasoning_effort") {
+		return false
+	}
+	return wordInString(norm, "tool") || wordInString(norm, "tools") || wordInString(norm, "function")
+}
+
+// wordInString reports whether word appears in s delimited by non-alphanumerics.
+func wordInString(s, word string) bool {
+	isWord := func(b byte) bool {
+		return b >= 'a' && b <= 'z' || b >= '0' && b <= '9'
+	}
+	for i := 0; i+len(word) <= len(s); i++ {
+		if s[i:i+len(word)] != word {
+			continue
+		}
+		beforeOK := i == 0 || !isWord(s[i-1])
+		afterOK := i+len(word) == len(s) || !isWord(s[i+len(word)])
+		if beforeOK && afterOK {
+			return true
+		}
+	}
+	return false
 }
 
 // tryReasoningEffortHeal is the third chained reactive heal (see call site in
@@ -72,9 +92,7 @@ func looksLikeReasoningEffortToolsConflict(body []byte) bool {
 // answer (registry.Health's learned-reasoning-effort cache) so the next
 // tool-call request from this client skips the failing first attempt.
 func (p *Proxy) tryReasoningEffortHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string) (*http.Response, []byte, bool) {
-	const peekCap = 8 << 10
-	peeked, _ := io.ReadAll(io.LimitReader(resp.Body, peekCap))
-	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peeked), resp.Body))
+	peeked := healPeek(resp)
 	if !looksLikeReasoningEffortToolsConflict(peeked) {
 		return resp, reqBody, false
 	}
@@ -82,20 +100,21 @@ func (p *Proxy) tryReasoningEffortHeal(ctx context.Context, resp *http.Response,
 	if !ok {
 		return resp, reqBody, false
 	}
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(fixedBody))
-	if err != nil {
-		return resp, reqBody, false
+	if ctx.Err() != nil {
+		return resp, reqBody, false // client already gone; don't burn a redispatch
 	}
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+authKey)
-	upReq.Header.Set("Accept", "text/event-stream, application/json")
-	upReq.Header.Set("X-Accel-Buffering", "no")
-	newResp, err := p.client.Do(upReq)
+	newResp, err := p.healRedispatch(ctx, upstreamURL, authKey, fixedBody)
 	if err != nil {
 		return resp, reqBody, false
 	}
 	resp.Body.Close()
-	p.registry.Health().LearnReasoningEffortNone(providerID, accountID)
+	// Learn ONLY when the retry actually succeeded: a 500 redispatch proves
+	// nothing, and this cache has no auto-correction path (unlike the
+	// symmetric token-param swap), so a wrong pin would degrade reasoning on
+	// every future tool request for this account until restart.
+	if healSucceeded(newResp) {
+		p.registry.Health().LearnReasoningEffortNone(providerID, accountID)
+	}
 	slog.Info("auto-forced reasoning_effort=none for tool-call request and retried, remembering for next time",
 		"provider", providerID, "account", accountID,
 		"status_before", resp.StatusCode, "status_after", newResp.StatusCode)
