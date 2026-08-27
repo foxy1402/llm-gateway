@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"context"
 	"llm-gateway/internal/config"
 	"llm-gateway/internal/registry"
 	"llm-gateway/internal/store"
-	"context"
 )
 
 func TestStreamingEarlyErrorRotates(t *testing.T) {
@@ -37,6 +37,7 @@ func TestStreamingEarlyErrorRotates(t *testing.T) {
 	reg := registry.New()
 	reg.Reload(st)
 	px := New(reg, st, 2*time.Second)
+	defer px.WaitLogs() // drain async log writes before the deferred st.Close()
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"c","messages":[],"stream":true}`))
 	rec := httptest.NewRecorder()
@@ -69,6 +70,7 @@ func TestStreamOutlivesHeaderTimeout(t *testing.T) {
 	reg := registry.New()
 	reg.Reload(st)
 	px := New(reg, st, 150*time.Millisecond)
+	defer px.WaitLogs() // drain async log writes before the deferred st.Close()
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"solo","messages":[],"stream":true}`))
 	rec := httptest.NewRecorder()
@@ -100,6 +102,7 @@ func TestStreamingMidStreamErrorPassesThrough(t *testing.T) {
 	reg := registry.New()
 	reg.Reload(st)
 	px := New(reg, st, 2*time.Second)
+	defer px.WaitLogs() // drain async log writes before the deferred st.Close()
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"solo","messages":[],"stream":true}`))
 	rec := httptest.NewRecorder()

@@ -39,6 +39,12 @@ func newTestStack(t *testing.T, upstream *httptest.Server, provs []config.Provid
 		t.Fatalf("reload: %v", err)
 	}
 	px := New(reg, st, 5*time.Second)
+	// t.Cleanup runs LIFO, so this drain executes BEFORE the st.Close()
+	// registered above — guaranteeing every in-flight async request-log write
+	// has landed before the store closes. Without it a background SQLite write
+	// races t.TempDir teardown under -race and flakily fails the test with
+	// "directory not empty" (observed: TestPinnedSiblingFallthrough).
+	t.Cleanup(px.WaitLogs)
 	return px, st, reg
 }
 

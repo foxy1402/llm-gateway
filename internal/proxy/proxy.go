@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"llm-gateway/internal/config"
@@ -62,6 +63,11 @@ type Proxy struct {
 	// minTokenFloorDefault; overridden via SetMinCompletionTokens
 	// (env.MIN_COMPLETION_TOKENS). 0 disables the heal entirely.
 	minCompletionTokens int
+	// logWG tracks the fire-and-forget request-log goroutines started by p.log
+	// so tests (and a future graceful shutdown) can WaitLogs before closing the
+	// store — otherwise a still-in-flight SQLite write races t.TempDir cleanup
+	// under -race and flakily fails tests with "directory not empty".
+	logWG sync.WaitGroup
 }
 
 func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy {
@@ -847,13 +853,22 @@ func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency ti
 		ResponseSnippet:  respSnippet,
 		HealNote:         healNote,
 	}
-	// Async to avoid blocking the response path.
+	// Async to avoid blocking the response path. Tracked on logWG so WaitLogs
+	// can drain in-flight writes before the store closes (tests, shutdown).
+	p.logWG.Add(1)
 	go func() {
+		defer p.logWG.Done()
 		if err := p.store.LogRequest(entry); err != nil {
 			slog.Warn("failed to write request log", "err", err)
 		}
 	}()
 }
+
+// WaitLogs blocks until every fire-and-forget request-log write started before
+// this call has finished. Tests call this before closing the store so a
+// background SQLite write can't race t.TempDir cleanup; a future graceful
+// shutdown can use it before closing the store too.
+func (p *Proxy) WaitLogs() { p.logWG.Wait() }
 
 func writeError(w http.ResponseWriter, status int, msg, typ string) {
 	w.Header().Set("Content-Type", "application/json")

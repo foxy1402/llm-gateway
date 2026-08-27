@@ -42,6 +42,7 @@ func TestStreamFlushesThroughWrapper(t *testing.T) {
 	reg := registry.New()
 	reg.Reload(st)
 	px := New(reg, st, 2*time.Second)
+	defer px.WaitLogs() // drain async log writes before the deferred st.Close()
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"solo","messages":[],"stream":true}`))
 	rec := httptest.NewRecorder()

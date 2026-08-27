@@ -93,7 +93,12 @@ func run() error {
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
-	return srv.Shutdown(shutdownCtx)
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	// All handlers have returned by now, but p.log fires its SQLite writes
+	// fire-and-forget — drain them so the final requests' logs actually land
+	// before the process exits.
+	px.WaitLogs()
+	return shutdownErr
 }
 
 // startLogPruner ticks hourly and prunes request logs older than the retention
