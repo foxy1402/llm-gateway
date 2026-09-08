@@ -72,6 +72,11 @@ func Mount(mux *http.ServeMux, d *Deps) {
 	mux.Handle("GET /dashboard/api/providers/{id}/models", withAuth(http.HandlerFunc(api.listProviderModels)))
 	mux.Handle("POST /dashboard/api/providers/{id}/models/fetch", withAuth(http.HandlerFunc(api.fetchProviderModels)))
 
+	mux.Handle("GET /dashboard/api/proxies", withAuth(http.HandlerFunc(api.listProxies)))
+	mux.Handle("POST /dashboard/api/proxies", withAuth(http.HandlerFunc(api.createProxy)))
+	mux.Handle("PUT /dashboard/api/proxies/{id}", withAuth(http.HandlerFunc(api.updateProxy)))
+	mux.Handle("DELETE /dashboard/api/proxies/{id}", withAuth(http.HandlerFunc(api.deleteProxy)))
+
 	mux.Handle("GET /dashboard/api/combos", withAuth(http.HandlerFunc(api.listCombos)))
 	mux.Handle("POST /dashboard/api/combos", withAuth(http.HandlerFunc(api.createCombo)))
 	mux.Handle("PUT /dashboard/api/combos/{id}", withAuth(http.HandlerFunc(api.updateCombo)))
@@ -136,6 +141,7 @@ type providerPayload struct {
 	ResponsesNative bool             `json:"responses_native"`
 	Accounts        []config.Account `json:"accounts,omitempty"`
 	TokenParamMode  string           `json:"token_param_mode,omitempty"`
+	ProxyRotate     bool             `json:"proxy_rotate,omitempty"`
 }
 
 func (pp providerPayload) toConfig() config.Provider {
@@ -143,6 +149,7 @@ func (pp providerPayload) toConfig() config.Provider {
 		ID: pp.ID, Display: pp.Display, BaseURL: pp.BaseURL, AuthKey: pp.AuthKey,
 		Model: pp.Model, Weight: pp.Weight, Tags: pp.Tags, Enabled: pp.Enabled,
 		ResponsesNative: pp.ResponsesNative, TokenParamMode: pp.TokenParamMode,
+		ProxyRotate: pp.ProxyRotate,
 	}
 }
 
@@ -267,6 +274,124 @@ func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	api.reload()
 	writeJSON(w, 200, p)
+}
+
+// --- proxy pool ---
+
+type proxyPayload struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	URL     string `json:"url"`
+	Enabled bool   `json:"enabled"`
+}
+
+// proxyRow is the dashboard-facing pool entry: the stored config plus its
+// passive liveness (see registry.HealthTracker proxy methods). Status is one
+// of "alive" (a response arrived through it), "dead" (transport failure, still
+// cooling down), or "unknown" (never tried since restart — not a verdict).
+func (api *apiHandlers) listProxies(w http.ResponseWriter, r *http.Request) {
+	type proxyRow struct {
+		config.ProxyEntry
+		Status     string `json:"status"`
+		Failures   int    `json:"failures"`
+		CooldownMs int64  `json:"cooldown_ms"`
+	}
+	out := []proxyRow{}
+	for _, e := range api.d.Reg.ListAllProxies() {
+		failures, avail, ms, seen := api.d.Reg.Health().ProxyStatus(e.ID)
+		status := "unknown"
+		if seen {
+			status = "alive"
+			if !avail {
+				status = "dead"
+			}
+		}
+		out = append(out, proxyRow{ProxyEntry: e, Status: status, Failures: failures, CooldownMs: ms})
+	}
+	writeJSON(w, 200, out)
+}
+
+// getProxyEntry finds one pool entry by ID, or nil. There's no dedicated
+// registry accessor (mirroring GetProvider/GetCombo) since the pool is small
+// and only the dashboard needs single-entry lookups; ListAllProxies already
+// takes the registry lock.
+func (api *apiHandlers) getProxyEntry(id string) *config.ProxyEntry {
+	for _, e := range api.d.Reg.ListAllProxies() {
+		if e.ID == id {
+			return &e
+		}
+	}
+	return nil
+}
+
+// createProxy adds a new pool entry with a server-generated ID: unlike
+// providers/combos, proxy entries have no natural user-facing identifier, so
+// (unlike createProvider/createCombo) the ID is never taken from the request
+// body — unconditionally discarding any client-supplied "id" keeps a POST
+// from ever being able to silently overwrite an existing entry.
+func (api *apiHandlers) createProxy(w http.ResponseWriter, r *http.Request) {
+	var p proxyPayload
+	if err := decodeJSON(r, &p); err != nil {
+		writeErr(w, 400, "invalid JSON")
+		return
+	}
+	p.URL = strings.TrimSpace(p.URL)
+	if err := proxy.ValidateProxyURL(p.URL); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	p.ID = "px-" + shortID()
+	// New entries go on the end, keeping the pool in a stable, user-visible
+	// rotation order.
+	pos := 0
+	for _, existing := range api.d.Reg.ListAllProxies() {
+		pos = existing.Position + 1
+	}
+	entry := config.ProxyEntry{ID: p.ID, Label: p.Label, URL: p.URL, Enabled: p.Enabled, Position: pos}
+	if err := api.d.Store.UpsertProxy(entry); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
+	writeJSON(w, 201, entry)
+}
+
+// updateProxy edits an existing pool entry in place, preserving its position.
+// Mirrors updateProvider/updateCombo: a PUT to an ID that doesn't exist is a
+// 404, not a silent insert under a client-chosen path segment.
+func (api *apiHandlers) updateProxy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	existing := api.getProxyEntry(id)
+	if existing == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
+	var p proxyPayload
+	if err := decodeJSON(r, &p); err != nil {
+		writeErr(w, 400, "invalid JSON")
+		return
+	}
+	p.URL = strings.TrimSpace(p.URL)
+	if err := proxy.ValidateProxyURL(p.URL); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	entry := config.ProxyEntry{ID: id, Label: p.Label, URL: p.URL, Enabled: p.Enabled, Position: existing.Position}
+	if err := api.d.Store.UpsertProxy(entry); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
+	writeJSON(w, 200, entry)
+}
+
+func (api *apiHandlers) deleteProxy(w http.ResponseWriter, r *http.Request) {
+	if err := api.d.Store.DeleteProxy(r.PathValue("id")); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	api.reload()
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
 func (api *apiHandlers) deleteProvider(w http.ResponseWriter, r *http.Request) {
@@ -608,6 +733,7 @@ type comboPayload struct {
 	Rotation    string               `json:"rotation"`
 	Members     []comboMemberPayload `json:"members"`
 	Enabled     bool                 `json:"enabled"`
+	ProxyRotate bool                 `json:"proxy_rotate,omitempty"`
 }
 
 func (cp comboPayload) toConfig() config.Combo {
@@ -620,7 +746,7 @@ func (cp comboPayload) toConfig() config.Combo {
 	}
 	return config.Combo{
 		ID: cp.ID, DisplayName: cp.DisplayName, Rotation: config.RotationPolicy(cp.Rotation),
-		Members: members, Enabled: cp.Enabled,
+		Members: members, Enabled: cp.Enabled, ProxyRotate: cp.ProxyRotate,
 	}
 }
 

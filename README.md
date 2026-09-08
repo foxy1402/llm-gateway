@@ -182,6 +182,22 @@ When an upstream returns a retryable status (default `402, 429, 500, 502, 503, 5
 
 **Self-heal within one request**: a direct provider call or an unpinned combo member automatically rotates across that provider's *other* healthy keys — up to `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` of them — before the request fails, so a single client call transparently survives one or more keys being rate-limited or out of credit. Pinned combo members (a member bound to one specific key) don't have siblings to fall back to *within that member*, but a same-provider sibling pinned to a **different** key on another combo member still rotates in normally.
 
+### Egress proxy pool (optional)
+
+Some upstreams rate-limit per **source IP** rather than per key — in that case a pool of 10 keys behind one IP still hits one shared ceiling, and no amount of key rotation helps. For those upstreams, the gateway keeps one shared **egress proxy pool** (dashboard → **Proxies**): entries are `http`/`https`/`socks5`/`socks5h` URLs with an explicit port (e.g. `socks5://user:pass@1.2.3.4:1080`), and validation happens at save time so a typo'd entry is a clear `400`, not a mystery dial failure mid-request.
+
+Routing through the pool is **opt-in per provider or combo** (their "Rotate egress proxy" toggle) and **off by default** — for upstreams that count per key, a proxy is just an extra hop and an extra failure mode. When opted in, every upstream **attempt** advances one proxy from the shared pool, so a retry after a per-IP `429` leaves from a different address; smart-mode heal retries deliberately reuse the *same* proxy so a healed retry doesn't hop IPs mid-conversation with an upstream that just accepted the connection. A combo's toggle wins over its member providers': turning it on routes every attempt of the whole combo through the pool, however each member provider is set. If a provider/combo opts in while the pool is empty (or fully disabled, or every entry is cooling down — see below), the request still goes out — dialed directly from the gateway's own IP — with a warning in the logs, rather than failing the request over a config gap. Egress labels show in the gateway logs (`direct` vs the proxy's label) so "which IP did this 429 come from" is answerable at a glance; credentials are never logged (labels fall back to `scheme://host`, never the full URL).
+
+**Connections stay warm for free.** Each pool entry gets one cached HTTP client whose transport is tuned for keep-alive reuse (10 idle sockets per origin, 90s idle lifetime), so repeat requests reuse the already-open TCP/TLS tunnel instead of paying connect+handshake per attempt. No fake traffic is ever sent — warmth comes purely from real requests sharing sockets, so an idle pool costs zero proxy bandwidth.
+
+**Health is passive, not probed.** There is deliberately no background health checker pinging through your proxies (that would burn metered proxy bandwidth 24/7 to answer a question real traffic answers anyway). Instead each entry carries a lightweight alive/dead state learned only from real dispatches, shown in the dashboard **Proxies** table as `Alive` / `Dead · Ns` / `Unknown`:
+
+- Any HTTP response through a proxy — even a `429`/`5xx` — proves the path to and through it is alive and clears its state to `Alive` (an error status says the *upstream* rejected the request, not that the proxy is down).
+- Only a transport-level dial failure (connection refused, timeout, TLS failure) marks it `Dead` and cools it down for the `health.cooldown` window (default 60s); while cooling, rotation skips it but keeps serving through siblings.
+- `Unknown` means "never tried since restart" — not a verdict, just no data yet.
+
+A dead proxy therefore self-recovers: the next real attempt after its cooldown elapses tries it again, and a single successful response flips it back to `Alive`.
+
 ### Smart mode: `max_tokens` vs `max_completion_tokens`
 
 Some models — OpenAI's reasoning tier, and any OpenAI-compatible upstream that mirrors that behavior (observed live against Lightning AI's `openai/gpt-5.6-sol`) — hard-reject whichever of `max_tokens` / `max_completion_tokens` the client didn't send, e.g. `"this model is not supported MaxTokens, please use MaxCompletionTokens"`. This can't be a provider-wide setting by default, because every *other* model on that same provider is usually fine with whichever field the client used — so out of the box, smart mode is fully automatic and needs no configuration:

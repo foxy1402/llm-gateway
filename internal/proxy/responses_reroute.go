@@ -49,7 +49,7 @@ func looksLikeNeedsResponsesEndpoint(body []byte) bool {
 // Returns the healed response, the Responses-shaped request body actually
 // sent (so the request log matches the URL it went to), and a note describing
 // the heal for the request log.
-func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, resp *http.Response, baseURL, authKey string, reqBody []byte, providerID, accountID string, wantStream bool, originalModel string) (*http.Response, []byte, string, bool) {
+func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, client *http.Client, resp *http.Response, baseURL, authKey string, reqBody []byte, providerID, accountID string, wantStream bool, originalModel string) (*http.Response, []byte, string, bool) {
 	peeked := healPeek(resp)
 	if !looksLikeNeedsResponsesEndpoint(peeked) {
 		return resp, reqBody, "", false
@@ -77,7 +77,7 @@ func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, resp *http.Response
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("Authorization", "Bearer "+authKey)
 	upReq.Header.Set("Accept", "application/json")
-	newResp, err := p.client.Do(upReq)
+	newResp, err := client.Do(upReq)
 	if err != nil {
 		return resp, reqBody, "", false
 	}

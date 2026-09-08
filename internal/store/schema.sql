@@ -16,7 +16,20 @@ CREATE TABLE IF NOT EXISTS providers (
     -- '' (auto, default) | 'max_tokens' | 'max_completion_tokens' — manual pin
     -- for the max_tokens/max_completion_tokens smart mode (see internal/proxy/token_param.go).
     token_param_mode TEXT NOT NULL DEFAULT '',
+    -- 1 = send this provider's upstream calls through the rotating proxy pool.
+    proxy_rotate     INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- proxies: the shared egress pool. Rotation is global (one pool, advanced once
+-- per upstream attempt); providers/combos only opt in or out via proxy_rotate.
+CREATE TABLE IF NOT EXISTS proxies (
+    id         TEXT PRIMARY KEY,
+    label      TEXT NOT NULL DEFAULT '',
+    url        TEXT NOT NULL, -- scheme://[user:pass@]host:port, scheme in http/https/socks5/socks5h
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    position   INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS provider_accounts (
@@ -44,6 +57,7 @@ CREATE TABLE IF NOT EXISTS combos (
     display_name TEXT NOT NULL,
     rotation     TEXT NOT NULL DEFAULT 'round-robin',
     enabled      INTEGER NOT NULL DEFAULT 1,
+    proxy_rotate INTEGER NOT NULL DEFAULT 0, -- route this combo's attempts through the proxy pool
     created_at   INTEGER NOT NULL DEFAULT (unixepoch())
 );
 

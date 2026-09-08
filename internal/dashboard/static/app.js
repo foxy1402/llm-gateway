@@ -22,7 +22,7 @@ const api = {
   del: (u) => api.req('DELETE', u),
 };
 
-const state = { providers: [], combos: [], settings: {}, currentRoute: 'overview', logRefresh: null, healthRefresh: null, logAutoRefresh: true, renderSeq: 0 };
+const state = { providers: [], combos: [], proxies: [], settings: {}, currentRoute: 'overview', logRefresh: null, healthRefresh: null, logAutoRefresh: true, renderSeq: 0 };
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
@@ -47,6 +47,7 @@ const routes = {
   overview: renderOverview,
   providers: renderProviders,
   combos: renderCombos,
+  proxies: renderProxies,
   logs: renderLogs,
   settings: renderSettings,
   export: renderExport,
@@ -267,7 +268,7 @@ async function testProvider(id) {
 }
 
 function showProviderForm(id) {
-  const p = id ? state.providers.find(x => x.id === id) : { id: '', display: '', base_url: '', auth_key: '', model: '', weight: 1, tags: [], enabled: true, responses_native: false, accounts: [], token_param_mode: '' };
+  const p = id ? state.providers.find(x => x.id === id) : { id: '', display: '', base_url: '', auth_key: '', model: '', weight: 1, tags: [], enabled: true, responses_native: false, accounts: [], token_param_mode: '', proxy_rotate: false };
   const accounts = (p.accounts && p.accounts.length ? p.accounts : [{ label: 'default', auth_key: p.auth_key || '', weight: 1, enabled: true }]);
   $('#providerForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} provider</h2>
@@ -310,6 +311,7 @@ function showProviderForm(id) {
       <div class="row">
         <label class="pill"><input type="checkbox" name="enabled" ${p.enabled ? 'checked' : ''} style="width:auto"> Enabled</label>
         <label class="pill"><input type="checkbox" name="responses_native" ${p.responses_native ? 'checked' : ''} style="width:auto"> Supports /v1/responses natively</label>
+        <label class="pill" title="Route this provider's upstream calls through the proxy pool, advancing one proxy per attempt. Off by default — only needed when the upstream rate-limits per source IP rather than per key."><input type="checkbox" name="proxy_rotate" ${p.proxy_rotate ? 'checked' : ''} style="width:auto"> Rotate egress proxy</label>
       </div>
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelProviderForm()">Cancel</button></div>
     </form></div>`;
@@ -438,6 +440,7 @@ async function saveProvider(e, id) {
     tags: (f.get('tags') || '').split(',').map(s => s.trim()).filter(Boolean),
     enabled: f.get('enabled') === 'on', responses_native: f.get('responses_native') === 'on',
     token_param_mode: f.get('token_param_mode') || '',
+    proxy_rotate: f.get('proxy_rotate') === 'on',
     accounts: accounts,
   };
   try {
@@ -486,7 +489,8 @@ function comboTable() {
 
 async function toggleCombo(id) {
   const c = state.combos.find(x => x.id === id);
-  await api.put('/combos/' + encodeURIComponent(id), { ...c, enabled: !c.enabled });
+  const next = { ...c, enabled: !c.enabled, proxy_rotate: !!c.proxy_rotate };
+  await api.put('/combos/' + encodeURIComponent(id), next);
   state.combos = await api.get('/combos');
   $('#comboTable').innerHTML = comboTable();
 }
@@ -531,7 +535,7 @@ function accountShortLabel(providerID, accountID) {
 }
 
 function showComboForm(id) {
-  const c = id ? state.combos.find(x => x.id === id) : { id: '', display_name: '', rotation: 'round-robin', members: [], enabled: true };
+  const c = id ? state.combos.find(x => x.id === id) : { id: '', display_name: '', rotation: 'round-robin', members: [], enabled: true, proxy_rotate: false };
   const avail = state.providers;
   $('#comboForm').innerHTML = `
     <div class="card"><h2>${id ? 'Edit' : 'Add'} combo</h2>
@@ -550,7 +554,10 @@ function showComboForm(id) {
         <select id="memberPicker">${avail.map(a => `<option>${esc(a.id)}</option>`).join('')}</select>
         <button type="button" class="btn sm ghost" onclick="addMember()">+ Add member</button>
       </div>
-      <label class="pill"><input type="checkbox" name="enabled" ${c.enabled ? 'checked' : ''} style="width:auto"> Enabled</label>
+      <div class="row">
+        <label class="pill"><input type="checkbox" name="enabled" ${c.enabled ? 'checked' : ''} style="width:auto"> Enabled</label>
+        <label class="pill" title="Route every attempt this combo makes through the proxy pool, whatever the member provider's own setting is. Off by default — only needed when the upstream rate-limits per source IP rather than per key."><input type="checkbox" name="proxy_rotate" ${c.proxy_rotate ? 'checked' : ''} style="width:auto"> Rotate egress proxy</label>
+      </div>
       <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelComboForm()">Cancel</button></div>
     </form></div>`;
   // Render each existing member as a provider+account+model row.
@@ -633,6 +640,7 @@ async function saveCombo(e, id) {
   const payload = {
     id: f.get('id'), display_name: f.get('display_name'), rotation: f.get('rotation'),
     members, enabled: f.get('enabled') === 'on',
+    proxy_rotate: f.get('proxy_rotate') === 'on',
   };
   try {
     if (id) await api.put('/combos/' + encodeURIComponent(id), payload);
@@ -642,6 +650,126 @@ async function saveCombo(e, id) {
     $('#comboTable').innerHTML = comboTable();
   } catch (err) { alert('Save failed: ' + err.message); }
   return false;
+}
+
+// ---------- Proxies ----------
+async function renderProxies() {
+  const seq = state.renderSeq;
+  const app = $('#app');
+  app.innerHTML = '<div class="loading">Loading proxies…</div>';
+  try {
+    state.proxies = await api.get('/proxies');
+    if (seq !== state.renderSeq) return;
+    app.innerHTML = `
+      <h1>Egress proxies</h1>
+      <div class="sub">Shared rotation pool for upstreams that rate-limit per source IP. Providers and combos opt in with their "Rotate egress proxy" toggle — everything else dials out directly.</div>
+      <div class="toolbar"><div class="grow"></div><button class="btn" onclick="showProxyForm()">+ Add proxy</button></div>
+      <div id="proxyForm"></div>
+      <div class="card"><div id="proxyTable">${proxyTable()}</div></div>`;
+  } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
+}
+
+function proxyTable() {
+  const ps = state.proxies || [];
+  if (!ps.length) return '<div class="empty">No proxies configured — providers dial out directly.</div>';
+  return `<table><thead><tr><th>Label</th><th>URL</th><th>Status</th><th>Enabled</th><th></th></tr></thead><tbody>` +
+    ps.map(p => `<tr>
+      <td>${esc(p.label || '(no label)')}</td>
+      <td class="mono small">${esc(maskProxyURL(p.url))}</td>
+      <td>${proxyStatusBadge(p)}</td>
+      <td><button class="btn sm ${p.enabled ? '' : 'ghost'}" onclick="toggleProxy(${jsq(p.id)})">${p.enabled ? 'On' : 'Off'}</button></td>
+      <td style="white-space:nowrap;text-align:right">
+        <button class="btn sm ghost" onclick="showProxyForm(${jsq(p.id)})">Edit</button>
+        <button class="btn sm danger" onclick="deleteProxy(${jsq(p.id)})">Del</button>
+      </td></tr>`).join('') + `</tbody></table>`;
+}
+
+// proxyStatusBadge renders passive liveness for one pool entry: alive (a
+// response arrived through it), dead + cooldown (transport failure, skipped by
+// rotation until the cooldown elapses), or unknown (never tried since restart
+// — not a verdict). No background probing exists, so the status only ever
+// reflects real dispatched traffic.
+function proxyStatusBadge(p) {
+  const s = p.status || 'unknown';
+  if (s === 'alive') return '<span class="badge ok">Alive</span>';
+  if (s === 'dead') {
+    const secs = p.cooldown_ms != null ? Math.max(0, Math.ceil(p.cooldown_ms / 1000)) : 0;
+    return `<span class="badge err" title="Transport failure — skipped by rotation until the cooldown elapses. Failures: ${p.failures || 0}">Dead${secs ? ' · ' + secs + 's' : ''}</span>`;
+  }
+  return '<span class="badge" title="Never tried since restart — not a verdict">Unknown</span>';
+}
+
+// maskProxyURL shows the proxy URL without credentials — URLs carry
+// user:pass in userinfo and the table must not leak them on screen. Parsed
+// with the URL constructor (not a naive indexOf('@') split) because a
+// non-percent-encoded '@' inside the password is itself legal userinfo — the
+// LAST '@' before the host is the real delimiter, exactly like Go's
+// url.Parse on the server side, and a first-'@' split would leak the tail of
+// such a password plus the real host.
+function maskProxyURL(raw) {
+  const s = String(raw || '');
+  try {
+    const u = new URL(s);
+    if (u.username || u.password) return u.protocol + '//' + '••••••@' + u.host + u.pathname + u.search;
+    return s;
+  } catch (_) {
+    return s;
+  }
+}
+
+function showProxyForm(id) {
+  const p = id ? (state.proxies || []).find(x => x.id === id) : { id: '', label: '', url: '', enabled: true };
+  $('#proxyForm').innerHTML = `
+    <div class="card"><h2>${id ? 'Edit' : 'Add'} proxy</h2>
+    <form onsubmit="return saveProxy(event, ${jsq(id || '')})">
+      <div class="row">
+        <div><label>Label</label><input name="label" value="${esc(p.label || '')}" placeholder="e.g. eu-resi-1"></div>
+        <div style="flex:2"><label>URL *</label><input name="url" value="${esc(p.url || '')}" placeholder="socks5://user:pass@1.2.3.4:1080" required></div>
+      </div>
+      <div class="row">
+        <label class="pill"><input type="checkbox" name="enabled" ${p.enabled ? 'checked' : ''} style="width:auto"> Enabled</label>
+      </div>
+      <div class="small muted" style="margin-top:6px">Scheme must be http, https, socks5 or socks5h, with an explicit port. URLs are masked in this table and never appear in logs (dashboard API responses do include the full URL, same as provider API keys, so this form can be edited).</div>
+      <div class="form-actions"><button class="btn" type="submit">Save</button><button class="btn ghost" type="button" onclick="cancelProxyForm()">Cancel</button></div>
+    </form></div>`;
+  $('#proxyForm').scrollIntoView({ behavior: 'smooth' });
+}
+function cancelProxyForm() { $('#proxyForm').innerHTML = ''; }
+
+async function saveProxy(e, id) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const payload = {
+    label: (f.get('label') || '').toString().trim(),
+    url: (f.get('url') || '').toString().trim(),
+    enabled: f.get('enabled') === 'on',
+  };
+  try {
+    if (id) await api.put('/proxies/' + encodeURIComponent(id), payload);
+    else await api.post('/proxies', payload);
+    state.proxies = await api.get('/proxies');
+    cancelProxyForm();
+    $('#proxyTable').innerHTML = proxyTable();
+  } catch (err) { alert('Save failed: ' + err.message); }
+  return false;
+}
+
+async function toggleProxy(id) {
+  const p = (state.proxies || []).find(x => x.id === id);
+  if (!p) return;
+  try {
+    await api.put('/proxies/' + encodeURIComponent(id), { label: p.label, url: p.url, enabled: !p.enabled });
+    p.enabled = !p.enabled;
+  } catch (e) { alert('Toggle failed: ' + e.message); }
+  $('#proxyTable').innerHTML = proxyTable();
+}
+
+async function deleteProxy(id) {
+  if (!confirm('Delete proxy "' + id + '"? Providers/combos using the pool keep working — they fall back to direct dial.')) return;
+  await api.del('/proxies/' + encodeURIComponent(id));
+  state.proxies = (state.proxies || []).filter(x => x.id !== id);
+  $('#proxyTable').innerHTML = proxyTable();
+  cancelProxyForm();
 }
 
 // ---------- Logs ----------

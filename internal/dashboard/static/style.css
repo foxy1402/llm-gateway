@@ -54,6 +54,7 @@ label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
 .badge.ok{background:rgba(22,163,74,.15);color:var(--ok)}
 .badge.err{background:rgba(220,38,38,.15);color:var(--bad)}
+.badge{background:var(--chip);color:var(--muted)}
 .muted{color:var(--muted)} .small{font-size:12px}
 .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .toolbar .grow{flex:1}

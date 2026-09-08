@@ -44,6 +44,22 @@ type Provider struct {
 	// means "auto": pass through whatever the client sent, and self-heal via
 	// detection + a learned per-account cache if the model rejects it.
 	TokenParamMode string `json:"token_param_mode,omitempty"`
+	// ProxyRotate sends this provider's upstream calls through the shared proxy
+	// pool, advancing one proxy per attempt (see internal/proxy/egress.go). Off
+	// by default: only a minority of upstreams rate-limit per source IP, and
+	// routing the rest through a proxy just adds a hop and a failure mode.
+	ProxyRotate bool `json:"proxy_rotate,omitempty"`
+}
+
+// ProxyEntry is one egress proxy in the rotation pool. URL carries the scheme,
+// host, port and (optionally) credentials in userinfo, e.g.
+// "socks5://user:pass@1.2.3.4:1080" or "http://user:pass@host:8080".
+type ProxyEntry struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	URL      string `json:"url"`
+	Enabled  bool   `json:"enabled"`
+	Position int    `json:"position"`
 }
 
 type RotationPolicy string
@@ -75,6 +91,9 @@ type Combo struct {
 	Rotation    RotationPolicy `json:"rotation"`
 	Members     []ComboMember  `json:"members"` // provider+model in position order
 	Enabled     bool           `json:"enabled"`
+	// ProxyRotate routes every attempt this combo makes through the proxy pool,
+	// whatever the member provider's own setting is (see Provider.ProxyRotate).
+	ProxyRotate bool `json:"proxy_rotate,omitempty"`
 }
 
 type LogEntry struct {

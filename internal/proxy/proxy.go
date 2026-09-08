@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -43,6 +42,14 @@ const maxLogPayload = 4 << 10 // 4 KiB
 // SetMaxAccountsPerProviderCap (env MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER).
 const defaultMaxAccountsPerProviderCap = 10
 
+// maxEgressDialRetries bounds how many times ONE attempt re-dials through a
+// fresh egress pick after a transport-level failure through a pool proxy
+// (see the retry loop around dispatch.Do in ServeHTTP). Small and fixed
+// rather than scaled to pool size: enough to route around one or two bad
+// entries without turning a large, mostly-dead pool into a long serial stall
+// before the existing account/provider-level rotation ever gets a turn.
+const maxEgressDialRetries = 2
+
 type Proxy struct {
 	registry *registry.Registry
 	store    *store.Store
@@ -63,6 +70,12 @@ type Proxy struct {
 	// minTokenFloorDefault; overridden via SetMinCompletionTokens
 	// (env.MIN_COMPLETION_TOKENS). 0 disables the heal entirely.
 	minCompletionTokens int
+	// proxyClients caches one client per egress proxy URL (see egress.go). Built
+	// lazily on first use and never invalidated: a pool entry that's edited or
+	// removed just stops being handed out by registry.NextProxy, and a handful
+	// of idle transports is cheaper than rebuilding one per request.
+	proxyMu      sync.Mutex
+	proxyClients map[string]*http.Client
 	// logWG tracks the fire-and-forget request-log goroutines started by p.log
 	// so tests (and a future graceful shutdown) can WaitLogs before closing the
 	// store — otherwise a still-in-flight SQLite write races t.TempDir cleanup
@@ -71,28 +84,15 @@ type Proxy struct {
 }
 
 func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy {
-	tr := &http.Transport{
-		DisableCompression: true,
-		// Header timeout only: covers connect → first response bytes. Once headers
-		// arrive, the stream lives on the client's request context (cancel = Esc) and
-		// the per-chunk stall detector in stream.go. Applied as a transport timeout
-		// (not a context) so canceling the request context later cleans up the body
-		// without the timeout ever firing mid-stream.
-		ResponseHeaderTimeout: timeout,
-		DialContext: (&net.Dialer{
-			Timeout:   timeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: min(timeout, 10*time.Second),
-	}
 	return &Proxy{
 		registry:                  reg,
 		store:                     st,
-		client:                    &http.Client{Transport: tr},
+		client:                    &http.Client{Transport: newUpstreamTransport(timeout, nil)},
 		timeout:                   timeout,
 		maxBodyBytes:              defaultMaxBodyBytes,
 		maxAccountsPerProviderCap: defaultMaxAccountsPerProviderCap,
 		minCompletionTokens:       minTokenFloorDefault,
+		proxyClients:              map[string]*http.Client{},
 	}
 }
 
@@ -472,8 +472,45 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		upReq.Header.Set("Accept", "text/event-stream, application/json")
 		upReq.Header.Set("X-Accel-Buffering", "no")
 
+		// Egress selection is per ATTEMPT, not per client request: rotating here
+		// means a retry after a per-IP 429 leaves from a different address, which
+		// is exactly the failure the pool exists for. The heals below reuse this
+		// same client so a healed retry doesn't hop IPs mid-conversation with an
+		// upstream that just accepted the connection.
+		egress := p.egressFor(upstream, combo)
+		dispatch := egress.client
+
 		start := time.Now()
-		resp, err := p.client.Do(upReq)
+		resp, err := dispatch.Do(upReq)
+		// A transport failure through a POOL PROXY (dead exit node, connection
+		// refused, proxy-side timeout) implicates the proxy, not this account or
+		// even the upstream endpoint — unlike a direct-dial transport failure,
+		// where every account shares the same unreachable URL and retrying can't
+		// help, a different egress pick has a real chance of succeeding here. Give
+		// this exact attempt (same account, same request body) a bounded number of
+		// fresh egress picks before falling through to the account/provider-level
+		// failure handling below — otherwise a single bad proxy in an otherwise
+		// healthy pool hard-fails every request it happens to draw, most visibly
+		// for a direct (non-combo) call to a single-account provider, which has no
+		// other fallback at all.
+		for retry := 0; err != nil && egress.proxyID != "" && retry < maxEgressDialRetries; retry++ {
+			if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+				break // client already gone; let the abort check below handle it
+			}
+			p.registry.Health().RecordProxyFailure(egress.proxyID)
+			slog.Warn("egress dispatch failed, retrying with a different proxy",
+				"provider", logID, "egress", egressForLog(egress.label), "err", err)
+			egress = p.egressFor(upstream, combo)
+			dispatch = egress.client
+			retryReq, buildErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+			if buildErr != nil {
+				break // shouldn't happen (same URL/body that just built fine above)
+			}
+			retryReq.Header = upReq.Header.Clone()
+			upReq = retryReq
+			start = time.Now()
+			resp, err = dispatch.Do(upReq)
+		}
 		if err != nil {
 			// Client-initiated abort (Esc) or parent deadline: the caller is gone, so
 			// rotating to another provider is wasted and would even fire after the
@@ -487,8 +524,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// *provider* level (all accounts share the same URL and would fail the
 			// same way) and rotate to the next member. Do NOT penalize for
 			// context.DeadlineExceeded on the client side (#2, #11).
+			//
+			// Passive proxy health lives here too: only a transport error through
+			// a pool entry can implicate the PROXY (an HTTP status, even 429/5xx,
+			// proves the proxy forwarded fine). A failed entry cools down so the
+			// next attempt rotates to a sibling — no background probes needed. This
+			// is the LAST egress attempted (after any retries just above), so the
+			// right one is charged.
 			p.registry.Health().RecordFailure(upstream.ID, 0)
-			slog.Warn("upstream dispatch failed", "provider", logID, "err", err)
+			if egress.proxyID != "" {
+				p.registry.Health().RecordProxyFailure(egress.proxyID)
+			}
+			slog.Warn("upstream dispatch failed", "provider", logID, "egress", egressForLog(egress.label), "err", err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "upstream request failed", "gateway_error")
 				p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), "", "")
@@ -510,7 +557,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		var healNote, healURL string
 		if endpoint == registry.EndpointChatCompletions {
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+				if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
 					resp, body, healNote = healedResp, healedBody, "healed max_tokens field"
 				}
 			}
@@ -522,7 +569,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// through the account-rotation loop (which wouldn't even help here,
 			// since every sibling account fails on the same too-small value).
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryMinTokensHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID, p.minTokenFloor()); healed {
+				if healedResp, healedBody, healed := p.tryMinTokensHeal(attemptCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID, p.minTokenFloor()); healed {
 					resp, body, healNote = healedResp, healedBody, "healed max_tokens floor"
 				}
 			}
@@ -534,7 +581,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// to chat-completions shape) rather than burning the account/rotating —
 			// again a request-shape problem identical across every sibling account.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, note, healed := p.tryResponsesRerouteHeal(attemptCtx, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream, info.Model); healed {
+				if healedResp, healedBody, note, healed := p.tryResponsesRerouteHeal(attemptCtx, dispatch, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream, info.Model); healed {
 					resp, body, healNote = healedResp, healedBody, note
 					healURL = buildUpstreamURL(upstream.BaseURL, "/responses")
 				}
@@ -545,7 +592,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// where the reroute heal already handles it); kept as a fallback for
 			// those. Same request-shape reasoning as the others.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryReasoningEffortHeal(attemptCtx, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+				if healedResp, healedBody, healed := p.tryReasoningEffortHeal(attemptCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
 					resp, body, healNote = healedResp, healedBody, "healed reasoning_effort"
 				}
 			}
@@ -560,6 +607,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 					p.registry.Health().ForgetReasoningEffortNone(upstream.ID, account.ID)
 				}
 			}
+		}
+		// Any HTTP response at all — even a 429/5xx — proves the TCP/TLS path
+		// to and through the egress proxy is alive. Record the proxy success
+		// here (before the retryable/terminal branches below diverge): passive
+		// liveness with zero probe traffic.
+		if egress.proxyID != "" {
+			p.registry.Health().RecordProxySuccess(egress.proxyID)
 		}
 		// healNote/healURL feed the request log below; when the reroute heal
 		// fired, the logged URL must be the /responses URL the body actually
@@ -594,7 +648,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// per-attempt failure below skips writing a request_log row (that would
 			// be one row per rotated key per request), so this is the only place
 			// the actual upstream rejection reason surfaces for debugging.
-			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode, "body", strings.TrimSpace(string(peek)))
+			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode,
+				"egress", egressForLog(egress.label), "body", strings.TrimSpace(string(peek)))
 			// NOTE: provider is NOT dropped from triedProviders — NextAccount will
 			// yield a different key next time plan.next (or the plan==nil direct
 			// path, which always re-targets the same provider) re-selects it.

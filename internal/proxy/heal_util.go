@@ -37,9 +37,10 @@ func healPeek(resp *http.Response) []byte {
 }
 
 // healRedispatch builds and sends the healed request to the same upstream with
-// the same credentials. Shared by every try*Heal so the request plumbing can't
-// drift between them.
-func (p *Proxy) healRedispatch(ctx context.Context, url, authKey string, body []byte) (*http.Response, error) {
+// the same credentials, over the SAME client (and therefore the same egress
+// proxy) the failed attempt used. Shared by every try*Heal so the request
+// plumbing can't drift between them.
+func (p *Proxy) healRedispatch(ctx context.Context, client *http.Client, url, authKey string, body []byte) (*http.Response, error) {
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -48,7 +49,7 @@ func (p *Proxy) healRedispatch(ctx context.Context, url, authKey string, body []
 	upReq.Header.Set("Authorization", "Bearer "+authKey)
 	upReq.Header.Set("Accept", "text/event-stream, application/json")
 	upReq.Header.Set("X-Accel-Buffering", "no")
-	return p.client.Do(upReq)
+	return client.Do(upReq)
 }
 
 // healSucceeded reports whether a healed redispatch produced a 2xx. Learning is

@@ -91,7 +91,7 @@ func wordInString(s, word string) bool {
 // each one. Redispatches ONCE on the same account/URL and remembers the
 // answer (registry.Health's learned-reasoning-effort cache) so the next
 // tool-call request from this client skips the failing first attempt.
-func (p *Proxy) tryReasoningEffortHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string) (*http.Response, []byte, bool) {
+func (p *Proxy) tryReasoningEffortHeal(ctx context.Context, client *http.Client, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string) (*http.Response, []byte, bool) {
 	peeked := healPeek(resp)
 	if !looksLikeReasoningEffortToolsConflict(peeked) {
 		return resp, reqBody, false
@@ -103,7 +103,7 @@ func (p *Proxy) tryReasoningEffortHeal(ctx context.Context, resp *http.Response,
 	if ctx.Err() != nil {
 		return resp, reqBody, false // client already gone; don't burn a redispatch
 	}
-	newResp, err := p.healRedispatch(ctx, upstreamURL, authKey, fixedBody)
+	newResp, err := p.healRedispatch(ctx, client, upstreamURL, authKey, fixedBody)
 	if err != nil {
 		return resp, reqBody, false
 	}

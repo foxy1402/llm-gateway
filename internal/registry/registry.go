@@ -38,12 +38,17 @@ type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]*config.Provider
 	combos    map[string]*config.Combo
+	// proxies is the full egress pool in rotation order (enabled and disabled;
+	// NextProxy filters). One shared pool, not per-provider: providers/combos
+	// only choose whether to use it (config.Provider.ProxyRotate).
+	proxies []config.ProxyEntry
 
 	health *HealthTracker
 
 	// rotation state
 	rrCounters map[string]*atomic.Int64
 	acctRR     map[string]*atomic.Int64 // per-provider account round-robin pointers
+	proxyRR    atomic.Int64             // global proxy pool pointer, one step per upstream attempt
 	wrrState   map[string][]wrrEntry
 	wrrMu      sync.Mutex
 }
@@ -70,6 +75,10 @@ func (r *Registry) Reload(st *store.Store) error {
 	if err != nil {
 		return err
 	}
+	proxies, err := st.ListProxies()
+	if err != nil {
+		return err
+	}
 	// Load health settings.
 	cooldownSec, _ := getSettingInt(st, "health.cooldown", 60)
 	errCodes, _ := getSettingCSVInts(st, "health.error_codes", defaultRetryableCodesList())
@@ -89,6 +98,7 @@ func (r *Registry) Reload(st *store.Store) error {
 	r.mu.Lock()
 	r.providers = provMap
 	r.combos = comboMap
+	r.proxies = proxies
 	r.mu.Unlock()
 
 	// Rebuild WRR state for combos (keep existing rrCounters). Also rebuild the
@@ -155,6 +165,13 @@ func (r *Registry) Reload(st *store.Store) error {
 		}
 	}
 	r.health.PruneLearnedAccounts(liveAccounts)
+	// Same hygiene for passive proxy health: entries reference pool IDs that
+	// may have been deleted or renamed.
+	liveProxies := map[string]bool{}
+	for _, px := range proxies {
+		liveProxies[px.ID] = true
+	}
+	r.health.PruneProxies(liveProxies)
 	r.wrrMu.Unlock()
 	return nil
 }
@@ -250,6 +267,47 @@ func (r *Registry) ListAllCombos() []*config.Combo {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// ListAllProxies returns the whole egress pool in rotation order (for the dashboard).
+func (r *Registry) ListAllProxies() []config.ProxyEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]config.ProxyEntry(nil), r.proxies...)
+}
+
+// NextProxy advances the shared pool pointer and returns the next enabled proxy.
+// One call per upstream attempt is the contract: a retry after a 429 lands on a
+// different egress IP, which is the whole point of the pool. Entries in passive
+// cooldown (a recent transport-level dial failure through them) are skipped but
+// still advance the pointer, so slot order stays stable across requests.
+// ok=false means the pool is empty (or fully disabled / all cooling down) and
+// the caller must dial out directly — silently dropping the request instead
+// would turn a config gap into an outage.
+func (r *Registry) NextProxy() (config.ProxyEntry, bool) {
+	r.mu.RLock()
+	enabled := make([]config.ProxyEntry, 0, len(r.proxies))
+	for _, p := range r.proxies {
+		if p.Enabled && p.URL != "" {
+			enabled = append(enabled, p)
+		}
+	}
+	r.mu.RUnlock()
+	if len(enabled) == 0 {
+		return config.ProxyEntry{}, false
+	}
+	// Bounded scan: at most one full lap. Skips rotate the pointer just like
+	// hits do (each attempt consumes one rotation slot), but MUST NOT spin
+	// past len(enabled) picks, or a fully-cooling pool would loop forever
+	// instead of falling back to direct dial.
+	for range enabled {
+		n := int(r.proxyRR.Add(1) - 1)
+		cand := enabled[n%len(enabled)]
+		if r.health.IsProxyAvailable(cand.ID) {
+			return cand, true
+		}
+	}
+	return config.ProxyEntry{}, false
 }
 
 // Health returns the shared tracker so proxy/admin can record/observe.

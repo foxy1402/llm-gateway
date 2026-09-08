@@ -91,7 +91,7 @@ func applyTokenParamMode(body []byte, mode string) (out []byte, ok bool) {
 // when a mode was pre-applied (explicit or learned): configs go stale (a
 // provider's model can change) and this is what self-corrects instead of
 // wedging a wrong setting in place forever.
-func (p *Proxy) tryTokenParamHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string) (*http.Response, []byte, bool) {
+func (p *Proxy) tryTokenParamHeal(ctx context.Context, client *http.Client, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string) (*http.Response, []byte, bool) {
 	peeked := healPeek(resp)
 	if !looksLikeTokenParamMismatch(peeked) {
 		return resp, reqBody, false
@@ -103,7 +103,7 @@ func (p *Proxy) tryTokenParamHeal(ctx context.Context, resp *http.Response, upst
 	if ctx.Err() != nil {
 		return resp, reqBody, false // client already gone; don't burn a redispatch
 	}
-	newResp, err := p.healRedispatch(ctx, upstreamURL, authKey, fixedBody)
+	newResp, err := p.healRedispatch(ctx, client, upstreamURL, authKey, fixedBody)
 	if err != nil {
 		return resp, reqBody, false
 	}
@@ -141,7 +141,7 @@ const minTokenFloorDefault = 16
 // request-shape fix exactly like the field-name heal: it must not burn the
 // key into cooldown or consume a rotation attempt, since every sibling
 // account would fail identically on the same too-small value.
-func (p *Proxy) tryMinTokensHeal(ctx context.Context, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string, floor int) (*http.Response, []byte, bool) {
+func (p *Proxy) tryMinTokensHeal(ctx context.Context, client *http.Client, resp *http.Response, upstreamURL, authKey string, reqBody []byte, providerID, accountID string, floor int) (*http.Response, []byte, bool) {
 	if floor <= 0 {
 		return resp, reqBody, false // MIN_COMPLETION_TOKENS=0 disables this heal
 	}
@@ -156,7 +156,7 @@ func (p *Proxy) tryMinTokensHeal(ctx context.Context, resp *http.Response, upstr
 	if ctx.Err() != nil {
 		return resp, reqBody, false // client already gone; don't burn a redispatch
 	}
-	newResp, err := p.healRedispatch(ctx, upstreamURL, authKey, fixedBody)
+	newResp, err := p.healRedispatch(ctx, client, upstreamURL, authKey, fixedBody)
 	if err != nil {
 		return resp, reqBody, false
 	}

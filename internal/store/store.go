@@ -67,9 +67,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		columns []string
 	}{
 		{"request_log", []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER", "heal_note TEXT DEFAULT ''"}},
-		{"providers", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
+		{"providers", []string{"token_param_mode TEXT NOT NULL DEFAULT ''", "proxy_rotate INTEGER NOT NULL DEFAULT 0"}},
 		{"provider_accounts", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
 		{"combo_members", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
+		{"combos", []string{"proxy_rotate INTEGER NOT NULL DEFAULT 0"}},
 	}
 	for _, mig := range columnMigrations {
 		for _, col := range mig.columns {
@@ -98,13 +99,14 @@ func (s *Store) DB() *sql.DB { return s.db }
 func scanProvider(row interface{ Scan(...any) error }) (config.Provider, error) {
 	var p config.Provider
 	var tags string
-	var enabled, native int
-	err := row.Scan(&p.ID, &p.Display, &p.BaseURL, &p.AuthKey, &p.Model, &p.Weight, &tags, &enabled, &native, &p.TokenParamMode)
+	var enabled, native, proxyRotate int
+	err := row.Scan(&p.ID, &p.Display, &p.BaseURL, &p.AuthKey, &p.Model, &p.Weight, &tags, &enabled, &native, &p.TokenParamMode, &proxyRotate)
 	if err != nil {
 		return config.Provider{}, err
 	}
 	p.Enabled = enabled != 0
 	p.ResponsesNative = native != 0
+	p.ProxyRotate = proxyRotate != 0
 	if tags != "" {
 		p.Tags = strings.Split(tags, ",")
 	} else {
@@ -113,7 +115,7 @@ func scanProvider(row interface{ Scan(...any) error }) (config.Provider, error) 
 	return p, nil
 }
 
-const providerCols = "id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode"
+const providerCols = "id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode, proxy_rotate"
 
 func (s *Store) ListProviders() ([]config.Provider, error) {
 	rows, err := s.db.Query("SELECT " + providerCols + " FROM providers ORDER BY id")
@@ -187,14 +189,14 @@ func (s *Store) UpsertProvider(p config.Provider) error {
 func upsertProviderTx(tx *sql.Tx, p config.Provider) error {
 	tags := strings.Join(p.Tags, ",")
 	_, err := tx.Exec(`INSERT INTO providers
-		(id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode, proxy_rotate)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			display=excluded.display, base_url=excluded.base_url, auth_key=excluded.auth_key,
 			model=excluded.model, weight=excluded.weight, tags=excluded.tags,
 			enabled=excluded.enabled, responses_native=excluded.responses_native,
-			token_param_mode=excluded.token_param_mode`,
-		p.ID, p.Display, p.BaseURL, p.AuthKey, p.Model, p.Weight, tags, boolToInt(p.Enabled), boolToInt(p.ResponsesNative), p.TokenParamMode)
+			token_param_mode=excluded.token_param_mode, proxy_rotate=excluded.proxy_rotate`,
+		p.ID, p.Display, p.BaseURL, p.AuthKey, p.Model, p.Weight, tags, boolToInt(p.Enabled), boolToInt(p.ResponsesNative), p.TokenParamMode, boolToInt(p.ProxyRotate))
 	return err
 }
 
@@ -391,7 +393,7 @@ func (s *Store) ReplaceModels(providerID string, models []string) error {
 // --- Combos ---
 
 func (s *Store) ListCombos() ([]config.Combo, error) {
-	rows, err := s.db.Query("SELECT id, display_name, rotation, enabled FROM combos ORDER BY id")
+	rows, err := s.db.Query("SELECT id, display_name, rotation, enabled, proxy_rotate FROM combos ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -400,12 +402,13 @@ func (s *Store) ListCombos() ([]config.Combo, error) {
 	out := []config.Combo{}
 	for rows.Next() {
 		var c config.Combo
-		var enabled int
-		if err := rows.Scan(&c.ID, &c.DisplayName, &c.Rotation, &enabled); err != nil {
+		var enabled, proxyRotate int
+		if err := rows.Scan(&c.ID, &c.DisplayName, &c.Rotation, &enabled, &proxyRotate); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		c.Enabled = enabled != 0
+		c.ProxyRotate = proxyRotate != 0
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -424,10 +427,10 @@ func (s *Store) ListCombos() ([]config.Combo, error) {
 }
 
 func (s *Store) GetCombo(id string) (*config.Combo, error) {
-	row := s.db.QueryRow("SELECT id, display_name, rotation, enabled FROM combos WHERE id = ?", id)
+	row := s.db.QueryRow("SELECT id, display_name, rotation, enabled, proxy_rotate FROM combos WHERE id = ?", id)
 	var c config.Combo
-	var enabled int
-	err := row.Scan(&c.ID, &c.DisplayName, &c.Rotation, &enabled)
+	var enabled, proxyRotate int
+	err := row.Scan(&c.ID, &c.DisplayName, &c.Rotation, &enabled, &proxyRotate)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -435,6 +438,7 @@ func (s *Store) GetCombo(id string) (*config.Combo, error) {
 		return nil, err
 	}
 	c.Enabled = enabled != 0
+	c.ProxyRotate = proxyRotate != 0
 	members, err := s.listComboMembers(c.ID)
 	if err != nil {
 		return nil, err
@@ -466,9 +470,10 @@ func (s *Store) UpsertCombo(c config.Combo) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`INSERT INTO combos (id, display_name, rotation, enabled) VALUES (?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, rotation=excluded.rotation, enabled=excluded.enabled`,
-		c.ID, c.DisplayName, string(c.Rotation), boolToInt(c.Enabled))
+	_, err = tx.Exec(`INSERT INTO combos (id, display_name, rotation, enabled, proxy_rotate) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, rotation=excluded.rotation,
+			enabled=excluded.enabled, proxy_rotate=excluded.proxy_rotate`,
+		c.ID, c.DisplayName, string(c.Rotation), boolToInt(c.Enabled), boolToInt(c.ProxyRotate))
 	if err != nil {
 		return fmt.Errorf("upsert combo: %w", err)
 	}
@@ -492,6 +497,41 @@ func (s *Store) UpsertCombo(c config.Combo) error {
 
 func (s *Store) DeleteCombo(id string) error {
 	_, err := s.db.Exec("DELETE FROM combos WHERE id = ?", id)
+	return err
+}
+
+// --- Proxy pool ---
+
+// ListProxies returns the whole pool (enabled and disabled) in rotation order.
+func (s *Store) ListProxies() ([]config.ProxyEntry, error) {
+	rows, err := s.db.Query("SELECT id, label, url, enabled, position FROM proxies ORDER BY position, id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []config.ProxyEntry{}
+	for rows.Next() {
+		var p config.ProxyEntry
+		var enabled int
+		if err := rows.Scan(&p.ID, &p.Label, &p.URL, &enabled, &p.Position); err != nil {
+			return nil, err
+		}
+		p.Enabled = enabled != 0
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertProxy(p config.ProxyEntry) error {
+	_, err := s.db.Exec(`INSERT INTO proxies (id, label, url, enabled, position) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET label=excluded.label, url=excluded.url,
+			enabled=excluded.enabled, position=excluded.position`,
+		p.ID, p.Label, p.URL, boolToInt(p.Enabled), p.Position)
+	return err
+}
+
+func (s *Store) DeleteProxy(id string) error {
+	_, err := s.db.Exec("DELETE FROM proxies WHERE id = ?", id)
 	return err
 }
 

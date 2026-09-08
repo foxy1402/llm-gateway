@@ -25,6 +25,10 @@ func (s *Store) ExportSQL() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	proxies, err := s.ListProxies()
+	if err != nil {
+		return "", err
+	}
 
 	var b strings.Builder
 	b.WriteString(exportHeader + "\n")
@@ -38,15 +42,16 @@ func (s *Store) ExportSQL() (string, error) {
 	b.WriteString("DELETE FROM provider_models;\n")
 	b.WriteString("DELETE FROM provider_accounts;\n")
 	b.WriteString("DELETE FROM providers;\n")
+	b.WriteString("DELETE FROM proxies;\n")
 	b.WriteString("DELETE FROM settings;\n\n")
 
 	if len(provs) > 0 {
-		b.WriteString("INSERT INTO providers (id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode) VALUES\n")
+		b.WriteString("INSERT INTO providers (id, display, base_url, auth_key, model, weight, tags, enabled, responses_native, token_param_mode, proxy_rotate) VALUES\n")
 		for i, p := range provs {
 			tags := strings.Join(p.Tags, ",")
-			fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %s, %d, %d, %s)",
+			fmt.Fprintf(&b, "  (%s, %s, %s, %s, %s, %d, %s, %d, %d, %s, %d)",
 				q(p.ID), q(p.Display), q(p.BaseURL), q(p.AuthKey), q(p.Model),
-				p.Weight, q(tags), boolToInt(p.Enabled), boolToInt(p.ResponsesNative), q(p.TokenParamMode))
+				p.Weight, q(tags), boolToInt(p.Enabled), boolToInt(p.ResponsesNative), q(p.TokenParamMode), boolToInt(p.ProxyRotate))
 			if i == len(provs)-1 {
 				b.WriteString(";\n\n")
 			} else {
@@ -91,10 +96,21 @@ func (s *Store) ExportSQL() (string, error) {
 			b.WriteString(";\n\n")
 		}
 	}
+	if len(proxies) > 0 {
+		b.WriteString("INSERT INTO proxies (id, label, url, enabled, position) VALUES\n")
+		for i, px := range proxies {
+			fmt.Fprintf(&b, "  (%s, %s, %s, %d, %d)", q(px.ID), q(px.Label), q(px.URL), boolToInt(px.Enabled), px.Position)
+			if i == len(proxies)-1 {
+				b.WriteString(";\n\n")
+			} else {
+				b.WriteString(",\n")
+			}
+		}
+	}
 	if len(combos) > 0 {
-		b.WriteString("INSERT INTO combos (id, display_name, rotation, enabled) VALUES\n")
+		b.WriteString("INSERT INTO combos (id, display_name, rotation, enabled, proxy_rotate) VALUES\n")
 		for i, c := range combos {
-			fmt.Fprintf(&b, "  (%s, %s, %s, %d)", q(c.ID), q(c.DisplayName), q(string(c.Rotation)), boolToInt(c.Enabled))
+			fmt.Fprintf(&b, "  (%s, %s, %s, %d, %d)", q(c.ID), q(c.DisplayName), q(string(c.Rotation)), boolToInt(c.Enabled), boolToInt(c.ProxyRotate))
 			if i == len(combos)-1 {
 				b.WriteString(";\n\n")
 			} else {
@@ -211,6 +227,7 @@ var importAllowedTables = map[string]bool{
 	"provider_models":   true,
 	"combos":            true,
 	"combo_members":     true,
+	"proxies":           true,
 	"settings":          true,
 }
 

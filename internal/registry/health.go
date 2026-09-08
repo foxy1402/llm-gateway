@@ -2,6 +2,7 @@ package registry
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -260,6 +261,89 @@ func (h *HealthTracker) PruneLearnedAccounts(accountKeys map[string]bool) {
 	h.reasoningEffortMu.Unlock()
 }
 
+// proxyStateKey namespaces per-proxy health inside the shared states map.
+// Provider IDs are user-chosen and could theoretically collide with a proxy
+// ID ("px-..."), so the prefix keeps the two namespaces disjoint while reusing
+// the exact same cooldown machinery (and therefore the same configurable
+// health.cooldown window) as provider health.
+func proxyStateKey(id string) string { return "proxy::" + id }
+
+// RecordProxyFailure cools down a single pool entry. Called ONLY on
+// transport-level dispatch errors through that proxy (dial/connect refused,
+// timeout) — an HTTP status, even a retryable 429/5xx, proves the proxy
+// successfully forwarded the request and says nothing about proxy liveness,
+// so it must NOT penalize the proxy (only the account, as before).
+func (h *HealthTracker) RecordProxyFailure(id string) {
+	h.RecordFailure(proxyStateKey(id), 0)
+}
+
+// RecordProxySuccess clears a proxy's cooldown/failure state. Called whenever
+// ANY HTTP response (even a 429/5xx) arrives through that proxy — receiving a
+// response proves the TCP/TLS path to and through the proxy is alive.
+func (h *HealthTracker) RecordProxySuccess(id string) {
+	h.RecordSuccess(proxyStateKey(id))
+}
+
+// IsProxyAvailable reports whether a pool entry is currently eligible (out of
+// cooldown). Unknown proxies (never tried) report true WITHOUT creating state —
+// no data means no reason to skip, and the dashboard's "Unknown" verdict must
+// survive until the first real attempt.
+func (h *HealthTracker) IsProxyAvailable(id string) bool {
+	h.mu.Lock()
+	s, ok := h.states[proxyStateKey(id)]
+	h.mu.Unlock()
+	if !ok {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Now().After(s.cooldownUntil) || s.cooldownUntil.IsZero()
+}
+
+// ProxyStatus returns the dashboard-facing health of one pool entry. seen is
+// false when the proxy has never been tried since restart — the dashboard
+// renders that as "Unknown" rather than "Alive", so a freshly added proxy
+// isn't misread as proven.
+func (h *HealthTracker) ProxyStatus(id string) (failures int, available bool, cooldownMs int64, seen bool) {
+	h.mu.Lock()
+	s, ok := h.states[proxyStateKey(id)]
+	h.mu.Unlock()
+	if !ok {
+		return 0, true, 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	avail := now.After(s.cooldownUntil) || s.cooldownUntil.IsZero()
+	var ms int64
+	if !avail {
+		ms = s.cooldownUntil.Sub(now).Milliseconds()
+	}
+	return s.failures, avail, ms, true
+}
+
+// PruneProxies drops health state for pool entries that no longer exist,
+// mirroring PruneLearnedAccounts so dashboard churn (delete/rename) doesn't
+// grow the states map without bound. liveIDs is the set of current proxy IDs.
+func (h *HealthTracker) PruneProxies(liveIDs map[string]bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k := range h.states {
+		if id, ok := disentangleProxyKey(k); ok {
+			if !liveIDs[id] {
+				delete(h.states, k)
+			}
+		}
+	}
+}
+
+func disentangleProxyKey(k string) (string, bool) {
+	if id, ok := strings.CutPrefix(k, "proxy::"); ok {
+		return id, true
+	}
+	return "", false
+}
+
 // SupportsEndpoint reports whether the provider can handle the given endpoint.
 func (h *HealthTracker) SupportsEndpoint(id, endpoint string) bool {
 	s := h.state(id)
@@ -272,13 +356,22 @@ func (h *HealthTracker) SupportsEndpoint(id, endpoint string) bool {
 	return true
 }
 
-// Snapshot returns health state for all tracked providers.
+// Snapshot returns health state for all tracked providers. Proxy pool entries
+// share the same underlying states map (namespaced via proxyStateKey so their
+// cooldowns reuse the provider machinery) but are NOT providers — every
+// consumer of this snapshot (dashboard "Provider health" table, /admin/status)
+// looks each ProviderID up against the provider list, so a leaked "proxy::px-1"
+// key would render as a bogus disabled "provider". Proxy health has its own
+// accessor (ProxyStatus) for the dedicated Proxies dashboard table.
 func (h *HealthTracker) Snapshot() []config.HealthSnapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make([]config.HealthSnapshot, 0, len(h.states))
 	now := time.Now()
 	for id, s := range h.states {
+		if _, isProxy := disentangleProxyKey(id); isProxy {
+			continue
+		}
 		s.mu.Lock()
 		snap := config.HealthSnapshot{
 			ProviderID:            id,

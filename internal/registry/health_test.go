@@ -64,6 +64,23 @@ func TestSnapshotSorted(t *testing.T) {
 	}
 }
 
+// Snapshot feeds the dashboard's "Provider health" table and /admin/status,
+// both of which look every ProviderID up against the real provider list and
+// render a row regardless of the lookup miss. Proxy pool health lives in the
+// SAME underlying states map (namespaced via "proxy::") purely so it can
+// reuse the cooldown machinery — it must never surface here as a fake
+// "provider", only through ProxyStatus/the dedicated Proxies table.
+func TestSnapshotExcludesProxyEntries(t *testing.T) {
+	h := NewHealthTracker()
+	h.RecordFailure("real-provider", 500)
+	h.RecordProxyFailure("px-1")
+	h.RecordProxySuccess("px-2")
+	snap := h.Snapshot()
+	if len(snap) != 1 || snap[0].ProviderID != "real-provider" {
+		t.Fatalf("proxy health leaked into provider snapshot: %v", snap)
+	}
+}
+
 // Learned reasoning_effort pins must be forgettable (un-learn hook) and pruned
 // when an account disappears from the config (Reload prune).
 func TestReasoningEffortLearnForgetPrune(t *testing.T) {
