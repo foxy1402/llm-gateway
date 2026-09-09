@@ -168,21 +168,15 @@ func (b *sentinelBody) Read(p []byte) (int, error) {
 		b.pos += n
 		return n, nil
 	}
-	if b.done == nil {
-		b.done = make(chan struct{})
-	}
-	<-b.done // hold the connection open, never EOF — until Close
+	// Hold the connection open, never EOF — until Close. done is created with
+	// the body (never lazily), so there is no init-vs-Close data race.
+	<-b.done
 	return 0, io.EOF
 }
 
 func (b *sentinelBody) Close() error {
 	b.closed = true
-	b.once.Do(func() {
-		if b.done == nil {
-			b.done = make(chan struct{})
-		}
-		close(b.done)
-	})
+	b.once.Do(func() { close(b.done) })
 	return nil
 }
 
@@ -191,7 +185,7 @@ func (b *sentinelBody) Close() error {
 // hold the connection open used to trip the 90s stall timer, which then marked
 // the (healthy) account failed.
 func TestStreamStopsAtDoneSentinel(t *testing.T) {
-	body := &sentinelBody{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")}
+	body := &sentinelBody{data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"), done: make(chan struct{})}
 	upstream := &http.Response{
 		StatusCode: 200,
 		Header:     make(http.Header),
