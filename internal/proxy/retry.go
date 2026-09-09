@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"crypto/rand"
+	"fmt"
 	"math/big"
+	"strings"
 
 	"llm-gateway/internal/config"
 	"llm-gateway/internal/registry"
@@ -39,6 +41,60 @@ func (p *Proxy) newRotationPlan(combo *config.Combo, endpoint string) *rotationP
 // burning one legitimately burns the other.
 func memberKey(m config.ComboMember) string {
 	return m.ProviderID + "|" + m.AccountID + "|" + m.Model
+}
+
+// rotationBlockReason explains WHY plan.next has nothing eligible, for the
+// attempt journal's terminal row. It replays next()'s eligibility checks over
+// the plan members and buckets each one by its FIRST failing reason — tried
+// this request, provider in cooldown, endpoint unsupported, or provider
+// missing/disabled — so "all upstreams failed" names the dominant cause
+// (e.g. "2 in cooldown, 1 already tried") instead of going out bare.
+func (p *Proxy) rotationBlockReason(combo *config.Combo, endpoint string, tried map[string]bool, triedMembers map[string]bool) string {
+	cooling, unsupported, alreadyTried, gone := []string{}, []string{}, []string{}, []string{}
+	health := p.registry.Health()
+	seen := map[string]bool{}
+	for _, m := range combo.Members {
+		prov := p.registry.GetProvider(m.ProviderID)
+		switch {
+		case prov == nil || !prov.Enabled:
+			if !seen["gone:"+m.ProviderID] {
+				seen["gone:"+m.ProviderID] = true
+				gone = append(gone, m.ProviderID)
+			}
+		case triedMembers[memberKey(m)] || tried[m.ProviderID]:
+			if !seen["tried:"+memberKey(m)] {
+				seen["tried:"+memberKey(m)] = true
+				alreadyTried = append(alreadyTried, m.ProviderID)
+			}
+		case !health.IsAvailable(m.ProviderID):
+			if !seen["cooling:"+m.ProviderID] {
+				seen["cooling:"+m.ProviderID] = true
+				cooling = append(cooling, m.ProviderID)
+			}
+		case !health.SupportsEndpoint(m.ProviderID, endpoint):
+			if !seen["unsupported:"+m.ProviderID] {
+				seen["unsupported:"+m.ProviderID] = true
+				unsupported = append(unsupported, m.ProviderID)
+			}
+		}
+	}
+	parts := []string{}
+	if len(cooling) > 0 {
+		parts = append(parts, fmt.Sprintf("%d cooling down (%s)", len(cooling), strings.Join(cooling, ", ")))
+	}
+	if len(unsupported) > 0 {
+		parts = append(parts, fmt.Sprintf("%d unsupported for %s (%s)", len(unsupported), endpoint, strings.Join(unsupported, ", ")))
+	}
+	if len(alreadyTried) > 0 {
+		parts = append(parts, fmt.Sprintf("%d already tried (%s)", len(alreadyTried), strings.Join(alreadyTried, ", ")))
+	}
+	if len(gone) > 0 {
+		parts = append(parts, fmt.Sprintf("%d missing/disabled (%s)", len(gone), strings.Join(gone, ", ")))
+	}
+	if len(parts) == 0 {
+		return "no members configured"
+	}
+	return strings.Join(parts, "; ")
 }
 
 // next selects the next combo member (provider+model) to try, returning nil when

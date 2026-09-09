@@ -279,7 +279,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		maxAttempts = p.accountBudget(provider)
 	}
 	if maxAttempts == 0 {
+		// Every member disabled/missing — previously a silent 502 with no log row.
 		writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
+		p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed: combo has no enabled members", nil, nil, nil, "", string(info.Raw), "", "")
 		return
 	}
 
@@ -292,6 +294,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 	// 502 "all upstreams failed" — useful signal for a client's own backoff.
 	var lastFailStatus int
 	var lastFailLogID string
+	// attemptJournal collects one short line per failed or skipped attempt so the
+	// terminal log row answers "which upstream failed and why" — transport error,
+	// HTTP status, cooldown skip — instead of a bare "all upstreams failed".
+	var attemptJournal []string
+	journal := func(format string, args ...any) {
+		// Collapse whitespace: upstream bodies and transport errors can span
+		// lines, and the error column renders as one dashboard row.
+		s := strings.Join(strings.Fields(fmt.Sprintf(format, args...)), " ")
+		if len(s) > 300 {
+			s = s[:300]
+		}
+		attemptJournal = append(attemptJournal, s)
+	}
+	journalText := func() string {
+		return strings.Join(attemptJournal, "; ")
+	}
+
+	// cancelAttempt releases the current iteration's attempt context. Declared
+	// OUTSIDE the loop as a no-op and re-armed per iteration: early continues
+	// (member/account/model resolution, before any context exists) call it
+	// safely, and per-iteration cancel avoids piling up defers over the loop.
+	cancelAttempt := func() {}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var upstream *config.Provider
@@ -299,11 +323,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		if plan != nil {
 			member = plan.next(p.registry, triedProviders, triedMembers)
 			if member == nil {
+				// Rotation is spent: every member is tried, provider-cooling,
+				// endpoint-unsupported, or its provider vanished. This is THE
+				// live path for a cooldown storm (sustained failures cool all
+				// members, so the loop can break on the very first iteration
+				// with no per-attempt lines at all) — summarize WHY nothing
+				// was eligible or the terminal row would read
+				// "all upstreams failed: " with nothing after it.
+				journal("no eligible member (%s)", p.rotationBlockReason(combo, endpoint, triedProviders, triedMembers))
 				break
 			}
 			upstream = p.registry.GetProvider(member.ProviderID)
 			if upstream == nil || !upstream.Enabled {
+				journal("%s: provider missing or disabled", member.ProviderID)
 				triedProviders[member.ProviderID] = true
+				cancelAttempt()
 				continue
 			}
 		} else {
@@ -325,10 +359,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			if member != nil && member.AccountID != "" {
 				// Only this pinned key is out (tried/disabled/cooling); same-provider
 				// siblings pinned to other keys must stay reachable.
+				journal("%s: pinned key %s unavailable (cooling down or already tried)", upstream.ID, member.AccountID)
 				triedMembers[memberKey(*member)] = true
 			} else {
+				journal("%s: no eligible key left (all cooling down or already tried)", upstream.ID)
 				triedProviders[upstream.ID] = true
 			}
+			cancelAttempt()
 			continue
 		}
 
@@ -348,6 +385,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		if model == "" {
 			slog.Warn("no upstream model resolved for attempt",
 				"provider", upstream.ID, "account", account.Label)
+			journal("%s: no model configured (provider/key/member all empty)", upstream.ID)
 			// Burn all three scopes: the account so a later member to the same
 			// provider can't pick the same model-less key again, plus the
 			// member/provider so unpinning layers stop re-offering it.
@@ -363,6 +401,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 					"gateway_error")
 				return
 			}
+			cancelAttempt()
 			continue
 		}
 		triedAccounts[account.ID] = true
@@ -446,10 +485,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// Non-streaming attempts are additionally bounded in total (headers + body
 		// window) because a 200-then-hang body has no other watchdog.
 		attemptCtx := r.Context()
+		cancelAttempt() // release the previous iteration's context, if any
+		cancelAttempt = func() {}
 		if !info.Stream {
 			var cancel context.CancelFunc
 			attemptCtx, cancel = context.WithTimeout(attemptCtx, 2*p.timeout)
-			defer cancel()
+			cancelAttempt = cancel
 		}
 		upReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 		if err != nil {
@@ -459,12 +500,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// the whole combo on one mistyped URL.
 			p.registry.Health().RecordFailure(upstream.ID, 0)
 			slog.Warn("failed to build upstream request (check base_url)", "provider", logID, "url", upstreamURL, "err", err)
+			journal("%s: bad base_url (%v)", logID, err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "failed to build upstream request", "gateway_error")
 				p.log(info.Model, logID, endpoint, http.StatusBadGateway, 0, err.Error(), nil, nil, nil, upstreamURL, string(body), "", "")
 				return
 			}
 			triedProviders[upstream.ID] = true
+			cancelAttempt()
 			continue
 		}
 		upReq.Header.Set("Content-Type", "application/json")
@@ -500,6 +543,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			p.registry.Health().RecordProxyFailure(egress.proxyID)
 			slog.Warn("egress dispatch failed, retrying with a different proxy",
 				"provider", logID, "egress", egressForLog(egress.label), "err", err)
+			journal("%s: egress %s failed (%v), retrying on another proxy", logID, egressForLog(egress.label), err)
 			egress = p.egressFor(upstream, combo)
 			dispatch = egress.client
 			retryReq, buildErr := http.NewRequestWithContext(attemptCtx, http.MethodPost, upstreamURL, bytes.NewReader(body))
@@ -536,12 +580,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 				p.registry.Health().RecordProxyFailure(egress.proxyID)
 			}
 			slog.Warn("upstream dispatch failed", "provider", logID, "egress", egressForLog(egress.label), "err", err)
+			journal("%s: transport error via %s: %v", logID, egressForLog(egress.label), err)
 			if plan == nil {
 				writeError(w, http.StatusBadGateway, "upstream request failed", "gateway_error")
 				p.log(info.Model, logID, endpoint, http.StatusBadGateway, time.Since(start), err.Error(), nil, nil, nil, upstreamURL, string(body), "", "")
 				return
 			}
 			triedProviders[upstream.ID] = true
+			cancelAttempt()
 			continue
 		}
 
@@ -650,9 +696,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// the actual upstream rejection reason surfaces for debugging.
 			slog.Warn("upstream retryable status", "provider", logID, "status", resp.StatusCode,
 				"egress", egressForLog(egress.label), "body", strings.TrimSpace(string(peek)))
+			journal("%s: upstream returned %d (%s)", logID, resp.StatusCode, strings.TrimSpace(string(peek)))
 			// NOTE: provider is NOT dropped from triedProviders — NextAccount will
 			// yield a different key next time plan.next (or the plan==nil direct
 			// path, which always re-targets the same provider) re-selects it.
+			cancelAttempt()
 			continue
 		}
 
@@ -668,12 +716,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			_, _ = io.Copy(io.Discard, resp.Body) // drain so the socket can be reused
 			resp.Body.Close()
 			p.registry.Health().MarkUnsupported(upstream.ID, endpoint)
+			journal("%s: does not support %s (404)", logID, endpoint)
 			if plan == nil {
 				writeError(w, resp.StatusCode, fmt.Sprintf("provider does not support %s", endpoint), "invalid_request_error")
 				p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), "unsupported endpoint", nil, nil, nil, upstreamURL, string(body), "", "")
 				return
 			}
 			triedProviders[upstream.ID] = true
+			cancelAttempt()
 			continue
 		}
 		// Any remaining 404/405 on chat.completions (or a non-optional endpoint) is
@@ -718,14 +768,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// retryable error was already rotated — we only reach here on a 2xx and
 			// can safely commit the client response headers.
 			translateStream := format == StreamFormatResponses
-			promptTokens, completionTokens, cachedTokens, streamErr := p.streamResponse(w, resp, format, translateStream)
+			promptTokens, completionTokens, cachedTokens, streamErr := p.streamResponse(w, resp, format, translateStream, r.Context())
 			errMsg := ""
 			if streamErr != nil {
-				// The stream died after a 2xx: the success recorded above is
-				// misleading, so mark the account failed to feed the rotation/cooldown
-				// logic and keep a marker in the request log.
-				p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
-				errMsg = streamErr.Error()
+				// The stream died after a 2xx. Distinguish WHO killed it: a client
+				// abort (Esc mid-generation) makes the select fire on the canceled
+				// client context even though the upstream was perfectly healthy —
+				// penalizing the account here used to poison one healthy key per
+				// abort, and enough aborted streams cooled down an entire combo into
+				// "all upstreams failed" 502s. Upstream death (read error, stall)
+				// still marks the account failed to feed rotation/cooldown. The
+				// upstream detail is kept in the log even on the abort path so a
+				// coincidental upstream failure isn't silently swallowed.
+				if errors.Is(streamErr, context.Canceled) || r.Context().Err() != nil {
+					errMsg = "client disconnected mid-stream (upstream: " + streamErr.Error() + ")"
+				} else {
+					p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
+					errMsg = streamErr.Error()
+				}
 			}
 			p.log(info.Model, logID, endpoint, 200, time.Since(start), errMsg, promptTokens, completionTokens, cachedTokens, logURL, string(body), "", healNote)
 			return
@@ -741,7 +801,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// Account-scoped dispatch failure: rotate to another key/member
 			// exactly like a retryable status would.
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
+			journal("%s: body read error: %v", logID, readErr)
 			slog.Warn("upstream body read failed", "provider", logID, "err", readErr)
+			cancelAttempt()
 			continue
 		}
 
@@ -772,11 +834,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 
 	if lastFailStatus != 0 {
 		writeUpstreamError(w, lastFailStatus)
-		p.log(info.Model, lastFailLogID, endpoint, lastFailStatus, 0, fmt.Sprintf("all accounts exhausted, last status %d", lastFailStatus), nil, nil, nil, "", "", "", "")
+		p.log(info.Model, lastFailLogID, endpoint, lastFailStatus, 0,
+			fmt.Sprintf("all accounts exhausted, last status %d; attempts: %s", lastFailStatus, journalText()),
+			nil, nil, nil, "", string(info.Raw), "", "")
 		return
 	}
+	// Nothing ever got an HTTP response (all transport failures, skips, or
+	// cooldowns). The journal is the only diagnostic: it names each account and
+	// whether it died dialing (endpoint/network problem) or was skipped (health
+	// state the gateway itself booked).
 	writeError(w, http.StatusBadGateway, "all upstreams failed", "gateway_error")
-	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0, "all upstreams failed", nil, nil, nil, "", "", "", "")
+	p.log(info.Model, "", endpoint, http.StatusBadGateway, 0,
+		"all upstreams failed: "+journalText(),
+		nil, nil, nil, "", string(info.Raw), "", "")
 }
 
 func upstreamPathFor(endpoint string, nativeResponses bool) string {

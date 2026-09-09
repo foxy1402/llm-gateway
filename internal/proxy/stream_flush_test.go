@@ -72,7 +72,7 @@ func TestStreamReadErrorReported(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	p := &Proxy{}
-	if _, _, _, err := p.streamResponse(rec, upstream, StreamFormatChat, false); err == nil {
+	if _, _, _, err := p.streamResponse(rec, upstream, StreamFormatChat, false, context.Background()); err == nil {
 		t.Fatal("expected a mid-stream read error to be reported")
 	}
 }

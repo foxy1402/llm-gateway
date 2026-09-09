@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -36,8 +37,23 @@ const streamStallTimeout = 90 * time.Second
 // error or stall timeout — so the caller can record an account failure instead of
 // letting a provider that 200s then hangs keep a perfect health record. A clean
 // EOF (with or without a [DONE] sentinel) is not an error: some providers close
-// the body instead of sending the sentinel.
-func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, format StreamFormat, translate bool) (*int, *int, *int, error) {
+// the body instead of sending the sentinel. [DONE] itself also terminates the
+// read loop without waiting for EOF: some upstreams hold the connection open
+// after the sentinel, and waiting there used to trip the stall timer and mark a
+// healthy account failed.
+//
+// The upstream body is closed on every exit path, and the reader goroutine is
+// reaped — a missed close leaks one connection (fd) per streamed response and,
+// under sustained streaming load, exhausts sockets until every dial fails.
+//
+// ctx is the CLIENT's request context: when it is canceled (user hits Esc), the
+// returned error wraps the context error so the caller can distinguish "client
+// left" (no penalty) from "upstream died" (account failure). A nil ctx is
+// treated as context.Background (never canceled).
+func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, format StreamFormat, translate bool, ctx context.Context) (*int, *int, *int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// SSE headers.
 	// Note: if translate is false, we forward chat-completions stream bytes as-is.
 	h := w.Header()
@@ -53,6 +69,15 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	// through those wrappers and tokens arrive in 2 KiB bursts.
 	rc := http.NewResponseController(w)
 	_ = rc.Flush()
+
+	// Close the upstream body on every exit path — including panics. Before this,
+	// the ONLY body never closed in the proxy was this one: one leaked connection
+	// per streamed response, eventually exhausting sockets under sustained load
+	// until every dial failed with "cannot assign requested address" and every
+	// combo 502'd. Close releases the TRANSPORT connection; the reader goroutine
+	// below is stopped separately via doneCh (Close alone does not unblock a
+	// Read on every body implementation, e.g. wrapped or in-memory bodies).
+	defer upstream.Body.Close()
 
 	src := bufio.NewReaderSize(upstream.Body, 4096)
 	var out bytes.Buffer
@@ -73,16 +98,26 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	var promptTokens, completionTokens, cachedTokens *int
 
 	// Per-chunk stall detection: run each line read in a goroutine and bound it with
-	// a timer that resets on every successful read.
+	// a timer that resets on every successful read. The goroutine stops when the
+	// function returns (doneCh closed by defer) or when the upstream body hits
+	// EOF/error: its send is gated on doneCh so it can never block forever on a
+	// full channel after an early return ([DONE], stall, client abort) — a bare
+	// blocking send would leak one goroutine per such stream.
 	type readResult struct {
 		line []byte
 		err  error
 	}
 	readCh := make(chan readResult, 1)
+	doneCh := make(chan struct{})
+	defer close(doneCh)
 	go func() {
 		for {
 			line, err := src.ReadBytes('\n')
-			readCh <- readResult{line, err}
+			select {
+			case readCh <- readResult{line, err}:
+			case <-doneCh:
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -110,6 +145,21 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			// Upstream stalled mid-response: the client got a truncated stream and
 			// the account must not keep a clean health record for it.
 			return promptTokens, completionTokens, cachedTokens, fmt.Errorf("upstream stalled for %s mid-stream", streamStallTimeout)
+		case <-ctx.Done():
+			// Client went away mid-stream (Esc in an IDE, page nav). Not an upstream
+			// fault: the wrapped context error tells the caller NOT to penalize
+			// the account. Prefer a read that already completed (both can be ready
+			// at once; Go would otherwise pick randomly and drop a good chunk):
+			// only when no chunk is waiting do we report the disconnect.
+			select {
+			case rr = <-readCh:
+				if len(rr.line) > 0 && !stall.Stop() {
+					<-stall.C
+				}
+				stall.Reset(streamStallTimeout)
+			default:
+				return promptTokens, completionTokens, cachedTokens, fmt.Errorf("client disconnected mid-stream: %w", ctx.Err())
+			}
 		}
 		line, err := rr.line, rr.err
 		if len(line) > 0 {
@@ -144,6 +194,20 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 					} else {
 						out.Write(line)
 					}
+					// Flush accumulated bytes.
+					if out.Len() > 0 {
+						_, _ = w.Write(out.Bytes())
+						out.Reset()
+						_ = rc.Flush()
+					}
+					// The sentinel is the protocol-level end of stream: stop here
+					// instead of waiting for EOF. Upstreams that keep the connection
+					// open after [DONE] used to hold us until the stall timer fired,
+					// which then marked the account failed for a stream that had
+					// actually completed cleanly. Trailing bytes after the sentinel
+					// are intentionally dropped ([DONE] is terminal per SSE
+					// convention); usage already accumulated above is preserved.
+					return promptTokens, completionTokens, cachedTokens, nil
 				} else {
 					if translate && format == StreamFormatResponses {
 						translated, model, usage, details, toolDeltas, ok := translateChatChunk(payload)

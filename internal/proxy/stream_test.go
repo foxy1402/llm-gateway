@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -101,7 +102,7 @@ func TestStreamTranslateEmitsFunctionCallEvents(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	p := &Proxy{}
-	if _, _, _, err := p.streamResponse(rec, upstream, StreamFormatResponses, true); err != nil {
+	if _, _, _, err := p.streamResponse(rec, upstream, StreamFormatResponses, true, context.Background()); err != nil {
 		t.Fatalf("stream: %v", err)
 	}
 	out := rec.Body.String()
