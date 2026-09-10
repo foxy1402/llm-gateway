@@ -96,6 +96,7 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` | no | `10` | Self-heal ceiling: how many accounts (API keys) of **one** provider get tried within a single request before giving up on it. Default `10` covers realistic key pools in full (a provider with 5 keys tries all 5 before failing). Lower it if you'd rather fail fast than have one slow/unlucky request serially churn through a very large key pool. `0` or invalid values fall back to the default. |
 | `MIN_COMPLETION_TOKENS` | no | `16` | Floor used by the [token-budget-too-small smart-mode heal](#smart-mode-token-budget-too-small): if a reasoning-tier model rejects a request because `max_tokens`/`max_completion_tokens` is too small to produce any output (e.g. a `max_tokens: 1` connection probe), the gateway bumps it up to this floor and retries once. Set to `0` to disable this heal entirely. |
 | `MODEL_ALIASES` | no | — | Comma-separated `incoming=target` fallbacks, e.g. `gpt-4o=mycoding,vercel=qwen-vercel`. When a client sends a model that matches **neither a combo nor a provider** (common with agents/CLIs that hardcode a model ID), the gateway retries with `target`. Combos and providers always win over aliases. |
+| `ALLOW_PRIVATE_BASE_URL` | no | `0` | Set to `1` to allow a provider `base_url` that points at a loopback/private/link-local address (`127.0.0.1`, `10.x`, `192.168.x`, `localhost`, `169.254.x`, …). Default `0` rejects such URLs when you save a provider or use fetch-models. You never need this for public providers — see [Allowing private base URLs](#allowing-private-base-urls). |
 | `BAN_MAXFAIL` | no | `5` | Failed dashboard logins within `BAN_FIND_TIME` before the client IP is banned (429 + `Retry-After`). Guards the login that protects all stored provider keys. `0` disables the gate. |
 | `BAN_FIND_TIME` | no | `10m` | Failure window for the login fail-to-ban counter |
 | `BAN_TIME` | no | `30m` | Base ban duration; doubles per repeat offense |
@@ -123,6 +124,17 @@ When `TRUSTED_PROXY=1`, the gate reads the **last** entry of `X-Forwarded-For`: 
 | Home server / local-only, closed port (not exposed to the internet at all — LAN, `localhost`, VPN/Tailscale only) | **`0` (leave unset)** | The default; there's no untrusted public traffic to spoof headers in the first place, so trusting them buys nothing and only matters if you later add a reverse proxy in front. |
 
 Rule of thumb: `TRUSTED_PROXY=1` is safe **only** when you're certain every request that reaches the gateway process already passed through infrastructure you control (or a reputable managed platform) that strips/rewrites `X-Forwarded-For` — never set it just because you're "on the cloud." A raw VM with a directly-opened port (the OCI-Compute-plus-`docker run -p` case) behaves exactly like a home router port-forward: the gateway's port itself is the only thing facing the internet, so it must stay `0`.
+
+### Allowing private base URLs
+
+Since provider `base_url`s get saved through the dashboard and dispatched to directly — and the fetch-models button echoes the response back — a `base_url` pointing at the deployment's own network is a server-side request forgery (SSRF) probe: `http://127.0.0.1:8080` reaches the gateway itself, and on most cloud/PaaS hosts `http://169.254.169.254/latest/meta-data/` reaches the metadata service that can hand out cloud credentials. So by default the gateway rejects `base_url`s whose host is a loopback/private/link-local IP (or `localhost`).
+
+Set `ALLOW_PRIVATE_BASE_URL=1` **only** when a provider genuinely runs alongside the gateway:
+
+- a local model server (`http://127.0.0.1:11434` for Ollama, llama.cpp, LM Studio),
+- a sibling container on the same compose network (`http://vllm:8000`).
+
+For public providers (OpenAI, Lightning AI, every aggregator, …) leave it unset — nothing about that traffic is private, and leaving the check on means a mistyped URL fails loudly at save time instead of silently probing somewhere unintended. `1` also only relaxes the private-address check; the scheme must still be `http`/`https` and the host non-empty.
 
 ### Generating DASHBOARD_SECRET
 
