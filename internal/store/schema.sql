@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS request_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_log_ts ON request_log(ts DESC);
-CREATE INDEX IF NOT EXISTS idx_log_provider ON request_log(provider_used);
+-- Composite (filter, ts DESC) indexes: every dashboard log query is
+-- "WHERE <col> = ? ORDER BY ts DESC LIMIT/OFFSET", which a single-column index
+-- cannot serve — the planner had to scan the table and build a temp B-tree for
+-- the sort, dragging both 4 KiB payload columns off disk for every row (~930ms
+-- on a 300k-row log, twice per page because of the COUNT, every 5s while the
+-- logs view auto-refreshes).
+CREATE INDEX IF NOT EXISTS idx_log_provider_ts ON request_log(provider_used, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_endpoint_ts ON request_log(endpoint, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_log_status_ts ON request_log(status, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_accounts_provider ON provider_accounts(provider_id);
 CREATE INDEX IF NOT EXISTS idx_models_provider ON provider_models(provider_id);

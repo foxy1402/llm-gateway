@@ -62,14 +62,31 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	// re-run; the ONLY tolerated error is SQLite's "duplicate column name"). A
 	// fresh DB already has these via schema.sql above; this only matters for a
 	// database created before the column existed.
+	//
+	// Ordering matters: combo_members/provider_accounts columns that the
+	// combo_members table rebuild below selects must exist first, so the
+	// ADD COLUMN pass runs before rebuildComboMembers.
 	columnMigrations := []struct {
 		table   string
 		columns []string
 	}{
 		{"request_log", []string{"upstream_url TEXT DEFAULT ''", "request_payload TEXT DEFAULT ''", "response_snippet TEXT DEFAULT ''", "cached_tokens INTEGER", "heal_note TEXT DEFAULT ''"}},
 		{"providers", []string{"token_param_mode TEXT NOT NULL DEFAULT ''", "proxy_rotate INTEGER NOT NULL DEFAULT 0"}},
-		{"provider_accounts", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
-		{"combo_members", []string{"token_param_mode TEXT NOT NULL DEFAULT ''"}},
+		// provider_accounts.model (per-key model pin) and combo_members.account_id
+		// (pin a member to one specific key) were added to schema.sql without a
+		// matching ALTER, so a database created before them opened "successfully"
+		// and then failed EVERY provider/combo read with "no such column" — the
+		// process crash-looped on a volume whose data was perfectly intact, and
+		// ExportSQL failed too, so backing up before repair was impossible.
+		// account_id must stay nullable with a NULL default: SQLite only permits
+		// ADD COLUMN with a REFERENCES clause when the default is NULL.
+		{"provider_accounts", []string{"token_param_mode TEXT NOT NULL DEFAULT ''", "model TEXT NOT NULL DEFAULT ''"}},
+		{"combo_members", []string{
+			"token_param_mode TEXT NOT NULL DEFAULT ''",
+			"model TEXT NOT NULL DEFAULT ''",
+			"position INTEGER NOT NULL DEFAULT 0",
+			"account_id TEXT REFERENCES provider_accounts(id) ON DELETE SET NULL",
+		}},
 		{"combos", []string{"proxy_rotate INTEGER NOT NULL DEFAULT 0"}},
 	}
 	for _, mig := range columnMigrations {
@@ -85,8 +102,118 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			}
 		}
 	}
+	if err := rebuildComboMembers(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate combo_members primary key: %w", err)
+	}
+	// idx_log_provider (provider_used alone) is superseded by the composite
+	// (provider_used, ts DESC) index in schema.sql, which serves the same filter
+	// AND the ORDER BY. Dropping it saves write amplification on every log insert.
+	if _, err := db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_log_provider"); err != nil {
+		slog.Warn("could not drop superseded log index", "err", err)
+	}
 	s := &Store{db: db}
 	return s, nil
+}
+
+// rebuildComboMembers migrates combo_members to the current PRIMARY KEY
+// (combo_id, position). Earlier schemas used (combo_id, provider_id) and then
+// (combo_id, provider_id, model), neither of which can represent the same
+// provider twice in one combo — and CREATE TABLE IF NOT EXISTS silently no-ops
+// on an existing table, so the old PK survived every upgrade. A no-op when the
+// PK already matches, which is the case for any database created after the
+// account-pinning release.
+func rebuildComboMembers(ctx context.Context, db *sql.DB) error {
+	pk, err := primaryKeyColumns(ctx, db, "combo_members")
+	if err != nil {
+		return err
+	}
+	if len(pk) == 2 && pk[0] == "combo_id" && pk[1] == "position" {
+		return nil
+	}
+	slog.Warn("migrating combo_members to the current primary key; this is a one-time upgrade of an older database", "old_primary_key", pk)
+
+	// PRAGMA foreign_keys is a no-op inside a transaction and is per-connection,
+	// so the whole rebuild has to run on ONE pinned connection with FKs disabled
+	// around it — otherwise dropping the old table would cascade-delete rows.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return err
+	}
+	// Re-enable on the way out: this connection returns to the pool and would
+	// otherwise serve later writes with FK enforcement silently disabled.
+	defer func() {
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+			slog.Error("failed to re-enable foreign keys after migration", "err", err)
+		}
+	}()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmts := []string{
+		`CREATE TABLE combo_members_new (
+			combo_id         TEXT NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
+			provider_id      TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+			account_id       TEXT REFERENCES provider_accounts(id) ON DELETE SET NULL,
+			model            TEXT NOT NULL DEFAULT '',
+			token_param_mode TEXT NOT NULL DEFAULT '',
+			position         INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (combo_id, position)
+		)`,
+		// Positions are renumbered per combo: the old PK allowed duplicate
+		// positions (they were not part of it), which would collide under the new one.
+		`INSERT INTO combo_members_new (combo_id, provider_id, account_id, model, token_param_mode, position)
+		 SELECT combo_id, provider_id, account_id, COALESCE(model, ''), COALESCE(token_param_mode, ''),
+		        ROW_NUMBER() OVER (PARTITION BY combo_id ORDER BY position, provider_id) - 1
+		 FROM combo_members`,
+		`DROP TABLE combo_members`,
+		`ALTER TABLE combo_members_new RENAME TO combo_members`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("%s: %w", strings.Fields(stmt)[0], err)
+		}
+	}
+	// Catch a rebuild that would leave dangling references (e.g. a member whose
+	// provider was deleted while FKs were off in some earlier version) BEFORE
+	// committing, rather than discovering it on the next write.
+	var orphan string
+	err = tx.QueryRowContext(ctx, `SELECT combo_id || '/' || provider_id FROM combo_members m
+		WHERE NOT EXISTS (SELECT 1 FROM combos c WHERE c.id = m.combo_id)
+		   OR NOT EXISTS (SELECT 1 FROM providers p WHERE p.id = m.provider_id) LIMIT 1`).Scan(&orphan)
+	switch {
+	case err == nil:
+		return fmt.Errorf("refusing to commit: combo member %q references a missing combo/provider", orphan)
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+	return tx.Commit()
+}
+
+// primaryKeyColumns returns a table's PRIMARY KEY columns in key order.
+func primaryKeyColumns(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		cols = append(cols, name)
+	}
+	return cols, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -581,6 +708,9 @@ func (s *Store) QueryLogs(f config.LogFilter) ([]config.LogEntry, error) {
 	q += " ORDER BY ts DESC, id DESC"
 	if f.Limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", f.Limit)
+	} else if f.Offset > 0 {
+		// SQLite rejects OFFSET without LIMIT; -1 means "no limit".
+		q += " LIMIT -1"
 	}
 	if f.Offset > 0 {
 		q += fmt.Sprintf(" OFFSET %d", f.Offset)
@@ -721,13 +851,50 @@ func (s *Store) RequestsPerHour(hours int) ([]HourlyCount, error) {
 	return out, rows.Err()
 }
 
+// pruneBatchSize bounds one PruneLogs DELETE. An unbounded delete of a large
+// backlog (e.g. the first run after lowering log.retention_days) held the write
+// lock for over a second per 150k rows, stalling every concurrent log write and
+// dashboard save; at multi-GB scale it can approach busy_timeout and start
+// returning SQLITE_BUSY.
+const pruneBatchSize = 5000
+
 func (s *Store) PruneLogs(olderThanDays int) (int64, error) {
 	cutoff := time.Now().AddDate(0, 0, -olderThanDays).Unix()
-	res, err := s.db.Exec("DELETE FROM request_log WHERE ts < ?", cutoff)
-	if err != nil {
-		return 0, err
+	var total int64
+	for {
+		res, err := s.db.Exec(
+			"DELETE FROM request_log WHERE id IN (SELECT id FROM request_log WHERE ts < ? LIMIT ?)",
+			cutoff, pruneBatchSize)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < pruneBatchSize {
+			break
+		}
+		// Yield the write lock between batches so log writes and dashboard saves
+		// interleave instead of queueing behind a long prune.
+		time.Sleep(10 * time.Millisecond)
 	}
-	return res.RowsAffected()
+	if total > 0 {
+		// Deleted pages only return to SQLite's freelist, and passive WAL
+		// checkpointing is skipped whenever a reader holds a snapshot (an open
+		// dashboard inflates the WAL ~70x under load), so without this "pruning
+		// worked" and "the volume is still full" stayed true simultaneously.
+		if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			slog.Warn("wal checkpoint after prune failed", "err", err)
+		}
+		// Refresh planner statistics so the composite log indexes keep being chosen
+		// as the table's shape changes.
+		if _, err := s.db.Exec("ANALYZE request_log"); err != nil {
+			slog.Warn("analyze after prune failed", "err", err)
+		}
+	}
+	return total, nil
 }
 
 // --- Settings ---
@@ -745,6 +912,33 @@ func (s *Store) SetSetting(key, value string) error {
 	_, err := s.db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
+}
+
+// SetSettings writes several settings atomically. A per-key loop of SetSetting
+// left earlier keys committed when a later one failed, and since Go map
+// iteration order is random the surviving subset differed every attempt — while
+// the caller reported "save failed" and the user believed nothing was written.
+func (s *Store) SetSettings(kv map[string]string) error {
+	if len(kv) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for k, v := range kv {
+		if _, err := stmt.Exec(k, v); err != nil {
+			return fmt.Errorf("set setting %q: %w", k, err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) AllSettings() (map[string]string, error) {

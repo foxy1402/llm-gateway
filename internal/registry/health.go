@@ -135,11 +135,6 @@ func (h *HealthTracker) RecordSuccess(id string) {
 	s.cooldownUntil = time.Time{}
 }
 
-// MarkUnsupportedCompletions flags the provider as not supporting /v1/completions.
-func (h *HealthTracker) MarkUnsupportedCompletions(id string) {
-	h.MarkUnsupported(id, EndpointCompletions)
-}
-
 // MarkUnsupported flags the provider as not supporting an arbitrary endpoint (#5).
 func (h *HealthTracker) MarkUnsupported(id, endpoint string) {
 	s := h.state(id)
@@ -160,13 +155,28 @@ func (h *HealthTracker) IsAvailable(id string) bool {
 }
 
 // accountKey builds the cooldown-scoping key for a single account. Accounts use
-// "providerID::accountID" so a burned key (429 / auth fail on one account) only
-// takes that account out of rotation, not its siblings on the same endpoint.
+// "account::providerID::accountID" so a burned key (429 / auth fail on one
+// account) only takes that account out of rotation, not its siblings on the same
+// endpoint. The "account::" namespace matters because state(id) CREATES an entry
+// on first read, so merely considering a key for rotation registers it in the
+// shared states map — without a prefix those entries were indistinguishable from
+// providers and every account rendered as a phantom "Disabled provider" row in
+// the dashboard health table.
 func accountKey(providerID, accountID string) string {
 	if accountID == "" {
 		return providerID
 	}
-	return providerID + "::" + accountID
+	return accountStatePrefix + providerID + "::" + accountID
+}
+
+// accountStatePrefix namespaces per-account health state inside the shared
+// states map, mirroring proxyStateKey's "proxy::".
+const accountStatePrefix = "account::"
+
+// isAccountStateKey reports whether a states-map key belongs to a single account
+// rather than a provider.
+func isAccountStateKey(k string) bool {
+	return strings.HasPrefix(k, accountStatePrefix)
 }
 
 // RecordAccountFailure cools down a single account key. Subsequent candidates
@@ -259,6 +269,37 @@ func (h *HealthTracker) PruneLearnedAccounts(accountKeys map[string]bool) {
 		}
 	}
 	h.reasoningEffortMu.Unlock()
+	// Per-account cooldown state lives in the shared states map and is created on
+	// first read, so it needs the same pruning or a long-lived process accumulates
+	// an entry for every account that ever existed.
+	h.mu.Lock()
+	for k := range h.states {
+		if isAccountStateKey(k) && !accountKeys[k] {
+			delete(h.states, k)
+		}
+	}
+	h.mu.Unlock()
+}
+
+// ClearUnsupported forgets every learned "provider does not implement this
+// endpoint" mark. Called from Reload because those marks have no TTL and nothing
+// else ever clears them: a single 404 (often from a mistyped base_url or a wrong
+// responses_native flag) permanently removed the provider from rotation for that
+// endpoint, and correcting the configuration in the dashboard could not recover
+// it — only a process restart could. A reload is the operator stating the config
+// changed, so re-discovery is exactly the right behavior.
+func (h *HealthTracker) ClearUnsupported() {
+	h.mu.Lock()
+	states := make([]*providerHealth, 0, len(h.states))
+	for _, s := range h.states {
+		states = append(states, s)
+	}
+	h.mu.Unlock()
+	for _, s := range states {
+		s.mu.Lock()
+		s.unsupported = nil
+		s.mu.Unlock()
+	}
 }
 
 // proxyStateKey namespaces per-proxy health inside the shared states map.
@@ -356,13 +397,14 @@ func (h *HealthTracker) SupportsEndpoint(id, endpoint string) bool {
 	return true
 }
 
-// Snapshot returns health state for all tracked providers. Proxy pool entries
-// share the same underlying states map (namespaced via proxyStateKey so their
-// cooldowns reuse the provider machinery) but are NOT providers — every
-// consumer of this snapshot (dashboard "Provider health" table, /admin/status)
-// looks each ProviderID up against the provider list, so a leaked "proxy::px-1"
-// key would render as a bogus disabled "provider". Proxy health has its own
-// accessor (ProxyStatus) for the dedicated Proxies dashboard table.
+// Snapshot returns health state for all tracked providers. Proxy pool entries and
+// individual accounts share the same underlying states map (namespaced via
+// proxyStateKey / accountKey so their cooldowns reuse the provider machinery) but
+// are NOT providers — every consumer of this snapshot (dashboard "Provider
+// health" table, /admin/status) looks each ProviderID up against the provider
+// list, so a leaked "proxy::px-1" or "account::p1::p1:k2" key would render as a
+// bogus disabled "provider". Proxy health has its own accessor (ProxyStatus) for
+// the dedicated Proxies dashboard table.
 func (h *HealthTracker) Snapshot() []config.HealthSnapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -370,6 +412,9 @@ func (h *HealthTracker) Snapshot() []config.HealthSnapshot {
 	now := time.Now()
 	for id, s := range h.states {
 		if _, isProxy := disentangleProxyKey(id); isProxy {
+			continue
+		}
+		if isAccountStateKey(id) {
 			continue
 		}
 		s.mu.Lock()

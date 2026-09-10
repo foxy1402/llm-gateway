@@ -2,6 +2,12 @@
 
 FROM golang:1.25-alpine AS builder
 WORKDIR /src
+# TARGETOS/TARGETARCH are BuildKit predefined build args: they are only visible
+# inside a stage that redeclares them. Without these ARG lines both expanded to
+# empty and the amd64 defaults applied on EVERY platform — so the published
+# linux/arm64 image contained an amd64 binary and died with "exec format error".
+ARG TARGETOS
+ARG TARGETARCH
 # Cache deps first.
 COPY go.mod go.sum ./
 RUN go mod download

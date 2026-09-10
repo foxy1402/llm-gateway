@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -316,6 +317,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 	// (member/account/model resolution, before any context exists) call it
 	// safely, and per-iteration cancel avoids piling up defers over the loop.
 	cancelAttempt := func() {}
+	// Every `continue` cancels explicitly (so nothing is held across a rotation),
+	// but the many `return` paths — including the non-streaming success hot path —
+	// did not. For real HTTP traffic net/http cancels the request context on
+	// handler return so children were reaped anyway; the dashboard's test buttons
+	// build their request with context.Background(), whose Done() is nil and never
+	// fires, so each test click retained a context and a live timer for the full
+	// 2×timeout. Cancel funcs are idempotent, so this defer is a no-op after an
+	// explicit call and simply guarantees no path leaks.
+	defer func() { cancelAttempt() }()
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		var upstream *config.Provider
@@ -386,14 +396,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			slog.Warn("no upstream model resolved for attempt",
 				"provider", upstream.ID, "account", account.Label)
 			journal("%s: no model configured (provider/key/member all empty)", upstream.ID)
-			// Burn all three scopes: the account so a later member to the same
-			// provider can't pick the same model-less key again, plus the
-			// member/provider so unpinning layers stop re-offering it.
+			// Burn the account so no later member can pick this same model-less key
+			// again. Only burn the MEMBER when the member itself is what's broken —
+			// i.e. it pinned this key. Burning an UNPINNED member here also retired
+			// its healthy sibling keys, so a single blank-model key in an aggregator
+			// pool turned every request that rotated onto it into a hard 502 while
+			// correctly-configured keys sat idle. The +1 member budget padding covers
+			// the extra discovery iteration this costs.
 			triedAccounts[account.ID] = true
-			if member != nil {
-				triedMembers[memberKey(*member)] = true
-			} else {
+			switch {
+			case member == nil:
 				triedProviders[upstream.ID] = true
+			case member.AccountID != "":
+				triedMembers[memberKey(*member)] = true
 			}
 			if plan == nil {
 				writeError(w, http.StatusBadGateway,
@@ -569,15 +584,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// same way) and rotate to the next member. Do NOT penalize for
 			// context.DeadlineExceeded on the client side (#2, #11).
 			//
-			// Passive proxy health lives here too: only a transport error through
-			// a pool entry can implicate the PROXY (an HTTP status, even 429/5xx,
-			// proves the proxy forwarded fine). A failed entry cools down so the
-			// next attempt rotates to a sibling — no background probes needed. This
-			// is the LAST egress attempted (after any retries just above), so the
-			// right one is charged.
-			p.registry.Health().RecordFailure(upstream.ID, 0)
+			// Passive proxy health: only a transport error through a pool entry can
+			// implicate the PROXY (an HTTP status, even 429/5xx, proves the proxy
+			// forwarded fine). A failed entry cools down so the next attempt rotates
+			// to a sibling — no background probes needed. This is the LAST egress
+			// attempted (after any retries just above), so the right one is charged.
+			//
+			// Charge the PROVIDER only when the failure cannot be pinned on a proxy.
+			// The retry loop above already concluded a pool-proxy fault, so also
+			// cooling the provider took a healthy upstream — every one of its keys —
+			// out of rotation for the full cooldown because of a dead proxy entry. A
+			// fully-dead pool falls back to a direct dial (proxyID == ""), where the
+			// provider charge is the correct attribution.
 			if egress.proxyID != "" {
 				p.registry.Health().RecordProxyFailure(egress.proxyID)
+			} else {
+				p.registry.Health().RecordFailure(upstream.ID, 0)
 			}
 			slog.Warn("upstream dispatch failed", "provider", logID, "egress", egressForLog(egress.label), "err", err)
 			journal("%s: transport error via %s: %v", logID, egressForLog(egress.label), err)
@@ -707,11 +729,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// 404/405 endpoint-unsupported handling. Every OpenAI-compatible provider
 		// MUST implement chat.completions — a 404 there means our URL is wrong
 		// (bad base_url), not that the provider "doesn't support" it. Only the
-		// *optional* endpoints (legacy /v1/completions, /v1/embeddings, native
-		// /v1/responses) can genuinely be unimplemented.
+		// *optional* endpoints (legacy /v1/completions, /v1/embeddings) can
+		// genuinely be unimplemented.
+		//
+		// /v1/responses is deliberately NOT in this set even when the provider is
+		// flagged responses_native: MarkUnsupported is provider- and
+		// endpoint-scoped with no TTL and no un-mark, and SupportsEndpoint is the
+		// filter rotation uses — so one wrong responses_native checkbox
+		// permanently blacklisted /v1/responses for every combo containing that
+		// provider, including the translation path that would have worked fine,
+		// and not even fixing the flag plus a reload recovered it. A native 404
+		// instead falls through to the "any remaining 404" branch below, which
+		// surfaces the real upstream body so the misconfiguration is visible.
 		optional := endpoint == registry.EndpointCompletions ||
-			endpoint == registry.EndpointEmbeddings ||
-			(nativeThisAttempt && endpoint == registry.EndpointResponses)
+			endpoint == registry.EndpointEmbeddings
 		if (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) && optional {
 			_, _ = io.Copy(io.Discard, resp.Body) // drain so the socket can be reused
 			resp.Body.Close()
@@ -733,11 +764,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_, _ = io.Copy(io.Discard, resp.Body) // drain remainder so the socket can be reused
 			resp.Body.Close()
-			for k, v := range resp.Header {
-				if strings.HasPrefix(k, "Content-") {
-					w.Header()[k] = v
-				}
-			}
+			copyContentHeaders(w, resp)
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(bodyBytes)
 			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, logURL, string(body), string(bodyBytes), "")
@@ -749,11 +776,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_, _ = io.Copy(io.Discard, resp.Body) // drain remainder so the socket can be reused
 			resp.Body.Close()
-			for k, v := range resp.Header {
-				if strings.HasPrefix(k, "Content-") {
-					w.Header()[k] = v
-				}
-			}
+			copyContentHeaders(w, resp)
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(bodyBytes)
 			p.log(info.Model, logID, endpoint, resp.StatusCode, time.Since(start), strings.TrimSpace(string(bodyBytes)), nil, nil, nil, logURL, string(body), string(bodyBytes), "")
@@ -776,13 +799,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 				// client context even though the upstream was perfectly healthy —
 				// penalizing the account here used to poison one healthy key per
 				// abort, and enough aborted streams cooled down an entire combo into
-				// "all upstreams failed" 502s. Upstream death (read error, stall)
+				// "all upstreams failed" 502s. A failed write to the client is the
+				// same class: the caller hung up. Upstream death (read error, stall)
 				// still marks the account failed to feed rotation/cooldown. The
 				// upstream detail is kept in the log even on the abort path so a
 				// coincidental upstream failure isn't silently swallowed.
-				if errors.Is(streamErr, context.Canceled) || r.Context().Err() != nil {
+				switch {
+				case errors.Is(streamErr, errClientWriteFailed):
+					errMsg = "client hung up mid-stream (" + streamErr.Error() + ")"
+				case errors.Is(streamErr, context.Canceled) || r.Context().Err() != nil:
 					errMsg = "client disconnected mid-stream (upstream: " + streamErr.Error() + ")"
-				} else {
+				default:
 					p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 					errMsg = streamErr.Error()
 				}
@@ -798,6 +825,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 		resp.Body.Close()
 		if readErr != nil {
+			// Client-initiated abort, exactly as on the streaming path: the attempt
+			// context is a child of the client's, so an Esc / SDK timeout / closed tab
+			// surfaces here as context.Canceled. Penalizing that poisoned one healthy
+			// key per aborted request — the same cascade the streaming path already
+			// guards against, reached through the non-streaming door. A
+			// DeadlineExceeded from the attempt's OWN 2×timeout bound is a genuine
+			// upstream stall and must still count, so match Canceled specifically
+			// plus the client context.
+			if errors.Is(readErr, context.Canceled) || r.Context().Err() != nil {
+				slog.Info("client aborted mid-body", "provider", logID)
+				return
+			}
 			// Account-scoped dispatch failure: rotate to another key/member
 			// exactly like a retryable status would.
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
@@ -983,6 +1022,14 @@ func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency ti
 	p.logWG.Add(1)
 	go func() {
 		defer p.logWG.Done()
+		// This write happens after the response is already on the wire, so a panic
+		// here (nil store during shutdown, driver bug) would kill the process for a
+		// request the client already got. Contain it.
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("panic writing request log", "panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			}
+		}()
 		if err := p.store.LogRequest(entry); err != nil {
 			slog.Warn("failed to write request log", "err", err)
 		}
@@ -1005,6 +1052,21 @@ func writeError(w http.ResponseWriter, status int, msg, typ string) {
 
 func writeUpstreamError(w http.ResponseWriter, upstreamStatus int) {
 	writeError(w, upstreamStatus, fmt.Sprintf("upstream returned %d", upstreamStatus), "upstream_error")
+}
+
+// copyContentHeaders forwards an upstream response's Content-* headers to the
+// client, minus Content-Length. The bodies these callers forward are read
+// through a 1 MiB LimitReader, so a larger upstream error body would advertise a
+// length longer than what actually gets written and net/http would treat the
+// short write as a truncated response instead of a clean 4xx. Letting net/http
+// compute the length keeps the two in sync.
+func copyContentHeaders(w http.ResponseWriter, resp *http.Response) {
+	for k, v := range resp.Header {
+		if !strings.HasPrefix(k, "Content-") || http.CanonicalHeaderKey(k) == "Content-Length" {
+			continue
+		}
+		w.Header()[k] = v
+	}
 }
 
 // --- usage extraction ---

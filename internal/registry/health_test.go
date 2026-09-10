@@ -6,7 +6,7 @@ import (
 
 func TestSupportsEndpointGeneral(t *testing.T) {
 	h := NewHealthTracker()
-	h.MarkUnsupportedCompletions("a")
+	h.MarkUnsupported("a", EndpointCompletions)
 	if h.SupportsEndpoint("a", EndpointCompletions) {
 		t.Fatal("a should not support completions")
 	}

@@ -17,6 +17,18 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      - name: gofmt
+        # Runs on a fresh Linux checkout, so line endings are LF and this is a true
+        # formatting check (a Windows worktree with CRLF drift reports false hits).
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
       - name: go vet
         run: go vet ./...
 

@@ -37,15 +37,21 @@ func Mount(mux *http.ServeMux, d *Deps) {
 	api := &apiHandlers{d: d}
 
 	// The dashboard renders user-controlled strings (provider IDs, log payloads)
-	// but must never be sniffed into an executable context or framed.
+	// but must never be sniffed into an executable context or framed. API responses
+	// carry secrets (provider auth keys, the gateway API key on /endpoint), so they
+	// must never be cached by a proxy or written to a browser's disk cache.
 	secure := func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			if strings.HasPrefix(r.URL.Path, "/dashboard/api/") {
+				w.Header().Set("Cache-Control", "no-store")
+			}
 			h.ServeHTTP(w, r)
 		})
 	}
-	withAuth := func(h http.Handler) http.Handler { return secure(dash.Middleware(h)) }
+	withAuth := func(h http.Handler) http.Handler { return secure(dash.Middleware(sameOrigin(h))) }
 
 	// Auth endpoints. The login POST is the brute-force target (a session
 	// exposes every stored key), so it sits behind the fail-to-ban gate.
@@ -104,6 +110,65 @@ func Mount(mux *http.ServeMux, d *Deps) {
 }
 
 type apiHandlers struct{ d *Deps }
+
+// sameOrigin rejects a state-changing request whose Origin header names a
+// different site. SameSite=Strict on the session cookie already blocks classic
+// cross-site form/fetch CSRF, but it was the ONLY defense: this adds the standard
+// backstop so an admin panel that is reachable over the internet — and whose
+// session can read every stored upstream key — does not depend on a single
+// browser-side mechanism. A request with no Origin at all is allowed: curl and
+// the gateway's own tooling send none, and a browser that omits it cannot have
+// been driven cross-site.
+func sameOrigin(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			h.ServeHTTP(w, r)
+			return
+		}
+		origin := r.Header.Get("Origin")
+		if origin != "" && origin != requestOrigin(r) {
+			slog.Warn("rejected cross-origin dashboard request", "origin", origin, "path", r.URL.Path)
+			writeErr(w, http.StatusForbidden, "cross-origin request rejected")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// requestOrigin reconstructs this request's own origin (scheme://host), honoring
+// the PaaS TLS terminator's X-Forwarded-Proto the same way endpointInfo does.
+func requestOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		scheme = strings.ToLower(strings.TrimSpace(strings.SplitN(p, ",", 2)[0]))
+	}
+	return scheme + "://" + r.Host
+}
+
+// validateID constrains user-chosen provider/combo IDs. They appear in URLs, log
+// filters and request bodies, so an unconstrained value (encoded slashes, quotes,
+// "..") produced permanent oddities and, before the test bodies were built with
+// a marshaller, could rewrite the JSON sent upstream.
+func validateID(kind, id string) string {
+	if id == "" {
+		return kind + " id is required"
+	}
+	if len(id) > 64 {
+		return kind + " id must be at most 64 characters"
+	}
+	for _, c := range id {
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == ':'
+		if !ok {
+			return fmt.Sprintf("invalid %s id %q: use only letters, digits, '-', '_', '.' and ':'", kind, id)
+		}
+	}
+	return ""
+}
 
 // --- helpers ---
 
@@ -174,6 +239,27 @@ func (api *apiHandlers) createProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.ID == "" || p.BaseURL == "" || p.Model == "" {
 		writeErr(w, 400, "id, base_url and model are required")
+		return
+	}
+	if msg := validateID("provider", p.ID); msg != "" {
+		writeErr(w, 400, msg)
+		return
+	}
+	// A POST is a create: SaveProviderWithAccounts upserts, so without this a
+	// duplicate ID silently overwrote a working provider AND replaced its whole
+	// account pool, while still answering 201.
+	if api.d.Reg.GetProvider(p.ID) != nil {
+		writeErr(w, 409, "a provider with this id already exists")
+		return
+	}
+	// A combo and a provider sharing an ID is unresolvable on /v1: the combo wins
+	// and silently shadows the provider with no warning anywhere.
+	if api.d.Reg.GetCombo(p.ID) != nil {
+		writeErr(w, 409, "a combo already uses this id")
+		return
+	}
+	if err := proxy.ValidateBaseURL(p.BaseURL, api.d.Env.AllowPrivateBaseURL); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if p.Weight < 1 {
@@ -259,6 +345,10 @@ func (api *apiHandlers) updateProvider(w http.ResponseWriter, r *http.Request) {
 	// base_url/model would silently break its endpoint.
 	if p.BaseURL == "" || p.Model == "" {
 		writeErr(w, 400, "base_url and model are required")
+		return
+	}
+	if err := proxy.ValidateBaseURL(p.BaseURL, api.d.Env.AllowPrivateBaseURL); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if p.Weight < 1 {
@@ -386,6 +476,10 @@ func (api *apiHandlers) updateProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *apiHandlers) deleteProxy(w http.ResponseWriter, r *http.Request) {
+	if api.getProxyEntry(r.PathValue("id")) == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
 	if err := api.d.Store.DeleteProxy(r.PathValue("id")); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -394,13 +488,38 @@ func (api *apiHandlers) deleteProxy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "deleted"})
 }
 
+// deleteProvider 404s on an unknown id rather than reporting a successful delete
+// of nothing. Mirrors the PUT handlers, and matters because the SPA cannot tell
+// the difference otherwise — a delete aimed at the wrong id looked like a success
+// at every layer.
 func (api *apiHandlers) deleteProvider(w http.ResponseWriter, r *http.Request) {
+	if api.d.Reg.GetProvider(r.PathValue("id")) == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
 	if err := api.d.Store.DeleteProvider(r.PathValue("id")); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	api.reload()
 	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// testBody builds the probe request sent through the proxy pipeline. Marshalled,
+// never concatenated: a provider/combo id containing a quote used to inject
+// arbitrary keys into this JSON (including "stream" and a larger "max_tokens",
+// defeating the deliberately minimal probe).
+func testBody(model string) string {
+	b, err := json.Marshal(map[string]any{
+		"model":      model,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": 1,
+		"stream":     false,
+	})
+	if err != nil {
+		return `{}`
+	}
+	return string(b)
 }
 
 // testProvider sends a minimal chat-completions through the proxy pipeline.
@@ -410,8 +529,7 @@ func (api *apiHandlers) testProvider(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	body := `{"model":"` + p.ID + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`
-	res := api.runTest(body, registry.EndpointChatCompletions)
+	res := api.runTest(testBody(p.ID), registry.EndpointChatCompletions)
 	writeJSON(w, 200, res)
 }
 
@@ -421,8 +539,7 @@ func (api *apiHandlers) testCombo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	body := `{"model":"` + id + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`
-	res := api.runTest(body, registry.EndpointChatCompletions)
+	res := api.runTest(testBody(id), registry.EndpointChatCompletions)
 	writeJSON(w, 200, res)
 }
 
@@ -433,6 +550,14 @@ type testResult struct {
 	Error        string `json:"error,omitempty"`
 }
 
+// runTest drives a real request through the whole proxy pipeline, so it records
+// health, can trigger smart heals, and writes a request_log row exactly like
+// live traffic. That fidelity is the point of the button, but it does mean a test
+// against a rate-limited key puts that key into cooldown for real.
+//
+// ProviderUsed is recovered from the log row the request just wrote — for a combo
+// test "which member actually served this" is the single most useful result, and
+// it was previously declared and never filled in.
 func (api *apiHandlers) runTest(body string, endpoint string) testResult {
 	req, err := http.NewRequest("POST", "http://internal"+proxyPathFor(endpoint), strings.NewReader(body))
 	if err != nil {
@@ -444,8 +569,11 @@ func (api *apiHandlers) runTest(body string, endpoint string) testResult {
 	api.d.Proxy.ServeHTTP(rec, req, endpoint)
 	lat := time.Since(start).Milliseconds()
 	res := testResult{Status: rec.status(), LatencyMs: lat, Error: rec.errorString()}
-	// Extract provider_used from the log row just written — simpler: derive from response header
-	// We can't easily know which upstream served, so skip for provider test; for combo test we log it async.
+	// Log writes are fire-and-forget; drain them so the row is queryable.
+	api.d.Proxy.WaitLogs()
+	if rows, err := api.d.Store.QueryLogs(config.LogFilter{Limit: 1}); err == nil && len(rows) == 1 {
+		res.ProviderUsed = rows[0].ProviderUsed
+	}
 	return res
 }
 
@@ -458,6 +586,13 @@ func (api *apiHandlers) listUpstreamModels(w http.ResponseWriter, r *http.Reques
 	}
 	if err := decodeJSON(r, &req); err != nil || req.BaseURL == "" {
 		writeErr(w, 400, "base_url required")
+		return
+	}
+	// This endpoint dispatches to a caller-supplied URL and echoes the upstream
+	// response back, so an unvalidated base_url is a network probe with a
+	// convenient oracle. Same validation as saving a provider.
+	if err := proxy.ValidateBaseURL(req.BaseURL, api.d.Env.AllowPrivateBaseURL); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	ids, err := fetchModelIDs(req.BaseURL, req.AuthKey)
@@ -764,6 +899,21 @@ func (api *apiHandlers) createCombo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "id required")
 		return
 	}
+	if msg := validateID("combo", c.ID); msg != "" {
+		writeErr(w, 400, msg)
+		return
+	}
+	// UpsertCombo upserts, so a duplicate POST silently replaced an existing
+	// combo's whole member list while answering 201.
+	if api.d.Reg.GetCombo(c.ID) != nil {
+		writeErr(w, 409, "a combo with this id already exists")
+		return
+	}
+	// A combo shadows a same-ID provider on /v1 with no warning anywhere.
+	if api.d.Reg.GetProvider(c.ID) != nil {
+		writeErr(w, 409, "a provider already uses this id")
+		return
+	}
 	if c.Rotation == "" {
 		c.Rotation = string(config.RoundRobin)
 	}
@@ -851,6 +1001,10 @@ func (api *apiHandlers) validateCombo(c comboPayload) string {
 }
 
 func (api *apiHandlers) deleteCombo(w http.ResponseWriter, r *http.Request) {
+	if api.d.Reg.GetCombo(r.PathValue("id")) == nil {
+		writeErr(w, 404, "not found")
+		return
+	}
 	if err := api.d.Store.DeleteCombo(r.PathValue("id")); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -900,7 +1054,10 @@ func (api *apiHandlers) listLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *apiHandlers) logsChart(w http.ResponseWriter, r *http.Request) {
-	hours := atoi(r.URL.Query().Get("hours"), 24)
+	// Clamp like listLogs: a negative value put the cutoff in the FUTURE, so the
+	// chart came back empty with no error to explain it, and a huge one scanned
+	// the whole table for the same empty result.
+	hours := min(max(atoi(r.URL.Query().Get("hours"), 24), 1), 24*90)
 	data, err := api.d.Store.RequestsPerHour(hours)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -997,6 +1154,15 @@ func (api *apiHandlers) endpointInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// writableSettings are the keys the dashboard may set. Without an allowlist any
+// key/value was accepted, including the reserved "failban:state" — a PUT could
+// wipe the persisted brute-force ban state that guards the login page.
+var writableSettings = map[string]bool{
+	"health.cooldown":    true,
+	"health.error_codes": true,
+	"log.retention_days": true,
+}
+
 func (api *apiHandlers) updateSettings(w http.ResponseWriter, r *http.Request) {
 	var m map[string]string
 	if err := decodeJSON(r, &m); err != nil {
@@ -1004,10 +1170,37 @@ func (api *apiHandlers) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for k, v := range m {
-		if err := api.d.Store.SetSetting(k, v); err != nil {
-			writeErr(w, 500, err.Error())
+		if !writableSettings[k] {
+			writeErr(w, 400, fmt.Sprintf("setting %q is not writable", k))
 			return
 		}
+		// Validate here rather than relying on the readers' silent fallbacks, so a
+		// typo is reported instead of quietly ignored at load time.
+		switch k {
+		case "health.cooldown", "log.retention_days":
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || n <= 0 {
+				writeErr(w, 400, fmt.Sprintf("%s must be a positive integer, got %q", k, v))
+				return
+			}
+		case "health.error_codes":
+			for _, part := range strings.Split(v, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				if n, err := strconv.Atoi(part); err != nil || n < 100 || n > 599 {
+					writeErr(w, 400, fmt.Sprintf("health.error_codes must be comma-separated HTTP status codes, got %q", part))
+					return
+				}
+			}
+		}
+	}
+	// One transaction: a per-key loop left an unpredictable subset committed when a
+	// later key failed while the UI reported that nothing was saved.
+	if err := api.d.Store.SetSettings(m); err != nil {
+		writeErr(w, 500, err.Error())
+		return
 	}
 	api.reload()
 	writeJSON(w, 200, map[string]string{"status": "saved"})

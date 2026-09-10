@@ -229,7 +229,7 @@ function providerTable() {
       <td>${p.responses_native ? '<span class="pill-ok">native</span>' : '<span class="muted">translated</span>'}</td>
       <td><button class="btn sm ${p.enabled ? '' : 'ghost'}" onclick="toggleProvider(${jsq(p.id)})">${p.enabled ? 'On' : 'Off'}</button></td>
       <td style="white-space:nowrap;text-align:right">
-        <button class="btn sm ghost" onclick="testProvider(${jsq(p.id)})">Test</button>
+        <button class="btn sm ghost" onclick="testProvider(event, ${jsq(p.id)})">Test</button>
         <button class="btn sm ghost" onclick="showProviderForm(${jsq(p.id)})">Edit</button>
         <button class="btn sm danger" onclick="deleteProvider(${jsq(p.id)})">Del</button>
       </td></tr>`).join('') + `</tbody></table>`;
@@ -252,19 +252,34 @@ async function toggleProvider(id) {
 
 async function deleteProvider(id) {
   if (!confirm('Delete provider "' + id + '"? Combos referencing it will drop that member.')) return;
-  await api.del('/providers/' + encodeURIComponent(id));
+  // Without the catch a failed delete rejected silently: no alert, and the row
+  // stayed on screen, so the user believed the delete had worked.
+  try {
+    await api.del('/providers/' + encodeURIComponent(id));
+  } catch (e) { alert('Delete failed: ' + e.message); return; }
   state.providers = state.providers.filter(x => x.id !== id);
   $('#providerTable').innerHTML = providerTable();
   cancelProviderForm();
 }
 
-async function testProvider(id) {
-  const btn = event.target; btn.disabled = true; btn.textContent = '…';
+async function testProvider(ev, id) {
+  const btn = ev && ev.target;
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
     const res = await api.post('/providers/' + encodeURIComponent(id) + '/test');
-    alert(res.error ? 'Test failed (' + res.status + '): ' + res.error : 'OK — status ' + res.status + ' in ' + res.latency_ms + 'ms');
+    alert(testResultMessage(res));
   } catch (e) { alert('Test error: ' + e.message); }
-  finally { btn.disabled = false; btn.textContent = 'Test'; }
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
+}
+
+// testResultMessage renders the INNER result. The outer /test call always answers
+// 200 with the real outcome in the body, so the inner failure is only visible
+// here — and provider_used names which member actually served a combo test.
+function testResultMessage(res) {
+  const via = res.provider_used ? ' via ' + res.provider_used : '';
+  if (res.error) return 'Test failed (' + res.status + ')' + via + ': ' + res.error;
+  return 'OK — status ' + res.status + via + ' in ' + res.latency_ms + 'ms';
 }
 
 function showProviderForm(id) {
@@ -481,7 +496,7 @@ function comboTable() {
       <td class="small">${(c.members || []).map(m => `<span class="chip">${esc(memberLabel(m))}</span>`).join('')}</td>
       <td><button class="btn sm ${c.enabled ? '' : 'ghost'}" onclick="toggleCombo(${jsq(c.id)})">${c.enabled ? 'On' : 'Off'}</button></td>
       <td style="white-space:nowrap;text-align:right">
-        <button class="btn sm ghost" onclick="testCombo(${jsq(c.id)})">Test</button>
+        <button class="btn sm ghost" onclick="testCombo(event, ${jsq(c.id)})">Test</button>
         <button class="btn sm ghost" onclick="showComboForm(${jsq(c.id)})">Edit</button>
         <button class="btn sm danger" onclick="deleteCombo(${jsq(c.id)})">Del</button>
       </td></tr>`).join('') + `</tbody></table>`;
@@ -489,27 +504,34 @@ function comboTable() {
 
 async function toggleCombo(id) {
   const c = state.combos.find(x => x.id === id);
+  if (!c) return;
   const next = { ...c, enabled: !c.enabled, proxy_rotate: !!c.proxy_rotate };
-  await api.put('/combos/' + encodeURIComponent(id), next);
-  state.combos = await api.get('/combos');
+  try {
+    await api.put('/combos/' + encodeURIComponent(id), next);
+    state.combos = await api.get('/combos');
+  } catch (e) { alert('Toggle failed: ' + e.message); }
   $('#comboTable').innerHTML = comboTable();
 }
 
 async function deleteCombo(id) {
   if (!confirm('Delete combo "' + id + '"?')) return;
-  await api.del('/combos/' + encodeURIComponent(id));
+  try {
+    await api.del('/combos/' + encodeURIComponent(id));
+  } catch (e) { alert('Delete failed: ' + e.message); return; }
   state.combos = state.combos.filter(x => x.id !== id);
   $('#comboTable').innerHTML = comboTable();
   cancelComboForm();
 }
 
-async function testCombo(id) {
-  const btn = event.target; btn.disabled = true; btn.textContent = '…';
+async function testCombo(ev, id) {
+  const btn = ev && ev.target;
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
     const res = await api.post('/combos/' + encodeURIComponent(id) + '/test');
-    alert(res.error ? 'Test failed (' + res.status + '): ' + res.error : 'OK — status ' + res.status + ' in ' + res.latency_ms + 'ms');
+    alert(testResultMessage(res));
   } catch (e) { alert('Test error: ' + e.message); }
-  finally { btn.disabled = false; btn.textContent = 'Test'; }
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
 
 // memberLabel renders a combo member as "provider[key] → model", tolerating both
@@ -766,7 +788,9 @@ async function toggleProxy(id) {
 
 async function deleteProxy(id) {
   if (!confirm('Delete proxy "' + id + '"? Providers/combos using the pool keep working — they fall back to direct dial.')) return;
-  await api.del('/proxies/' + encodeURIComponent(id));
+  try {
+    await api.del('/proxies/' + encodeURIComponent(id));
+  } catch (e) { alert('Delete failed: ' + e.message); return; }
   state.proxies = (state.proxies || []).filter(x => x.id !== id);
   $('#proxyTable').innerHTML = proxyTable();
   cancelProxyForm();
@@ -815,7 +839,13 @@ async function renderLogs() {
   } catch (e) { if (seq === state.renderSeq) app.innerHTML = errBox(e); }
 }
 
-async function applyLogFilter() { logFilter.offset = 0; await loadLogs(); }
+// A failed reload must not leave the pager advertising a page that was never
+// loaded, and must say so instead of rejecting silently.
+async function applyLogFilter() {
+  const prev = logFilter.offset;
+  logFilter.offset = 0;
+  try { await loadLogs(); } catch (e) { logFilter.offset = prev; alert('Could not load logs: ' + e.message); }
+}
 
 function toggleLogAutoRefresh() {
   state.logAutoRefresh = !state.logAutoRefresh;
@@ -876,7 +906,11 @@ function renderLogTable(data) {
   $('#logPager').innerHTML = pager;
 }
 
-async function gotoLogPage(p) { logFilter.offset = p * logFilter.limit; await loadLogs(); }
+async function gotoLogPage(p) {
+  const prev = logFilter.offset;
+  logFilter.offset = p * logFilter.limit;
+  try { await loadLogs(); } catch (e) { logFilter.offset = prev; alert('Could not load page: ' + e.message); }
+}
 
 async function drawChart() {
   // Self-contained failure: a chart hiccup (or a missing canvas after the user

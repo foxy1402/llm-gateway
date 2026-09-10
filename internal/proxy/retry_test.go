@@ -188,7 +188,7 @@ func TestUnsupportedEndpointSkipped(t *testing.T) {
 	px, reg := setupRotationEnv(t, provs, combo)
 
 	// a doesn't support completions.
-	reg.Health().MarkUnsupportedCompletions("a")
+	reg.Health().MarkUnsupported("a", registry.EndpointCompletions)
 
 	plan := planFor(px, &combo, registry.EndpointCompletions)
 	if pid := pidOf(plan.next(reg, map[string]bool{}, map[string]bool{})); pid != "b" {

@@ -100,6 +100,16 @@ func (p *Proxy) tryResponsesRerouteHeal(ctx context.Context, client *http.Client
 		return resp, reqBody, "", false
 	}
 
+	// The reroute is now committed, so the original chat-completions rejection is
+	// superseded and nobody downstream can reach it: ServeHTTP replaces resp with
+	// finalResp, whose Body is an in-memory NopCloser. healPeek only consumed the
+	// first few KiB, so without this the transport connection is never released
+	// back to the pool — one leaked socket per rerouted request, and this heal
+	// deliberately keeps no learned cache, so every tool call pays it. Closing
+	// must happen here and not before the bail-outs above, which hand resp back
+	// to the caller's ladder still readable.
+	resp.Body.Close()
+
 	finalResp := &http.Response{StatusCode: 200, Header: http.Header{}}
 	if wantStream {
 		finalResp.Body = io.NopCloser(bytes.NewReader(chatResponseToSingleShotSSE(chatBody)))

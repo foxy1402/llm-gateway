@@ -6,9 +6,12 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"time"
 )
 
@@ -24,6 +27,39 @@ const (
 // per-request header timeout: long coding generations can legitimately idle for
 // tens of seconds between tokens, but a multi-minute silence means a hung upstream.
 const streamStallTimeout = 90 * time.Second
+
+// postDoneUsageWait is how long to keep reading after the [DONE] sentinel purely
+// to collect a trailing usage frame. Several providers emit usage AFTER the
+// sentinel, and returning the instant we see [DONE] logged NULL token counts for
+// them. Nothing read here is forwarded — [DONE] is terminal for the client — so
+// this only ever costs a frame that is already in flight.
+const postDoneUsageWait = 250 * time.Millisecond
+
+// errClientWriteFailed marks a stream that ended because writing to the CLIENT
+// failed (it hung up mid-response). Like a context cancel, this is not the
+// upstream's fault and must not cool down the account.
+var errClientWriteFailed = errors.New("client write failed mid-stream")
+
+// ssePayload extracts the data-field value from one SSE line. Per the SSE spec
+// the colon may be followed by an optional space, so matching only "data: "
+// (with the space) missed the equally legal "data:[DONE]" form — such a stream
+// was treated as an unparsed comment, so the sentinel was never recognized, the
+// loop waited for an EOF the upstream never sent, and the stall timer eventually
+// marked a perfectly healthy account failed.
+func ssePayload(line []byte) ([]byte, bool) {
+	trimmed := bytes.TrimRight(line, "\r\n")
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return nil, false
+	}
+	return bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:"))), true
+}
+
+// isDoneSentinel reports whether an SSE data payload is the terminal sentinel.
+// Compared case-insensitively: "[done]" is seen in the wild and missing it has
+// the same account-poisoning consequence described on ssePayload.
+func isDoneSentinel(payload []byte) bool {
+	return bytes.EqualFold(payload, []byte("[DONE]"))
+}
 
 // streamResponse copies an upstream SSE stream to the client, translating
 // chat-completions deltas to responses-format events when requested.
@@ -54,6 +90,15 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Defensive: a synthetic response assembled by a heal could omit either field,
+	// and both would panic below (WriteHeader rejects 0; a nil body nil-derefs).
+	if upstream.Body == nil {
+		upstream.Body = http.NoBody
+	}
+	status := upstream.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
 	// SSE headers.
 	// Note: if translate is false, we forward chat-completions stream bytes as-is.
 	h := w.Header()
@@ -61,7 +106,7 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	w.WriteHeader(upstream.StatusCode)
+	w.WriteHeader(status)
 
 	// Flush via ResponseController so wrapping middleware (the request logger's
 	// statusWriter, the fail-ban statusCapture) can never silently swallow
@@ -111,6 +156,19 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 	go func() {
+		// A panic in the transport's Read (seen with some HTTP/2 + proxy stacks on
+		// a torn-down connection) would otherwise kill the whole gateway. Contain it
+		// and hand the reader loop a synthetic error so it terminates the stream
+		// immediately instead of idling until the 90s stall timer fires.
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("panic reading upstream stream", "panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+				select {
+				case readCh <- readResult{err: fmt.Errorf("panic reading upstream stream: %v", rec)}:
+				case <-doneCh:
+				}
+			}
+		}()
 		for {
 			line, err := src.ReadBytes('\n')
 			select {
@@ -132,6 +190,81 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	// function_call events when [DONE] arrives.
 	toolOrder := []int{}
 	toolBuf := map[int]*bufferedToolCall{}
+
+	// flush writes whatever has accumulated to the client. A failed write means the
+	// client is gone: previously the error was discarded, so the gateway drained the
+	// entire upstream generation (paying for every token) and reported success.
+	flush := func() error {
+		if out.Len() == 0 {
+			return nil
+		}
+		if _, err := w.Write(out.Bytes()); err != nil {
+			return fmt.Errorf("%w: %v", errClientWriteFailed, err)
+		}
+		out.Reset()
+		_ = rc.Flush()
+		return nil
+	}
+
+	// emitTerminal writes the responses-format terminal events (buffered tool calls
+	// followed by response.completed). Shared by the [DONE] path and the clean-EOF
+	// path: a provider that closes the body instead of sending the sentinel used to
+	// get neither, silently dropping every buffered tool call and leaving a strict
+	// Responses client waiting forever for response.completed.
+	emitTerminal := func() {
+		if !translate || format != StreamFormatResponses {
+			return
+		}
+		writeFunctionCallEvents(&out, toolOrder, toolBuf)
+		completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage, functionCallOutputItems(toolOrder, toolBuf))
+		out.WriteString("event: response.completed\n")
+		out.WriteString("data: ")
+		out.Write(completed)
+		out.WriteString("\n\n")
+	}
+
+	// absorbUsage records token counts from one chunk, keeping already-captured
+	// values when a later frame reports nothing.
+	absorbUsage := func(payload []byte) {
+		pt, ct, cached := extractChunkUsage(payload)
+		if pt != nil {
+			promptTokens = pt
+		}
+		if ct != nil {
+			completionTokens = ct
+		}
+		if cached != nil {
+			cachedTokens = cached
+		}
+	}
+
+	// drainPostDoneUsage keeps reading briefly after the sentinel to catch a
+	// trailing usage frame. See postDoneUsageWait.
+	drainPostDoneUsage := func() {
+		if promptTokens != nil && completionTokens != nil {
+			return // already have counts; nothing worth waiting for
+		}
+		deadline := time.NewTimer(postDoneUsageWait)
+		defer deadline.Stop()
+		for {
+			select {
+			case rr := <-readCh:
+				if payload, ok := ssePayload(rr.line); ok && !isDoneSentinel(payload) {
+					absorbUsage(payload)
+					if promptTokens != nil && completionTokens != nil {
+						return
+					}
+				}
+				if rr.err != nil {
+					return
+				}
+			case <-deadline.C:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 
 	for {
 		var rr readResult
@@ -163,101 +296,91 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 		}
 		line, err := rr.line, rr.err
 		if len(line) > 0 {
-			trimmed := bytes.TrimRight(line, "\r\n")
-			if bytes.HasPrefix(trimmed, []byte("data: ")) {
-				payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+			if payload, isData := ssePayload(line); isData {
 				// #12: extract usage from every chunk before translation. Upstream
 				// chunks are always chat-completions format (prompt_tokens/completion_tokens),
 				// even when we later translate them to the responses shape for the client.
-				if pt, ct, cached := extractChunkUsage(payload); pt != nil || ct != nil || cached != nil {
-					if pt != nil {
-						promptTokens = pt
-					}
-					if ct != nil {
-						completionTokens = ct
-					}
-					if cached != nil {
-						cachedTokens = cached
-					}
-				}
-				if bytes.Equal(payload, []byte("[DONE]")) {
+				absorbUsage(payload)
+				if isDoneSentinel(payload) {
 					if translate && format == StreamFormatResponses {
-						// Emit buffered tool calls as function_call events…
-						writeFunctionCallEvents(&out, toolOrder, toolBuf)
-						// …then the terminal response.completed carrying them in
-						// the output array.
-						completed := buildResponseCompleted(respModel, lastUsage, &lastUsageDetails, sawUsage, functionCallOutputItems(toolOrder, toolBuf))
-						out.WriteString("event: response.completed\n")
-						out.WriteString("data: ")
-						out.Write(completed)
-						out.WriteString("\n\n")
+						emitTerminal()
 					} else {
 						out.Write(line)
+						// Terminate the final event with its blank separator line: the
+						// sentinel's own trailing newline arrives as a SEPARATE read that
+						// the return below never consumes, so a strict SSE parser would
+						// see an unterminated event.
+						if !bytes.HasSuffix(line, []byte("\n\n")) {
+							out.WriteString("\n")
+						}
 					}
-					// Flush accumulated bytes.
-					if out.Len() > 0 {
-						_, _ = w.Write(out.Bytes())
-						out.Reset()
-						_ = rc.Flush()
+					if ferr := flush(); ferr != nil {
+						return promptTokens, completionTokens, cachedTokens, ferr
 					}
 					// The sentinel is the protocol-level end of stream: stop here
 					// instead of waiting for EOF. Upstreams that keep the connection
 					// open after [DONE] used to hold us until the stall timer fired,
 					// which then marked the account failed for a stream that had
-					// actually completed cleanly. Trailing bytes after the sentinel
-					// are intentionally dropped ([DONE] is terminal per SSE
-					// convention); usage already accumulated above is preserved.
+					// actually completed cleanly. Nothing after the sentinel is
+					// forwarded ([DONE] is terminal per SSE convention), but we do
+					// briefly collect a trailing usage frame for the request log.
+					drainPostDoneUsage()
 					return promptTokens, completionTokens, cachedTokens, nil
-				} else {
-					if translate && format == StreamFormatResponses {
-						translated, model, usage, details, toolDeltas, ok := translateChatChunk(payload)
-						if model != "" {
-							respModel = model
-						}
-						if usage != nil {
-							lastUsage = *usage
-							sawUsage = true
-						}
-						if details != nil {
-							lastUsageDetails = *details
-						}
-						for _, td := range toolDeltas {
-							buf, seen := toolBuf[td.Index]
-							if !seen {
-								buf = &bufferedToolCall{}
-								toolBuf[td.Index] = buf
-								toolOrder = append(toolOrder, td.Index)
-							}
-							if td.ID != "" {
-								buf.id = td.ID
-							}
-							if td.Name != "" {
-								buf.name = td.Name
-							}
-							buf.args += td.Arguments
-						}
-						if ok {
-							for _, evt := range translated {
-								out.WriteString("event: ")
-								out.WriteString(evt.event)
-								out.WriteString("\ndata: ")
-								out.Write(evt.data)
-								out.WriteString("\n\n")
-							}
-						}
-					} else {
-						out.Write(line)
+				}
+				if translate && format == StreamFormatResponses {
+					translated, model, usage, details, toolDeltas, ok := translateChatChunk(payload)
+					if model != "" {
+						respModel = model
 					}
+					if usage != nil {
+						lastUsage = *usage
+						sawUsage = true
+					}
+					if details != nil {
+						lastUsageDetails = *details
+					}
+					for _, td := range toolDeltas {
+						buf, seen := toolBuf[td.Index]
+						if !seen {
+							// Assign the fallback call id ONCE, at buffer creation:
+							// deriving it lazily generated a fresh random id per call
+							// site, so the streamed function_call events and the final
+							// response.completed advertised DIFFERENT call_ids for the
+							// same call and agent clients could not correlate them.
+							buf = &bufferedToolCall{id: td.ID}
+							if buf.id == "" {
+								buf.id = "call_" + randomID()
+							}
+							toolBuf[td.Index] = buf
+							toolOrder = append(toolOrder, td.Index)
+						}
+						if td.ID != "" {
+							buf.id = td.ID
+						}
+						if td.Name != "" {
+							buf.name = td.Name
+						}
+						buf.args += td.Arguments
+					}
+					if ok {
+						for _, evt := range translated {
+							out.WriteString("event: ")
+							out.WriteString(evt.event)
+							out.WriteString("\ndata: ")
+							out.Write(evt.data)
+							out.WriteString("\n\n")
+						}
+					}
+				} else {
+					out.Write(line)
 				}
 			} else {
 				// Comments/keepalive lines — forward as-is.
 				out.Write(line)
 			}
 			// Flush accumulated bytes.
-			if out.Len() > 0 {
-				_, _ = w.Write(out.Bytes())
-				out.Reset()
-				_ = rc.Flush()
+			if ferr := flush(); ferr != nil {
+				return promptTokens, completionTokens, cachedTokens, ferr
 			}
 		}
 		if err != nil {
@@ -269,12 +392,20 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			break
 		}
 	}
+	// Clean EOF with no sentinel: still owe the client the terminal events.
+	emitTerminal()
+	if ferr := flush(); ferr != nil {
+		return promptTokens, completionTokens, cachedTokens, ferr
+	}
 	return promptTokens, completionTokens, cachedTokens, nil
 }
 
 // extractChunkUsage pulls prompt/completion/cached token counts from a single
 // chat-completions SSE chunk's usage block. Returns nil for all when the chunk
-// has no usage.
+// has no usage, or when the usage block carries no actual counts: providers that
+// send `"usage":{}` or an all-zero block on the terminal frame used to CLOBBER
+// the real counts captured from an earlier chunk, logging 0 prompt / 0
+// completion alongside a non-zero cached_tokens. Mirrors extractChatUsage.
 func extractChunkUsage(payload []byte) (*int, *int, *int) {
 	var c struct {
 		Usage *struct {
@@ -288,12 +419,15 @@ func extractChunkUsage(payload []byte) (*int, *int, *int) {
 	if json.Unmarshal(payload, &c) != nil || c.Usage == nil {
 		return nil, nil, nil
 	}
-	pt, ct := c.Usage.PromptTokens, c.Usage.CompletionTokens
 	var cached *int
 	if d := c.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
 		v := d.CachedTokens
 		cached = &v
 	}
+	if c.Usage.PromptTokens <= 0 && c.Usage.CompletionTokens <= 0 {
+		return nil, nil, cached
+	}
+	pt, ct := c.Usage.PromptTokens, c.Usage.CompletionTokens
 	return &pt, &ct, cached
 }
 
@@ -381,8 +515,10 @@ func functionCallOutputItems(order []int, buf map[int]*bufferedToolCall) []any {
 	return items
 }
 
-// toolCallItemIDs derives stable responses-API ids from the chat tool_call id
-// (falling back to a random one when the upstream omitted it).
+// toolCallItemIDs derives the responses-API ids from the chat tool_call id. Pure:
+// the id is assigned once when the bufferedToolCall is created (including the
+// random fallback for upstreams that omit it), so every call site — the streamed
+// function_call events and the terminal response.completed — agrees.
 func toolCallItemIDs(tc *bufferedToolCall) (itemID, callID string) {
 	callID = tc.id
 	if callID == "" {
@@ -410,10 +546,13 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 	var chunk struct {
 		Model   string `json:"model"`
 		Choices []struct {
+			Index int `json:"index"`
 			Delta struct {
-				Role      string `json:"role"`
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Role             string `json:"role"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Refusal          string `json:"refusal"`
+				ToolCalls        []struct {
 					Index    int    `json:"index"`
 					ID       string `json:"id"`
 					Type     string `json:"type"`
@@ -453,12 +592,37 @@ func translateChatChunk(payload []byte) (events []sseEvent, model string, usage 
 		}
 	}
 	for _, ch := range chunk.Choices {
+		// The Responses API has no n>1 equivalent, and its delta events carry no
+		// choice index — emitting every choice interleaved their text into one
+		// indistinguishable stream. Only choice 0 is translated; ResponsesToChatRequest
+		// no longer forwards n upstream, so this should not arise in practice.
+		if ch.Index != 0 {
+			continue
+		}
 		if ch.Delta.Content != "" {
 			b, _ := json.Marshal(map[string]any{
 				"type":  "response.output_text.delta",
 				"delta": ch.Delta.Content,
 			})
 			events = append(events, sseEvent{event: "response.output_text.delta", data: b})
+		}
+		// A refusal is the model's actual answer; without this the client got an
+		// empty response and no explanation. reasoning_content (DeepSeek/Qwen-style)
+		// is surfaced on its own event rather than being merged into the answer text.
+		if ch.Delta.Refusal != "" {
+			b, _ := json.Marshal(map[string]any{
+				"type":    "response.refusal.delta",
+				"delta":   ch.Delta.Refusal,
+				"refusal": ch.Delta.Refusal,
+			})
+			events = append(events, sseEvent{event: "response.refusal.delta", data: b})
+		}
+		if ch.Delta.ReasoningContent != "" {
+			b, _ := json.Marshal(map[string]any{
+				"type":  "response.reasoning_summary_text.delta",
+				"delta": ch.Delta.ReasoningContent,
+			})
+			events = append(events, sseEvent{event: "response.reasoning_summary_text.delta", data: b})
 		}
 		for _, tc := range ch.Delta.ToolCalls {
 			toolDeltas = append(toolDeltas, toolCallDelta{

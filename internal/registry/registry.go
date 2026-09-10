@@ -172,6 +172,11 @@ func (r *Registry) Reload(st *store.Store) error {
 		liveProxies[px.ID] = true
 	}
 	r.health.PruneProxies(liveProxies)
+	// Learned "endpoint unsupported" marks are re-discovered after a reload: they
+	// have no TTL, and a wrong base_url or responses_native flag would otherwise
+	// blacklist an endpoint for the life of the process even after the operator
+	// fixed the configuration. See HealthTracker.ClearUnsupported.
+	r.health.ClearUnsupported()
 	r.wrrMu.Unlock()
 	return nil
 }
@@ -437,17 +442,25 @@ func (r *Registry) SelectWRR(comboID string, eligible func(memberKey string) boo
 	if !ok || len(entries) == 0 {
 		return ""
 	}
+	// Only ELIGIBLE entries accrue credit and contribute to the total. Advancing
+	// every entry while subtracting the total from just the winner let an
+	// ineligible member (cooling down, endpoint-unsupported, already tried this
+	// request) build unbounded credit it never paid back: after a 60s cooldown at
+	// moderate traffic the recovered member had hundreds of credits banked and took
+	// EVERY request until the debt unwound, starving the member that had carried
+	// the load and hammering the key that was just rate-limited. Entry state
+	// survives dashboard saves (Reload preserves it when the member set is
+	// unchanged), so the skew was persistent.
 	total := 0
-	for _, e := range entries {
-		total += e.weight
-	}
 	best := -1
 	for i := range entries {
+		if !eligible(entries[i].key) {
+			continue
+		}
+		total += entries[i].weight
 		entries[i].current += entries[i].weight
-		if eligible(entries[i].key) {
-			if best == -1 || entries[i].current > entries[best].current {
-				best = i
-			}
+		if best == -1 || entries[i].current > entries[best].current {
+			best = i
 		}
 	}
 	if best == -1 {

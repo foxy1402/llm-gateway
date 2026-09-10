@@ -12,6 +12,14 @@ const exportHeader = "-- LLM Gateway Export"
 
 // ExportSQL renders the entire user-editable state as a plain-text SQL dump.
 // The output is FK-safe for import: DELETEs run in dependency order, then INSERTs.
+//
+// Every functional column is covered. The one exception is created_at on
+// providers/provider_accounts/combos/proxies: nothing in the gateway reads it, it
+// is not carried on the config structs, and it defaults to unixepoch() on insert
+// — so a restored backup shows the restore date rather than the original. Note
+// the dump contains provider auth keys, account keys and proxy credentials in
+// plaintext (a backup would be useless without them): treat the file as
+// credential material.
 func (s *Store) ExportSQL() (string, error) {
 	provs, err := s.ListProviders()
 	if err != nil {
@@ -193,6 +201,38 @@ func (s *Store) ImportSQL(sqlText string) error {
 	stmts := splitStatements(sqlText)
 	if len(stmts) == 0 {
 		return &ImportError{Reason: "no statements found"}
+	}
+	// A truncated export — a download cut short, a partial copy/paste — is still
+	// syntactically valid input: the file opens with the header and the seven
+	// unconditional DELETE FROM statements, so importing one wiped every provider,
+	// key, combo and setting and then reported SUCCESS. Require the INSERTs that
+	// are supposed to restore what those DELETEs remove, and require that every
+	// table being cleared is also being repopulated.
+	deleted := map[string]bool{}
+	inserted := map[string]bool{}
+	for _, st := range stmts {
+		fields := strings.Fields(st)
+		if len(fields) < 3 {
+			continue
+		}
+		switch strings.ToUpper(fields[0]) {
+		case "DELETE":
+			if strings.EqualFold(fields[1], "FROM") {
+				deleted[strings.ToLower(fields[2])] = true
+			}
+		case "INSERT":
+			if strings.EqualFold(fields[1], "INTO") {
+				inserted[strings.ToLower(strings.SplitN(fields[2], "(", 2)[0])] = true
+			}
+		}
+	}
+	if len(inserted) == 0 {
+		return &ImportError{Reason: "export contains no INSERT statements — the file looks truncated; refusing to clear the existing configuration"}
+	}
+	// providers is the anchor table: an export that clears it without restoring it
+	// cannot be a complete backup, whatever else the file contains.
+	if deleted["providers"] && !inserted["providers"] {
+		return &ImportError{Reason: "export clears providers but restores none — the file looks truncated; refusing to import"}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {

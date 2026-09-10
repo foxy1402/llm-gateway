@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -69,6 +70,14 @@ func run() error {
 		Addr:              env.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound idle keep-alive connections so a client that opens sockets and goes
+		// away doesn't hold them indefinitely. Deliberately NO WriteTimeout: it is
+		// absolute per response and would kill long SSE generations mid-stream (the
+		// per-chunk stall detector in stream.go is the right watchdog there). Also no
+		// ReadTimeout, because a legitimate 25 MiB vision upload on a slow link would
+		// trip it; ReadHeaderTimeout covers the slowloris case.
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	errCh := make(chan error, 1)
@@ -94,9 +103,17 @@ func run() error {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
 	shutdownErr := srv.Shutdown(shutdownCtx)
-	// All handlers have returned by now, but p.log fires its SQLite writes
-	// fire-and-forget — drain them so the final requests' logs actually land
-	// before the process exits.
+	if shutdownErr != nil {
+		// Graceful drain hit the 10s deadline, so handlers are STILL running — a
+		// long SSE stream is the normal cause. Shutdown does not touch those
+		// connections, so without Close they would keep serving while we tear the
+		// store down underneath them. Force them shut so WaitLogs below actually
+		// waits for a bounded set of writes instead of racing new ones.
+		slog.Warn("graceful shutdown deadline exceeded, forcing connections closed", "err", shutdownErr)
+		_ = srv.Close()
+	}
+	// p.log fires its SQLite writes fire-and-forget — drain them so the final
+	// requests' logs actually land before the process exits.
 	px.WaitLogs()
 	return shutdownErr
 }
@@ -106,6 +123,15 @@ func run() error {
 func startLogPruner(st *store.Store) func() {
 	stop := make(chan struct{})
 	go func() {
+		// A panic on this background goroutine would take the whole gateway down
+		// with it — and log retention is the least important thing running. Contain
+		// it: the ticker dies, request serving does not.
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("log pruner panicked, retention disabled until restart",
+					"panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			}
+		}()
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		prune := func() {

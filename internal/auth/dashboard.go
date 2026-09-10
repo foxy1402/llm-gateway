@@ -99,12 +99,18 @@ func (d *Dashboard) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 			d.mu.Unlock()
 		}
 	}
+	// Attribute-for-attribute match with the login cookie (minus the value):
+	// browsers may refuse to overwrite a Secure cookie with a non-Secure one, and a
+	// mismatched SameSite can leave the original in place. The server-side session
+	// is already gone above, so this is belt-and-braces rather than the trust root.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/dashboard",
 		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
+		Secure:   d.secureCookie(r),
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

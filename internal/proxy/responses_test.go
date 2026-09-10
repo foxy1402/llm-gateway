@@ -181,10 +181,16 @@ func TestResponsesTranslationPreservesAdvancedFields(t *testing.T) {
 	}
 	var m map[string]json.RawMessage
 	json.Unmarshal(out, &m)
-	for _, k := range []string{"tools", "tool_choice", "parallel_tool_calls", "response_format", "logit_bias", "stop", "n", "seed", "user", "temperature", "top_p", "frequency_penalty", "presence_penalty"} {
+	for _, k := range []string{"tools", "tool_choice", "parallel_tool_calls", "response_format", "logit_bias", "stop", "seed", "user", "temperature", "top_p", "frequency_penalty", "presence_penalty"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("missing passthrough field %q", k)
 		}
+	}
+	// "n" is deliberately NOT forwarded: it is not a Responses-API field, and
+	// ChatToResponsesResponse only ever reads choices[0], so any n>1 would be
+	// billed upstream and discarded here.
+	if _, ok := m["n"]; ok {
+		t.Error("n must not be forwarded to chat-completions")
 	}
 	if _, ok := m["max_tokens"]; !ok {
 		t.Error("max_output_tokens not mapped to max_tokens")

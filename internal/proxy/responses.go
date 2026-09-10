@@ -141,7 +141,26 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 					// chat-completions equivalent; skip rather than emit a ghost
 					// message with empty content.
 					slog.Warn("dropping item_reference input item (server-side items have no chat-completions equivalent)")
-				default: // "", "message", or anything else carrying role/content
+				default:
+					// Any other Responses-only item ("reasoning", "web_search_call",
+					// "file_search_call", "computer_call", "code_interpreter_call",
+					// "mcp_call", "image_generation_call", …). These carry no role and
+					// no content, so the old catch-all turned each one into a ghost
+					// {role:"user", content:""} message — strict upstreams 400 an empty
+					// user turn, and lenient ones let the empty message displace real
+					// conversation context.
+					//
+					// An unrecognized type that DOES carry a role is still a
+					// conversation turn (a vendor extension or a spec addition we
+					// don't know yet), so fall through to the message path rather
+					// than discarding the user's actual text.
+					if _, hasRole := item["role"]; !hasRole {
+						slog.Warn("dropping responses input item with no chat-completions equivalent", "type", typ)
+						continue
+					}
+					slog.Warn("translating unrecognized responses input item as a message (it carries a role)", "type", typ)
+					fallthrough
+				case "", "message":
 					role := "user"
 					if r, ok := item["role"]; ok {
 						_ = json.Unmarshal(r, &role)
@@ -158,8 +177,9 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 						if err := json.Unmarshal(c, &cs); err == nil {
 							content = cs
 						} else {
-							// Array of {type:"input_text"|"text",text} or
-							// {type:"input_image",image_url,detail} parts.
+							// Array of {type:"input_text"|"text",text},
+							// {type:"input_image",image_url,detail} or
+							// {type:"input_audio",input_audio} parts.
 							var parts []map[string]json.RawMessage
 							if err := json.Unmarshal(c, &parts); err == nil {
 								content = translateContentParts(parts)
@@ -196,7 +216,7 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 	for _, key := range []string{
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"parallel_tool_calls",
-		"response_format", "logit_bias", "stop", "n", "seed", "user",
+		"response_format", "logit_bias", "stop", "seed", "user",
 		"metadata", "service_tier",
 	} {
 		if v, ok := in[key]; ok {
@@ -225,6 +245,13 @@ func ResponsesToChatRequest(body []byte, upstreamModel string) ([]byte, error) {
 		if _, ok := in[key]; ok {
 			slog.Warn("responses->chat translation drops field with no chat-completions equivalent", "field", key)
 		}
+	}
+	// "n" is NOT a Responses-API field. A client that sends it is either confused
+	// or replaying a chat body; forwarding it would multiply the upstream bill by n
+	// while ChatToResponsesResponse only ever reads choices[0], so the extra
+	// completions are paid for and thrown away.
+	if _, ok := in["n"]; ok {
+		slog.Warn("dropping non-Responses field \"n\" (extra choices would be billed and discarded)")
 	}
 	if v, ok := in["max_output_tokens"]; ok {
 		out["max_tokens"] = v
@@ -328,32 +355,33 @@ func convertResponsesToolChoiceToChat(raw json.RawMessage) json.RawMessage {
 }
 
 // translateContentParts converts a Responses-API content-part array (input_text
-// / input_image parts) into either:
+// / input_image / input_audio parts) into either:
 //   - a plain concatenated string, when every part is text — matches the
 //     pre-existing legacy behavior so text-only messages still produce the
 //     simple chat-completions string form callers/tests expect, or
 //   - a chat-completions-style content ARRAY (text parts as
 //     {"type":"text","text":...}, images as
-//     {"type":"image_url","image_url":{"url":...}}), when any part is an
-//     input_image — this is what keeps vision/OCR requests from silently
-//     losing their image when routed through /v1/responses to a provider
-//     that only speaks chat-completions natively.
+//     {"type":"image_url","image_url":{"url":...}}, audio as
+//     {"type":"input_audio","input_audio":{"data":...,"format":...}}), when any
+//     part is an input_image or input_audio — this is what keeps vision/OCR and
+//     audio requests from silently losing their attachment when routed through
+//     /v1/responses to a provider that only speaks chat-completions natively.
 //
 // Responses-API image parts carry image_url as a bare string (URL or base64
 // data URL); chat-completions nests it under image_url.url — see
 // https://developers.openai.com/api/docs/guides/images-vision.
 func translateContentParts(parts []map[string]json.RawMessage) any {
-	hasImage := false
+	multimodal := false
 	for _, part := range parts {
 		if t, ok := part["type"]; ok {
 			var typ string
-			if json.Unmarshal(t, &typ) == nil && typ == "input_image" {
-				hasImage = true
+			if json.Unmarshal(t, &typ) == nil && (typ == "input_image" || typ == "input_audio") {
+				multimodal = true
 				break
 			}
 		}
 	}
-	if !hasImage {
+	if !multimodal {
 		text := ""
 		for _, part := range parts {
 			if t, ok := part["text"]; ok {
@@ -395,6 +423,18 @@ func translateContentParts(parts []map[string]json.RawMessage) any {
 				}
 			}
 			out = append(out, map[string]any{"type": "image_url", "image_url": imageURL})
+			continue
+		}
+		if typ == "input_audio" {
+			// Both APIs spell audio the same way — {"type":"input_audio",
+			// "input_audio":{"data":<base64>,"format":"wav"|"mp3"}} — so the part
+			// forwards verbatim. Without this branch the audio was dropped and the
+			// model was asked to transcribe silence.
+			if a, ok := part["input_audio"]; ok && len(a) > 0 {
+				out = append(out, map[string]any{"type": "input_audio", "input_audio": json.RawMessage(a)})
+				continue
+			}
+			slog.Warn("dropping input_audio part with no input_audio payload")
 			continue
 		}
 		// input_text / text (and anything else carrying a plain "text" field).
@@ -449,9 +489,15 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
-				Role      string          `json:"role"`
-				Content   json.RawMessage `json:"content"`
-				ToolCalls []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+				// Refusal carries a safety decline while content is null; without it
+				// the translated response was an empty assistant message and the
+				// client had no idea why. ReasoningContent is the de-facto
+				// chain-of-thought field on DeepSeek-R1-style upstreams.
+				Refusal          string `json:"refusal"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
@@ -477,8 +523,12 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 	}
 
 	text := ""
+	refusal := ""
+	reasoning := ""
 	if len(chat.Choices) > 0 {
 		text = extractChatMessageText(chat.Choices[0].Message.Content)
+		refusal = chat.Choices[0].Message.Refusal
+		reasoning = chat.Choices[0].Message.ReasoningContent
 	}
 	created := chat.Created
 	if created == 0 {
@@ -495,6 +545,29 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 	// there is text. Dropping tool_calls here is what made agent clients on
 	// /v1/responses never see the calls a chat-only upstream returned.
 	output := []any{}
+	// A reasoning summary precedes the answer, matching the ordering Responses
+	// clients expect from a reasoning model.
+	if reasoning != "" {
+		output = append(output, map[string]any{
+			"type": "reasoning",
+			"summary": []any{
+				map[string]any{"type": "summary_text", "text": reasoning},
+			},
+		})
+	}
+	if refusal != "" {
+		// A refusal is its own content-part type in the Responses API. Emitting it
+		// as output_text would make a safety decline indistinguishable from a
+		// normal answer; dropping it (the old behavior, since content is null on a
+		// refusal) left the client with an empty message and no explanation.
+		output = append(output, map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "refusal", "refusal": refusal},
+			},
+		})
+	}
 	if text != "" {
 		output = append(output, map[string]any{
 			"type": "message",
@@ -565,11 +638,18 @@ func ChatToResponsesResponse(body []byte, originalModel string) ([]byte, error) 
 	out["usage"] = usageObj
 	if len(chat.Choices) > 0 && chat.Choices[0].FinishReason != "" {
 		out["finish_reason"] = chat.Choices[0].FinishReason
-		// Chat's "length" finish reason maps to Responses' status "incomplete":
-		// the response stopped early because the token budget ran out. Leaving
-		// status "completed" would mislead Responses clients that check it.
-		if chat.Choices[0].FinishReason == "length" {
+		// Chat's early-stop reasons map to Responses' status "incomplete" plus an
+		// incomplete_details.reason. Leaving status "completed" would mislead
+		// Responses clients that check it — and for content_filter the client would
+		// treat a blocked generation as a finished one and never retry or surface
+		// the block. The reason strings are the ones the Responses API itself uses.
+		switch chat.Choices[0].FinishReason {
+		case "length":
 			out["status"] = "incomplete"
+			out["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		case "content_filter":
+			out["status"] = "incomplete"
+			out["incomplete_details"] = map[string]any{"reason": "content_filter"}
 		}
 	}
 	return json.Marshal(out)
@@ -704,7 +784,13 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 	if v, ok := full["reasoning_effort"]; ok {
 		out["reasoning"] = map[string]any{"effort": json.RawMessage(v)}
 	}
-	for _, key := range []string{"temperature", "top_p", "parallel_tool_calls", "user"} {
+	for _, key := range []string{
+		"temperature", "top_p", "parallel_tool_calls", "user",
+		// metadata and service_tier are identical in both APIs; the reroute used to
+		// drop them, silently changing a caller's billing tier and losing the
+		// request tags they use for their own attribution.
+		"metadata", "service_tier",
+	} {
 		if v, ok := full[key]; ok {
 			out[key] = json.RawMessage(v)
 		}
@@ -713,8 +799,13 @@ func ChatRequestToResponsesRequest(body []byte) ([]byte, error) {
 	// dropping them (min_completion_tokens, logprobs and response_format have
 	// no Responses-API analogue — structured output there goes through
 	// text.format, a different mechanism, and guessing a "min_tokens" field
-	// would risk upstream rejection).
-	for _, key := range []string{"logprobs", "top_logprobs", "response_format", "min_completion_tokens"} {
+	// would risk upstream rejection). frequency_penalty/presence_penalty/
+	// logit_bias/stop/seed/n likewise do not exist in the Responses API, and n>1
+	// would be billed while ResponsesResponseToChatResponse only emits choice 0.
+	for _, key := range []string{
+		"logprobs", "top_logprobs", "response_format", "min_completion_tokens",
+		"frequency_penalty", "presence_penalty", "logit_bias", "stop", "seed", "n",
+	} {
 		if _, ok := full[key]; ok {
 			slog.Warn("chat->responses reroute drops field with no Responses-API equivalent", "field", key)
 		}
@@ -789,6 +880,16 @@ func chatContentToResponsesParts(raw json.RawMessage, textType string) any {
 			out = append(out, item)
 			continue
 		}
+		if typ == "input_audio" {
+			// Identical shape in both APIs — forward verbatim so a voice request
+			// surviving the chat->responses reroute keeps its audio.
+			if a, ok := part["input_audio"]; ok && len(a) > 0 {
+				out = append(out, map[string]any{"type": "input_audio", "input_audio": json.RawMessage(a)})
+				continue
+			}
+			slog.Warn("dropping input_audio part with no input_audio payload in chat->responses reroute")
+			continue
+		}
 		var txt string
 		if t, ok := part["text"]; ok {
 			_ = json.Unmarshal(t, &txt)
@@ -861,6 +962,10 @@ func ResponsesResponseToChatResponse(body []byte, originalModel string) ([]byte,
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
+				// A refusal content part carries its message under "refusal",
+				// not "text" — without this the decline was dropped entirely
+				// and the client got an empty assistant message.
+				Refusal string `json:"refusal"`
 			} `json:"content"`
 			CallID    string `json:"call_id"`
 			Name      string `json:"name"`
@@ -886,11 +991,19 @@ func ResponsesResponseToChatResponse(body []byte, originalModel string) ([]byte,
 	}
 
 	text := ""
+	refusal := ""
 	var toolCalls []map[string]any
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "message":
 			for _, c := range item.Content {
+				if c.Refusal != "" {
+					if refusal != "" {
+						refusal += "\n"
+					}
+					refusal += c.Refusal
+					continue
+				}
 				if c.Text == "" {
 					continue
 				}
@@ -939,6 +1052,14 @@ func ResponsesResponseToChatResponse(body []byte, originalModel string) ([]byte,
 	// previous version nulled content whenever tool_calls were present, losing
 	// the model's accompanying narration.
 	message := map[string]any{"role": "assistant", "content": text}
+	if refusal != "" {
+		// chat-completions has a first-class "refusal" field on the message; a
+		// refusing turn carries null content there.
+		message["refusal"] = refusal
+		if text == "" {
+			message["content"] = nil
+		}
+	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 		// tool_calls only wins the finish_reason when the response actually

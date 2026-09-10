@@ -62,6 +62,49 @@ func ValidateProxyURL(raw string) error {
 	return nil
 }
 
+// ValidateBaseURL reports why raw is unusable as a provider base_url, or nil if
+// it is fine. base_url was the one user-supplied URL with no validation at all
+// (only a non-empty check), even though it is dispatched to directly and the
+// dashboard's "fetch models" button echoes the response body back to the caller —
+// making an unvalidated value an SSRF probe against the deployment's own network
+// and, on most PaaS hosts, its metadata service. Loopback/private/link-local
+// destinations are rejected unless ALLOW_PRIVATE_BASE_URL=1, which a
+// self-hosted setup pointing at a sibling container on the same network needs.
+func ValidateBaseURL(raw string, allowPrivate bool) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Errorf("base_url is empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("base_url %q is not a valid URL: %w", raw, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("base_url %q: scheme must be http or https", raw)
+	}
+	host := u.Hostname()
+	if u.Host == "" || host == "" {
+		return fmt.Errorf("base_url %q: missing host", raw)
+	}
+	if allowPrivate {
+		return nil
+	}
+	// Only literal IPs are checked. Resolving hostnames here would make saving a
+	// provider depend on DNS (and still be racy against a rebind), so this catches
+	// the direct attempt rather than pretending to be an airtight SSRF boundary.
+	if ip := net.ParseIP(host); ip != nil {
+		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			return fmt.Errorf("base_url %q points at a loopback/private/link-local address; set ALLOW_PRIVATE_BASE_URL=1 if that is intended", raw)
+		}
+	}
+	if strings.EqualFold(host, "localhost") {
+		return fmt.Errorf("base_url %q points at localhost; set ALLOW_PRIVATE_BASE_URL=1 if that is intended", raw)
+	}
+	return nil
+}
+
 // newUpstreamTransport builds the shared upstream transport. proxyURL nil = dial
 // direct. Every knob is identical across direct and proxied clients so routing
 // through the pool can't quietly change streaming/timeout behavior.

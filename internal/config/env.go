@@ -22,6 +22,13 @@ type Env struct {
 	MaxRequestBodyMB              int
 	MaxAccountAttemptsPerProvider int
 	MinCompletionTokens           int
+	// AllowPrivateBaseURL permits provider base_urls that point at
+	// loopback/private/link-local addresses. Off by default so an unvalidated URL
+	// can't be used to probe the deployment's own network (the dashboard's
+	// fetch-models button echoes the upstream response back); turn it on when a
+	// provider genuinely runs alongside the gateway (local llama.cpp, a sibling
+	// container).
+	AllowPrivateBaseURL bool
 }
 
 // BanConfig controls the dashboard-login fail-to-ban gate.
@@ -73,6 +80,7 @@ func LoadEnv() (*Env, error) {
 	// Default 16 fixes that without materially changing real completions. Set
 	// to 0 to disable the heal and let the raw upstream error pass through.
 	e.MinCompletionTokens = getEnvInt("MIN_COMPLETION_TOKENS", 16)
+	e.AllowPrivateBaseURL = os.Getenv("ALLOW_PRIVATE_BASE_URL") == "1"
 	if e.APIKey == "" {
 		return nil, fmt.Errorf("GATEWAY_API_KEY is required")
 	}
