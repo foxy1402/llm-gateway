@@ -98,11 +98,43 @@ func ValidateBaseURL(raw string, allowPrivate bool) error {
 		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 			return fmt.Errorf("base_url %q points at a loopback/private/link-local address; set ALLOW_PRIVATE_BASE_URL=1 if that is intended", raw)
 		}
+	} else if looksLikeNumericHost(host) {
+		// net.ParseIP accepts dotted-quad/decimal IPv4 and bracketed IPv6, but NOT
+		// the alternative IPv4 encodings (hex 0x7f.0.0.1, decimal 2130706433, octal
+		// 0177.0.0.1) — all of which the dialer DOES resolve to loopback/private
+		// addresses. Reject numeric-looking hosts outright rather than let one slip
+		// past the literal check.
+		return fmt.Errorf("base_url %q uses a non-standard numeric address; use a standard IP or hostname (set ALLOW_PRIVATE_BASE_URL=1 to override)", raw)
 	}
 	if strings.EqualFold(host, "localhost") {
 		return fmt.Errorf("base_url %q points at localhost; set ALLOW_PRIVATE_BASE_URL=1 if that is intended", raw)
 	}
 	return nil
+}
+
+// looksLikeNumericHost reports whether host is an alternative/non-standard
+// numeric IP encoding that net.ParseIP rejects but the dialer still resolves:
+// an all-numeric host, a 0x-prefixed hex form, a 0-prefixed octal form, or a
+// single integer. A real hostname always contains a letter, dot-separated label
+// alphabet, so rejecting pure-numeric/host-with-no-letters is safe.
+func looksLikeNumericHost(host string) bool {
+	// IPv6 bracket content was already handled by ParseIP.
+	if strings.Contains(host, ":") {
+		return false
+	}
+	// Any letter other than the hex 'x'/'X' prefix marker means a real name.
+	hexPrefix := strings.HasPrefix(host, "0x") || strings.HasPrefix(host, "0X")
+	for _, c := range host {
+		switch {
+		case c >= '0' && c <= '9':
+		case c == '.':
+		case (c == 'x' || c == 'X') && hexPrefix:
+		default:
+			return false
+		}
+	}
+	// All chars are digits/dots/x: a numeric address (or a bare integer).
+	return host != ""
 }
 
 // newUpstreamTransport builds the shared upstream transport. proxyURL nil = dial
@@ -137,8 +169,12 @@ func newUpstreamTransport(timeout time.Duration, proxyURL *url.URL) *http.Transp
 		// which is exactly the set a rotation-heavy workload reuses. Defaults
 		// (2 per host, no idle timeout) would churn TLS handshakes under any
 		// concurrency; these values hold the warm set without hoarding fds.
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		// Cap concurrent sockets per upstream host so one slow/hanging upstream
+		// can't accumulate unbounded connections (and their goroutines) — excess
+		// requests queue on a freed socket instead.
+		MaxConnsPerHost:       50,
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}

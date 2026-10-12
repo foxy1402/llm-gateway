@@ -39,6 +39,38 @@ type FailBan struct {
 
 	mu  sync.Mutex
 	ips map[string]*ipState
+
+	// saveMu serializes the (relatively slow) DB write so a burst of failures
+	// doesn't stack concurrent SQLite writes, while keeping that write OFF the
+	// hot f.mu critical section: under a brute-force spray every 401 used to
+	// serialize through a JSON marshal + SQLite write with f.mu held, queueing
+	// legitimate login checks behind it. snapshotLocked captures the state under
+	// f.mu; the caller then persists outside it.
+	saveMu sync.Mutex
+}
+
+// snapshotLocked returns a JSON blob of the current state. Callers hold f.mu.
+func (f *FailBan) snapshotLocked() (string, bool) {
+	if f.save == nil {
+		return "", false
+	}
+	b, err := json.Marshal(f.ips)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+// persist persists a snapshot taken under f.mu, OUTSIDE the lock. The saveMu
+// serialization means the last-writer wins; each snapshot is a complete view of
+// the map, so an interleaved later write is always at least as fresh.
+func (f *FailBan) persist(snapshot string) {
+	if f.save == nil {
+		return
+	}
+	f.saveMu.Lock()
+	defer f.saveMu.Unlock()
+	_ = f.save(snapshot) // persistence is best-effort; in-memory state still bans
 }
 
 // NewFailBan builds a gate; `initial` is a previously persisted state blob
@@ -135,27 +167,36 @@ func (f *FailBan) ClientIP(r *http.Request) string {
 // map stays bounded by recently-active addresses.
 func (f *FailBan) check(ip string) (time.Time, bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	st, ok := f.ips[ip]
 	if !ok {
+		f.mu.Unlock()
 		return time.Time{}, false
 	}
 	now := f.now()
 	st.prune(now, f.cfg.FindTime)
 	if st.Until > now.Unix() {
+		f.mu.Unlock()
 		return time.Unix(st.Until, 0), true
 	}
 	st.Until = 0
+	var snapshot string
+	changed := false
 	if len(st.Fails) == 0 && st.Level == 0 {
 		delete(f.ips, ip)
-		f.persistLocked()
+		changed = true
+	}
+	if changed {
+		snapshot, _ = f.snapshotLocked()
+	}
+	f.mu.Unlock()
+	if changed {
+		f.persist(snapshot)
 	}
 	return time.Time{}, false
 }
 
 func (f *FailBan) fail(ip string) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	now := f.now()
 	st := f.ips[ip]
 	if st == nil {
@@ -164,6 +205,7 @@ func (f *FailBan) fail(ip string) {
 			if len(f.ips) >= maxTrackedIPs {
 				// Refusing to track a new IP only means the spray isn't counted;
 				// every banned IP already in the map stays banned.
+				f.mu.Unlock()
 				return
 			}
 		}
@@ -177,19 +219,30 @@ func (f *FailBan) fail(ip string) {
 		st.Until = now.Add(f.banDuration(st.Level)).Unix()
 		st.Fails = st.Fails[:0]
 	}
-	f.persistLocked()
+	snapshot, _ := f.snapshotLocked()
+	f.mu.Unlock()
+	f.persist(snapshot)
 }
 
 func (f *FailBan) success(ip string) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	st := f.ips[ip]
 	if st == nil {
+		f.mu.Unlock()
 		return
 	}
+	var snapshot string
+	changed := false
 	if len(st.Fails) > 0 {
 		st.Fails = st.Fails[:0]
-		f.persistLocked()
+		changed = true
+	}
+	if changed {
+		snapshot, _ = f.snapshotLocked()
+	}
+	f.mu.Unlock()
+	if changed {
+		f.persist(snapshot)
 	}
 }
 
@@ -203,17 +256,6 @@ func (f *FailBan) banDuration(level int) time.Duration {
 		}
 	}
 	return d
-}
-
-func (f *FailBan) persistLocked() {
-	if f.save == nil {
-		return
-	}
-	b, err := json.Marshal(f.ips)
-	if err != nil {
-		return
-	}
-	_ = f.save(string(b)) // persistence is best-effort; in-memory state still bans
 }
 
 // sweepLocked drops fully-decayed entries (no ban, no recent failures, no

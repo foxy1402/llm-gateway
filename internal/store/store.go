@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,20 @@ import (
 
 //go:embed schema.sql
 var schemaSQL string
+
+// ReservedSettings are settings-table keys the gateway manages at runtime and
+// that operators must not be able to set or restore through the import path.
+// "failban:state" holds the persisted brute-force ban state: a tampered or stale
+// backup could otherwise silently reset (or forge) bans on the next restart.
+// Kept here rather than in the auth package so the export/import guards in this
+// package can reference it without an import cycle; auth.BanSettingsKey must
+// stay equal to the value below.
+var ReservedSettings = map[string]bool{
+	"failban:state": true,
+}
+
+// IsReservedSetting reports whether key is gateway-managed runtime state.
+func IsReservedSetting(key string) bool { return ReservedSettings[key] }
 
 type Store struct {
 	db *sql.DB
@@ -41,7 +56,15 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return nil, fmt.Errorf("create db dir %q: %w", dir, err)
 		}
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	// Build the DSN by escaping the path rather than interpolating it raw: a DB
+	// path containing '?', '#', or '&' broke DSN parsing (the tail was read as
+	// extra connection parameters). The pragmas are appended as literal query
+	// values, so percent-encode the filename only.
+	dsnPath := path
+	if strings.ContainsAny(dsnPath, "?#&%") {
+		dsnPath = (&url.URL{Path: dsnPath}).EscapedPath()
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", dsnPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -144,11 +167,15 @@ func rebuildComboMembers(ctx context.Context, db *sql.DB) error {
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return err
 	}
-	// Re-enable on the way out: this connection returns to the pool and would
-	// otherwise serve later writes with FK enforcement silently disabled.
+	// Re-enable on the way out. If re-enabling FAILS the connection must NOT
+	// return to the pool with FKs silently disabled — that would let every later
+	// write on it skip foreign-key enforcement. Closing it drops the connection so
+	// the pool opens a freshly-configured one instead. (The deferred conn.Close
+	// below still runs; a second Close on a *sql.Conn is harmless.)
 	defer func() {
 		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
-			slog.Error("failed to re-enable foreign keys after migration", "err", err)
+			slog.Error("failed to re-enable foreign keys after migration; dropping the connection", "err", err)
+			_ = conn.Close()
 		}
 	}()
 
@@ -455,6 +482,23 @@ func replaceAccountsTx(tx *sql.Tx, providerID string, accounts []config.Account)
 	keep := make(map[string]bool, len(accounts))
 	for _, a := range accounts {
 		keep[a.ID] = true
+		// An account ID that already belongs to a DIFFERENT provider must not be
+		// silently re-parented: the upsert below neither constrains nor sets
+		// provider_id on conflict, so a client-supplied ID copied from provider B
+		// (visible via listProviders) would overwrite B's credentials while saving
+		// A. Reject it instead — an ID is owned by the provider it was created for.
+		var owner string
+		err := tx.QueryRow("SELECT provider_id FROM provider_accounts WHERE id = ?", a.ID).Scan(&owner)
+		switch {
+		case err == nil:
+			if owner != providerID {
+				return fmt.Errorf("account id %q already belongs to provider %q", a.ID, owner)
+			}
+		case errors.Is(err, sql.ErrNoRows):
+			// new account — fine
+		default:
+			return fmt.Errorf("check account %q owner: %w", a.ID, err)
+		}
 	}
 	rows, err := tx.Query("SELECT id FROM provider_accounts WHERE provider_id = ?", providerID)
 	if err != nil {

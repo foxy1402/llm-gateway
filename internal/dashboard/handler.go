@@ -51,7 +51,8 @@ func Mount(mux *http.ServeMux, d *Deps) {
 			h.ServeHTTP(w, r)
 		})
 	}
-	withAuth := func(h http.Handler) http.Handler { return secure(dash.Middleware(sameOrigin(h))) }
+	behindProxy := d.Env != nil && d.Env.BanCfg.BehindProxy
+	withAuth := func(h http.Handler) http.Handler { return secure(dash.Middleware(sameOrigin(behindProxy, h))) }
 
 	// Auth endpoints. The login POST is the brute-force target (a session
 	// exposes every stored key), so it sits behind the fail-to-ban gate.
@@ -119,7 +120,7 @@ type apiHandlers struct{ d *Deps }
 // browser-side mechanism. A request with no Origin at all is allowed: curl and
 // the gateway's own tooling send none, and a browser that omits it cannot have
 // been driven cross-site.
-func sameOrigin(h http.Handler) http.Handler {
+func sameOrigin(behindProxy bool, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -127,7 +128,7 @@ func sameOrigin(h http.Handler) http.Handler {
 			return
 		}
 		origin := r.Header.Get("Origin")
-		if origin != "" && origin != requestOrigin(r) {
+		if origin != "" && origin != requestOrigin(r, behindProxy) {
 			slog.Warn("rejected cross-origin dashboard request", "origin", origin, "path", r.URL.Path)
 			writeErr(w, http.StatusForbidden, "cross-origin request rejected")
 			return
@@ -136,9 +137,15 @@ func sameOrigin(h http.Handler) http.Handler {
 	})
 }
 
-// requestOrigin reconstructs this request's own origin (scheme://host), honoring
-// the PaaS TLS terminator's X-Forwarded-Proto the same way endpointInfo does.
-func requestOrigin(r *http.Request) string {
+// requestOrigin reconstructs this request's own origin (scheme://host). It
+// honors the PaaS TLS terminator's X-Forwarded-Proto the same way endpointInfo
+// does, and — when the deployment is behind a trusted proxy — X-Forwarded-Host
+// too: a front proxy that rewrites Host to an internal name (without setting
+// X-Forwarded-Host) otherwise made every mutating dashboard request fail its
+// same-origin check with a 403, breaking the admin panel. XFH is only consulted
+// behind a trusted proxy (TRUSTED_PROXY), because it is client-spoofable and the
+// current ignore-XFH behavior is what makes the check CSRF-safe without one.
+func requestOrigin(r *http.Request, behindProxy bool) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -146,7 +153,13 @@ func requestOrigin(r *http.Request) string {
 	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
 		scheme = strings.ToLower(strings.TrimSpace(strings.SplitN(p, ",", 2)[0]))
 	}
-	return scheme + "://" + r.Host
+	host := r.Host
+	if behindProxy {
+		if fwd := r.Header.Get("X-Forwarded-Host"); fwd != "" {
+			host = strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
+		}
+	}
+	return scheme + "://" + host
 }
 
 // validateID constrains user-chosen provider/combo IDs. They appear in URLs, log
@@ -182,7 +195,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// decodeJSON decodes a request body into v, bounding the body first. Without a
+// cap, create/update provider/combo/account/proxy/settings handlers read
+// unbounded bodies into memory (and, for import-shaped payloads, into the DB);
+// login and import were already capped, so this closes the remaining handlers.
 func decodeJSON(r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, 8<<20)
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
@@ -960,6 +978,17 @@ func (api *apiHandlers) updateCombo(w http.ResponseWriter, r *http.Request) {
 // upstream doesn't expose — and keeps bogus pins from surfacing later as opaque
 // SQLite FK violations on insert.
 func (api *apiHandlers) validateCombo(c comboPayload) string {
+	// The rotation enum must be one of the four known policies: any other string
+	// silently fell back to round-robin at request time (retry.go), so a typo
+	// looked accepted in the UI while behaving as something else entirely.
+	switch config.RotationPolicy(c.Rotation) {
+	case config.RoundRobin, config.WeightedRoundRobin, config.Priority, config.Random:
+	case "":
+		// handled by callers defaulting to round-robin before validation
+	default:
+		return fmt.Sprintf("invalid rotation %q: must be one of %q, %q, %q, %q",
+			c.Rotation, config.RoundRobin, config.WeightedRoundRobin, config.Priority, config.Random)
+	}
 	for _, m := range c.Members {
 		p := api.d.Reg.GetProvider(m.ProviderID)
 		if p == nil {
@@ -1116,6 +1145,14 @@ func (api *apiHandlers) getSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	// Reserved runtime state (failban:state = banned IPs + failure timestamps,
+	// potentially 10k entries) is gateway bookkeeping, not configuration — do not
+	// echo it to the browser.
+	for k := range all {
+		if store.IsReservedSetting(k) {
+			delete(all, k)
+		}
 	}
 	// Ensure defaults present for the UI.
 	for _, k := range []string{"health.cooldown", "health.error_codes", "log.retention_days"} {

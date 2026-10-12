@@ -29,6 +29,20 @@ type Env struct {
 	// provider genuinely runs alongside the gateway (local llama.cpp, a sibling
 	// container).
 	AllowPrivateBaseURL bool
+	// RequestBudget caps total wall-clock time for one request's rotation across
+	// accounts/providers (REQUEST_BUDGET). Zero means "use the proxy default".
+	RequestBudget time.Duration
+	// StreamStallTimeout overrides the per-chunk streaming idle timeout
+	// (STREAM_STALL_TIMEOUT). Zero means "use the proxy default".
+	StreamStallTimeout time.Duration
+	// AttemptBackoffBase is the first inter-attempt delay (ATTEMPT_BACKOFF_BASE).
+	// AttemptBackoffSet distinguishes an explicit "0" (disable backoff) from unset.
+	AttemptBackoffBase time.Duration
+	AttemptBackoffSet  bool
+	// DashboardSecureCookie marks the dashboard session cookie Secure regardless
+	// of r.TLS — set when TLS is terminated at a trusted proxy
+	// (DASHBOARD_SECURE_COOKIE; defaults to TRUSTED_PROXY).
+	DashboardSecureCookie bool
 }
 
 // BanConfig controls the dashboard-login fail-to-ban gate.
@@ -81,6 +95,16 @@ func LoadEnv() (*Env, error) {
 	// to 0 to disable the heal and let the raw upstream error pass through.
 	e.MinCompletionTokens = getEnvInt("MIN_COMPLETION_TOKENS", 16)
 	e.AllowPrivateBaseURL = os.Getenv("ALLOW_PRIVATE_BASE_URL") == "1"
+	// Dashboard session cookie Secure attribute. This is a TLS-termination trust
+	// decision and is deliberately separate from TRUSTED_PROXY (which is about
+	// client-IP provenance): the two used to ride one flag, and the cookie one
+	// additionally consulted the client-spoofable X-Forwarded-Proto. Defaults to
+	// the TRUSTED_PROXY setting so an existing proxied deployment keeps working,
+	// but can be set independently with DASHBOARD_SECURE_COOKIE.
+	e.DashboardSecureCookie = e.BanCfg.BehindProxy
+	if v := os.Getenv("DASHBOARD_SECURE_COOKIE"); v != "" {
+		e.DashboardSecureCookie = v == "1" || strings.EqualFold(v, "true")
+	}
 	if e.APIKey == "" {
 		return nil, fmt.Errorf("GATEWAY_API_KEY is required")
 	}
@@ -103,9 +127,53 @@ func LoadEnv() (*Env, error) {
 		if err != nil {
 			return nil, fmt.Errorf("REQUEST_TIMEOUT invalid: %w", err)
 		}
+		// Reject non-positive values: 0 (or negative) makes every non-streaming
+		// attemptCtx expire instantly, so every request fails as a transport error
+		// AND providers get cooled down for a config typo. A duration of "0" is a
+		// footgun, not a valid "disable" signal — the gateway always needs some
+		// header timeout.
+		if d <= 0 {
+			return nil, fmt.Errorf("REQUEST_TIMEOUT must be positive, got %q", t)
+		}
 		e.RequestTimeout = d
 	} else {
 		e.RequestTimeout = 60 * time.Second
+	}
+	// Whole-request rotation budget (see proxy.defaultRequestBudget). Bounds the
+	// total wall-clock time spent rotating across accounts/providers for one
+	// client request; without it an all-dead combo could pin a handler for many
+	// minutes. 0 or negative falls back to the proxy default.
+	if t := os.Getenv("REQUEST_BUDGET"); t != "" {
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return nil, fmt.Errorf("REQUEST_BUDGET invalid: %w", err)
+		}
+		if d > 0 {
+			e.RequestBudget = d
+		}
+	}
+	// Per-chunk streaming idle timeout (see proxy.streamStallTimeout). Raise it for
+	// models that legitimately idle for long stretches between tokens.
+	if t := os.Getenv("STREAM_STALL_TIMEOUT"); t != "" {
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return nil, fmt.Errorf("STREAM_STALL_TIMEOUT invalid: %w", err)
+		}
+		if d > 0 {
+			e.StreamStallTimeout = d
+		}
+	}
+	// First inter-attempt delay before rotation (see proxy.defaultAttemptBackoffBase).
+	// 0 explicitly disables inter-attempt backoff.
+	if t := os.Getenv("ATTEMPT_BACKOFF_BASE"); t != "" {
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return nil, fmt.Errorf("ATTEMPT_BACKOFF_BASE invalid: %w", err)
+		}
+		if d >= 0 {
+			e.AttemptBackoffBase = d
+			e.AttemptBackoffSet = true
+		}
 	}
 	// MODEL_ALIASES: comma-separated incoming=target pairs. When a client sends a
 	// model name that matches neither a provider nor a combo (common with agents

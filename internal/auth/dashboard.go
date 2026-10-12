@@ -25,23 +25,23 @@ const (
 type Dashboard struct {
 	password string
 	secret   []byte
-	// behindProxy marks the deployment as fronted by a TLS-terminating load
-	// balancer: the cookie must then be Secure based on X-Forwarded-Proto,
-	// since r.TLS is nil at the gateway even for HTTPS clients.
-	behindProxy bool
+	// secure marks the session cookie Secure unconditionally (besides r.TLS).
+	// It is a single, configuration-derived trust decision, NOT a per-request
+	// read of X-Forwarded-Proto — see secureCookie.
+	secure bool
 
 	mu       sync.RWMutex
 	sessions map[string]time.Time // sessionID -> expiry
 }
 
-func NewDashboard(password, secret string, behindProxy ...bool) *Dashboard {
+func NewDashboard(password, secret string, secureCookie ...bool) *Dashboard {
 	d := &Dashboard{
 		password: password,
 		secret:   []byte(secret),
 		sessions: map[string]time.Time{},
 	}
-	if len(behindProxy) > 0 {
-		d.behindProxy = behindProxy[0]
+	if len(secureCookie) > 0 {
+		d.secure = secureCookie[0]
 	}
 	return d
 }
@@ -117,13 +117,17 @@ func (d *Dashboard) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // secureCookie reports whether the session cookie may be marked Secure for this
-// request: directly over TLS, or — behind a trusted TLS-terminating proxy — when
-// the client-facing hop was HTTPS.
+// request: directly over TLS, or when the deployment is known to sit behind a
+// TLS-terminating proxy (DASHBOARD_SECURE_COOKIE / TRUSTED_PROXY). It
+// deliberately does NOT consult the client-supplied X-Forwarded-Proto header: a
+// client could send X-Forwarded-Proto: https over plain HTTP and receive a
+// Secure cookie the browser then refuses to send back, producing a login loop.
+// The trust decision is made once, from configuration, not per request.
 func (d *Dashboard) secureCookie(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	return d.behindProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	return d.secure
 }
 
 // Middleware protects dashboard routes; HTML requests redirect to /dashboard/login.

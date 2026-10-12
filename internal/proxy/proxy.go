@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"slices"
@@ -43,6 +45,25 @@ const maxLogPayload = 4 << 10 // 4 KiB
 // SetMaxAccountsPerProviderCap (env MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER).
 const defaultMaxAccountsPerProviderCap = 10
 
+// defaultRequestBudget bounds the total wall-clock time one client request may
+// spend rotating across accounts/providers. Without it, the attempt loop is
+// bounded only per-attempt (2×timeout non-streaming), so an all-dead combo whose
+// dials hang to the dial timeout could hold a handler for tens of minutes
+// before answering. Streaming requests are exempt once bytes are committed (the
+// client's own context governs a live generation), but the rotation before the
+// first byte is still bounded here.
+const defaultRequestBudget = 10 * time.Minute
+
+// defaultAttemptBackoffBase is the first inter-attempt delay when a request
+// rotates to the next account/provider after a retryable failure. Back-to-back
+// retries against an already-rate-limiting upstream turn one client request into
+// a burst; a small exponential delay with jitter lets the upstream recover and
+// de-synchronizes concurrent requests. Override via SetAttemptBackoff.
+const defaultAttemptBackoffBase = 100 * time.Millisecond
+
+// attemptBackoffCap bounds the exponential inter-attempt delay.
+const attemptBackoffCap = 2 * time.Second
+
 // maxEgressDialRetries bounds how many times ONE attempt re-dials through a
 // fresh egress pick after a transport-level failure through a pool proxy
 // (see the retry loop around dispatch.Do in ServeHTTP). Small and fixed
@@ -71,6 +92,17 @@ type Proxy struct {
 	// minTokenFloorDefault; overridden via SetMinCompletionTokens
 	// (env.MIN_COMPLETION_TOKENS). 0 disables the heal entirely.
 	minCompletionTokens int
+	// streamStall is the per-chunk idle timeout for streaming responses (see
+	// streamStallTimeout). Overridable via SetStreamStallTimeout so operators can
+	// relax it for slow long-reasoning models or tighten it for fast ones.
+	streamStall time.Duration
+	// requestBudget caps total wall-clock time across all rotation attempts for
+	// one client request (see defaultRequestBudget). Overridable via
+	// SetRequestBudget.
+	requestBudget time.Duration
+	// attemptBackoffBase is the first inter-attempt delay; subsequent retries back
+	// off exponentially up to attemptBackoffCap (see SetAttemptBackoff).
+	attemptBackoffBase time.Duration
 	// proxyClients caches one client per egress proxy URL (see egress.go). Built
 	// lazily on first use and never invalidated: a pool entry that's edited or
 	// removed just stops being handed out by registry.NextProxy, and a handful
@@ -93,6 +125,9 @@ func New(reg *registry.Registry, st *store.Store, timeout time.Duration) *Proxy 
 		maxBodyBytes:              defaultMaxBodyBytes,
 		maxAccountsPerProviderCap: defaultMaxAccountsPerProviderCap,
 		minCompletionTokens:       minTokenFloorDefault,
+		streamStall:               streamStallTimeout,
+		requestBudget:             defaultRequestBudget,
+		attemptBackoffBase:        defaultAttemptBackoffBase,
 		proxyClients:              map[string]*http.Client{},
 	}
 }
@@ -130,6 +165,32 @@ func (p *Proxy) SetMinCompletionTokens(n int) {
 // minTokenFloor returns the configured heal floor, or 0 (disabled) — kept as
 // a method so the call site doesn't need to know the field name.
 func (p *Proxy) minTokenFloor() int { return p.minCompletionTokens }
+
+// SetStreamStallTimeout overrides the per-chunk streaming idle timeout
+// (STREAM_STALL_TIMEOUT). Values <= 0 are ignored so a misconfigured env can't
+// disable the stall watchdog entirely.
+func (p *Proxy) SetStreamStallTimeout(d time.Duration) {
+	if d > 0 {
+		p.streamStall = d
+	}
+}
+
+// SetRequestBudget overrides the whole-request wall-clock bound
+// (REQUEST_BUDGET). Values <= 0 are ignored.
+func (p *Proxy) SetRequestBudget(d time.Duration) {
+	if d > 0 {
+		p.requestBudget = d
+	}
+}
+
+// SetAttemptBackoff overrides the first inter-attempt delay
+// (ATTEMPT_BACKOFF_BASE). n == 0 explicitly disables inter-attempt backoff;
+// n < 0 is ignored (keeps the default).
+func (p *Proxy) SetAttemptBackoff(d time.Duration) {
+	if d >= 0 {
+		p.attemptBackoffBase = d
+	}
+}
 
 // enabledAccountCount returns how many accounts of a provider could plausibly
 // serve a request: real enabled rows, or 1 for legacy single-key providers
@@ -295,6 +356,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 	// 502 "all upstreams failed" — useful signal for a client's own backoff.
 	var lastFailStatus int
 	var lastFailLogID string
+	// lastFailHeaders/lastFailBody preserve the most recent upstream *error*
+	// response so a terminal 429/401/5xx forwarded to the client still carries the
+	// upstream's own pacing hints (Retry-After, X-RateLimit-*) and its real error
+	// body instead of a synthesized generic message — the client SDK's backoff and
+	// its error reporting both depend on that detail.
+	var lastFailHeaders http.Header
+	var lastFailBody []byte
+	var lastFailContentType string
 	// attemptJournal collects one short line per failed or skipped attempt so the
 	// terminal log row answers "which upstream failed and why" — transport error,
 	// HTTP status, cooldown skip — instead of a bare "all upstreams failed".
@@ -327,7 +396,43 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 	// explicit call and simply guarantees no path leaks.
 	defer func() { cancelAttempt() }()
 
+	// Whole-request wall-clock bound across all rotation attempts. Each attempt
+	// is individually bounded (2×timeout non-streaming), but the loop itself was
+	// unbounded: an all-dead combo whose dials hang to the dial timeout could
+	// hold a handler for tens of minutes before answering. This caps the total
+	// rotation time. Once bytes are committed on the streaming hot path the
+	// deadline no longer matters (that path returns before the next iteration),
+	// so a live generation is never cut off by it.
+	budgetCtx, cancelBudget := context.WithTimeout(r.Context(), p.requestBudget)
+	defer cancelBudget()
+
+	// dispatchedLast marks that the previous loop iteration actually reached the
+	// network, so the inter-attempt backoff is only paid between real retries —
+	// not between pure "discovery" iterations that only resolve members/accounts.
+	dispatchedLast := false
+
+attemptLoop:
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Between real rotations, back off briefly so a rate-limiting upstream
+		// isn't hammered with back-to-back retries and concurrent requests don't
+		// re-synchronize. Skipped on the first iteration (nothing failed yet).
+		if attempt > 0 && dispatchedLast && p.attemptBackoffBase > 0 {
+			select {
+			case <-time.After(p.attemptBackoff(attempt)):
+			case <-budgetCtx.Done():
+				journal("request budget exhausted after %d attempt(s)", attempt)
+				break attemptLoop
+			case <-r.Context().Done():
+				return
+			}
+		}
+		dispatchedLast = false
+		select {
+		case <-budgetCtx.Done():
+			journal("request budget exhausted after %d attempt(s)", attempt)
+			break attemptLoop
+		default:
+		}
 		var upstream *config.Provider
 		var member *config.ComboMember
 		if plan != nil {
@@ -374,6 +479,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			} else {
 				journal("%s: no eligible key left (all cooling down or already tried)", upstream.ID)
 				triedProviders[upstream.ID] = true
+				// Direct-provider path (plan == nil): the loop re-targets this same
+				// provider every iteration, and NextAccount will keep reporting no
+				// eligible key, so a bare continue just spins the remaining budget
+				// doing nothing. Stop immediately instead.
+				if plan == nil {
+					break
+				}
 			}
 			cancelAttempt()
 			continue
@@ -498,13 +610,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// transport level (ResponseHeaderTimeout etc.), so a fixed wall-clock context
 		// timeout never kills a live stream mid-generation (#1).
 		// Non-streaming attempts are additionally bounded in total (headers + body
-		// window) because a 200-then-hang body has no other watchdog.
+		// window) because a 200-then-hang body has no other watchdog — and are
+		// nested under the whole-request budget so a long rotation chain is capped.
 		attemptCtx := r.Context()
 		cancelAttempt() // release the previous iteration's context, if any
 		cancelAttempt = func() {}
 		if !info.Stream {
 			var cancel context.CancelFunc
-			attemptCtx, cancel = context.WithTimeout(attemptCtx, 2*p.timeout)
+			attemptCtx, cancel = context.WithTimeout(budgetCtx, 2*p.timeout)
 			cancelAttempt = cancel
 		}
 		upReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, upstreamURL, bytes.NewReader(body))
@@ -539,6 +652,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		dispatch := egress.client
 
 		start := time.Now()
+		dispatchedLast = true
 		resp, err := dispatch.Do(upReq)
 		// A transport failure through a POOL PROXY (dead exit node, connection
 		// refused, proxy-side timeout) implicates the proxy, not this account or
@@ -596,8 +710,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// out of rotation for the full cooldown because of a dead proxy entry. A
 			// fully-dead pool falls back to a direct dial (proxyID == ""), where the
 			// provider charge is the correct attribution.
+			//
+			// A pure TIMEOUT (net.Error.Timeout(): header timeout on an upstream slow
+			// to emit its first token, e.g. a long-reasoning model with TTFT > the
+			// header timeout) books only a short SOFT penalty. A full provider
+			// cooldown there took a healthy-but-slow endpoint out of rotation for the
+			// whole window, every time — the provider flapped in and out of rotation.
+			// A connection-level failure (refused, reset, no route) still books the
+			// full provider cooldown: that endpoint really is unreachable.
 			if egress.proxyID != "" {
 				p.registry.Health().RecordProxyFailure(egress.proxyID)
+			} else if isTimeoutErr(err) {
+				p.registry.Health().RecordSoftFailure(upstream.ID)
 			} else {
 				p.registry.Health().RecordFailure(upstream.ID, 0)
 			}
@@ -624,8 +748,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// where every heal matches but none fully fixes the request.
 		var healNote, healURL string
 		if endpoint == registry.EndpointChatCompletions {
+			// Heal redispatches must be bounded even on the streaming path, where
+			// attemptCtx is the unbounded client context: a hung heal redispatch
+			// otherwise holds the handler (and its socket) until the client
+			// disconnects. Bound it to the same 2×header-timeout window the
+			// non-streaming attempt uses; a heal is a short error-probe round trip,
+			// never a live generation, so it needs no unbounded window.
+			healCtx, cancelHeal := context.WithTimeout(attemptCtx, 2*p.timeout)
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryTokenParamHeal(attemptCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+				if healedResp, healedBody, healed := p.tryTokenParamHeal(healCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
 					resp, body, healNote = healedResp, healedBody, "healed max_tokens field"
 				}
 			}
@@ -637,7 +768,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// through the account-rotation loop (which wouldn't even help here,
 			// since every sibling account fails on the same too-small value).
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryMinTokensHeal(attemptCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID, p.minTokenFloor()); healed {
+				if healedResp, healedBody, healed := p.tryMinTokensHeal(healCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID, p.minTokenFloor()); healed {
 					resp, body, healNote = healedResp, healedBody, "healed max_tokens floor"
 				}
 			}
@@ -649,7 +780,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// to chat-completions shape) rather than burning the account/rotating —
 			// again a request-shape problem identical across every sibling account.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, note, healed := p.tryResponsesRerouteHeal(attemptCtx, dispatch, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream, info.Model); healed {
+				if healedResp, healedBody, note, healed := p.tryResponsesRerouteHeal(healCtx, dispatch, resp, upstream.BaseURL, authKey, body, upstream.ID, account.ID, info.Stream, info.Model); healed {
 					resp, body, healNote = healedResp, healedBody, note
 					healURL = buildUpstreamURL(upstream.BaseURL, "/responses")
 				}
@@ -660,7 +791,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// where the reroute heal already handles it); kept as a fallback for
 			// those. Same request-shape reasoning as the others.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				if healedResp, healedBody, healed := p.tryReasoningEffortHeal(attemptCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
+				if healedResp, healedBody, healed := p.tryReasoningEffortHeal(healCtx, dispatch, resp, upstreamURL, authKey, body, upstream.ID, account.ID); healed {
 					resp, body, healNote = healedResp, healedBody, "healed reasoning_effort"
 				}
 			}
@@ -675,6 +806,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 					p.registry.Health().ForgetReasoningEffortNone(upstream.ID, account.ID)
 				}
 			}
+			// Release the heal context now that the ladder is done — no heal ever
+			// outlives its attempt, and a per-iteration defer would pile up contexts
+			// over the rotation loop.
+			cancelHeal()
 		}
 		// Any HTTP response at all — even a 429/5xx — proves the TCP/TLS path
 		// to and through the egress proxy is alive. Record the proxy success
@@ -711,6 +846,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			// endpoint itself is unreachable and ALL keys would fail identically.
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			lastFailStatus, lastFailLogID = resp.StatusCode, logID
+			lastFailHeaders = resp.Header.Clone()
+			lastFailBody = peek
+			lastFailContentType = resp.Header.Get("Content-Type")
 			// Body snippet (not the request we sent, which may hold the caller's
 			// prompt) logged here because this attempt is otherwise invisible: the
 			// per-attempt failure below skips writing a request_log row (that would
@@ -809,6 +947,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 					errMsg = "client hung up mid-stream (" + streamErr.Error() + ")"
 				case errors.Is(streamErr, context.Canceled) || r.Context().Err() != nil:
 					errMsg = "client disconnected mid-stream (upstream: " + streamErr.Error() + ")"
+				case errors.Is(streamErr, errStreamStalled):
+					// Stalled, not proven dead: a long-reasoning model can idle past the
+					// stall window without being broken. Book a short soft penalty so a
+					// genuinely wedged key still rotates out briefly, but a merely slow
+					// one isn't cooled down for the full window.
+					p.registry.Health().RecordSoftFailure(upstream.ID)
+					errMsg = streamErr.Error()
 				default:
 					p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 					errMsg = streamErr.Error()
@@ -821,8 +966,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 		// Non-streaming: the attempt context (2×header-timeout bound set above) is
 		// the only body-read watchdog, and read errors must not be swallowed — a
 		// truncated body would otherwise be forwarded as a syntactically-valid
-		// 200 (client sees a cut-off JSON blob and retries nothing).
-		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		// 200 (client sees a cut-off JSON blob and retries nothing). Read one byte
+		// PAST the cap so an oversized body is detected rather than silently
+		// truncated: a truncated-but-valid JSON prefix forwarded as 200 was
+		// indistinguishable from a complete answer to the client.
+		const maxRespBody = 10 << 20
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRespBody+1))
 		resp.Body.Close()
 		if readErr != nil {
 			// Client-initiated abort, exactly as on the streaming path: the attempt
@@ -842,6 +991,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
 			journal("%s: body read error: %v", logID, readErr)
 			slog.Warn("upstream body read failed", "provider", logID, "err", readErr)
+			cancelAttempt()
+			continue
+		}
+		// Oversized body: LimitReader stopped one byte past the cap, so a response
+		// that hit exactly maxRespBody+1 bytes is intact only if the upstream sent
+		// precisely that many. Treat ">= cap" as truncated and refuse to forward
+		// it: cutting a large batch-embeddings/long-generation body and labelling
+		// the fragment a 200 hands the client corrupt JSON it cannot detect.
+		if len(respBody) > maxRespBody {
+			p.registry.Health().RecordAccountFailure(upstream.ID, account.ID)
+			journal("%s: response body exceeded %d bytes, not forwarding a truncated body", logID, maxRespBody)
+			slog.Warn("upstream response body too large", "provider", logID, "limit", maxRespBody)
 			cancelAttempt()
 			continue
 		}
@@ -872,7 +1033,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, endpoint strin
 	}
 
 	if lastFailStatus != 0 {
-		writeUpstreamError(w, lastFailStatus)
+		copyRateLimitHeaders(w, lastFailHeaders)
+		if len(lastFailBody) > 0 {
+			// Forward the upstream's real error body (and its Content-Type) so the
+			// client sees the actual rejection reason — e.g. "invalid api key" —
+			// instead of a synthesized generic message.
+			ct := lastFailContentType
+			if ct == "" {
+				ct = "application/json"
+			}
+			w.Header().Set("Content-Type", ct)
+			w.WriteHeader(lastFailStatus)
+			_, _ = w.Write(lastFailBody)
+		} else {
+			writeUpstreamError(w, lastFailStatus)
+		}
 		p.log(info.Model, lastFailLogID, endpoint, lastFailStatus, 0,
 			fmt.Sprintf("all accounts exhausted, last status %d; attempts: %s", lastFailStatus, journalText()),
 			nil, nil, nil, "", string(info.Raw), "", "")
@@ -1042,6 +1217,28 @@ func (p *Proxy) log(modelIn, providerID, endpoint string, status int, latency ti
 // shutdown can use it before closing the store too.
 func (p *Proxy) WaitLogs() { p.logWG.Wait() }
 
+// attemptBackoff returns the inter-attempt delay before the Nth rotation:
+// exponential in the attempt number (base×2ⁿ⁻¹, capped) with ±25% jitter so
+// concurrent requests that all drew the same 429 don't retry in lockstep.
+func (p *Proxy) attemptBackoff(attempt int) time.Duration {
+	d := p.attemptBackoffBase
+	for i := 1; i < attempt && d < attemptBackoffCap; i++ {
+		d *= 2
+	}
+	if d > attemptBackoffCap {
+		d = attemptBackoffCap
+	}
+	return time.Duration(float64(d) * (0.75 + rand.Float64()*0.5))
+}
+
+// isTimeoutErr reports whether a dispatch error was a timeout (as opposed to a
+// connection-level failure). Timeouts mean "slow", not "dead", so the caller
+// books only a soft penalty; a refused/reset connection means unreachable.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 func writeError(w http.ResponseWriter, status int, msg, typ string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1055,17 +1252,39 @@ func writeUpstreamError(w http.ResponseWriter, upstreamStatus int) {
 }
 
 // copyContentHeaders forwards an upstream response's Content-* headers to the
-// client, minus Content-Length. The bodies these callers forward are read
+// client, minus Content-Length, plus the rate-limit signaling headers a client
+// SDK uses to pace its own retries. The bodies these callers forward are read
 // through a 1 MiB LimitReader, so a larger upstream error body would advertise a
 // length longer than what actually gets written and net/http would treat the
 // short write as a truncated response instead of a clean 4xx. Letting net/http
 // compute the length keeps the two in sync.
+//
+// Retry-After and X-RateLimit-*/RateLimit-* are forwarded because dropping them
+// degraded the client's own backoff to guessing exactly when the upstream had
+// told us how long to wait.
+// copyRateLimitHeaders forwards only the pacing hints from an upstream error
+// response. Used on the terminal (all-accounts-exhausted) path where there is
+// no upstream body to copy wholesale: the client still deserves the upstream's
+// Retry-After / rate-limit signals so its own backoff is informed.
+func copyRateLimitHeaders(w http.ResponseWriter, h http.Header) {
+	for k, v := range h {
+		ck := http.CanonicalHeaderKey(k)
+		if ck == "Retry-After" || strings.HasPrefix(ck, "X-Ratelimit-") || strings.HasPrefix(ck, "Ratelimit-") {
+			w.Header()[k] = v
+		}
+	}
+}
+
 func copyContentHeaders(w http.ResponseWriter, resp *http.Response) {
 	for k, v := range resp.Header {
-		if !strings.HasPrefix(k, "Content-") || http.CanonicalHeaderKey(k) == "Content-Length" {
+		ck := http.CanonicalHeaderKey(k)
+		if ck == "Content-Length" {
 			continue
 		}
-		w.Header()[k] = v
+		if strings.HasPrefix(k, "Content-") || ck == "Retry-After" ||
+			strings.HasPrefix(ck, "X-Ratelimit-") || strings.HasPrefix(ck, "Ratelimit-") {
+			w.Header()[k] = v
+		}
 	}
 }
 

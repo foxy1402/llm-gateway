@@ -54,10 +54,21 @@ func run() error {
 	px.SetMaxBodyBytes(int64(env.MaxRequestBodyMB) << 20)
 	px.SetMaxAccountsPerProviderCap(env.MaxAccountAttemptsPerProvider)
 	px.SetMinCompletionTokens(env.MinCompletionTokens)
+	if env.RequestBudget > 0 {
+		px.SetRequestBudget(env.RequestBudget)
+	}
+	if env.StreamStallTimeout > 0 {
+		px.SetStreamStallTimeout(env.StreamStallTimeout)
+	}
+	if env.AttemptBackoffSet {
+		px.SetAttemptBackoff(env.AttemptBackoffBase)
+	}
 
 	a := &app{env: env, store: st, reg: reg, px: px}
 
 	// Nightly log pruning: respects the log.retention_days setting (default 30).
+	// stopPrune waits for any in-flight prune to finish, so shutdown never closes
+	// the store underneath a mid-batch DELETE / wal_checkpoint.
 	stopPrune := startLogPruner(st)
 
 	mux := http.NewServeMux()
@@ -119,10 +130,15 @@ func run() error {
 }
 
 // startLogPruner ticks hourly and prunes request logs older than the retention
-// setting (default 30 days). Returns a stop function.
+// setting (default 30 days). The returned stop function signals the goroutine to
+// exit AND blocks until it has, so a caller can safely Close the store right
+// after: without the wait, a prune mid-PRAGMA wal_checkpoint(TRUNCATE) could race
+// store teardown.
 func startLogPruner(st *store.Store) func() {
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		// A panic on this background goroutine would take the whole gateway down
 		// with it — and log retention is the least important thing running. Contain
 		// it: the ticker dies, request serving does not.
@@ -158,7 +174,10 @@ func startLogPruner(st *store.Store) func() {
 			}
 		}
 	}()
-	return func() { close(stop) }
+	return func() {
+		close(stop)
+		<-done
+	}
 }
 
 func parsePositiveInt(s string) (int, error) {

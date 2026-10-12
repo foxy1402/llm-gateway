@@ -63,7 +63,7 @@ func registerRoutes(mux *http.ServeMux, a *app) {
 		Store: a.store,
 		Reg:   a.reg,
 		Proxy: a.px,
-		Auth:  auth.NewDashboard(a.env.DashboardPassword, a.env.DashboardSecret, a.env.BanCfg.BehindProxy),
+		Auth:  auth.NewDashboard(a.env.DashboardPassword, a.env.DashboardSecret, a.env.DashboardSecureCookie),
 		Env:   a.env,
 	}
 	// Strict fail-to-ban on the login endpoint (BAN_MAXFAIL=0 disables).
@@ -114,6 +114,9 @@ func (a *app) adminExport(w http.ResponseWriter, r *http.Request) {
 	filename := "gateway-export-" + time.Now().Format("2006-01-02") + ".sql"
 	w.Header().Set("Content-Type", "application/sql")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
+	// Same plaintext-key dump the dashboard export serves; that path gets
+	// no-store via secure(), so the API-key path must too.
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(out))
 }
 

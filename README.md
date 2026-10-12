@@ -91,7 +91,10 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `GATEWAY_LISTEN` | no | `:8080` | Listen address. Accepts `:8080`, `8080` (bare port), or `0.0.0.0:8080`. Some PaaS hosts reject the leading `:`, so a plain port number like `8080` is normalized to `:8080` for you. |
 | `GATEWAY_LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `DB_PATH` | no | `./gateway.db` | SQLite file path (use a mounted volume in Docker) |
-| `REQUEST_TIMEOUT` | no | `60s` | Timeout for **connect + response headers** only (per attempt). Streaming bodies run unbounded until the client disconnects or the upstream stalls for 90s — a fixed timeout would kill long coding generations mid-edit. |
+| `REQUEST_TIMEOUT` | no | `60s` | Timeout for **connect + response headers** only (per attempt). Must be positive. Streaming bodies run unbounded until the client disconnects or the upstream stalls for 90s — a fixed timeout would kill long coding generations mid-edit. |
+| `REQUEST_BUDGET` | no | `10m` | Total wall-clock budget for one client request across **all** account/provider rotation attempts. Bounds the worst case where every attempt is individually slow (e.g. an all-dead combo whose dials hang); without it such a request could pin a handler for many minutes. A live stream that has already started is governed by the client connection, not this budget. `0` or negative falls back to the default. |
+| `STREAM_STALL_TIMEOUT` | no | `90s` | How long a streaming response may go without receiving a chunk before the gateway declares it stalled and terminates it (emitting an SSE error frame). Raise it for models that legitimately idle for long stretches between tokens. |
+| `ATTEMPT_BACKOFF_BASE` | no | `100ms` | First delay before rotating to the next account/provider after a retryable failure; grows exponentially (capped at 2s) with jitter so a rate-limiting upstream isn't hammered and concurrent requests don't retry in lockstep. Set to `0` to disable inter-attempt backoff entirely. |
 | `MAX_REQUEST_BODY_MB` | no | `25` | Cap on the incoming `/v1/*` request body size. Raise this if you send large base64-encoded images (vision/OCR) or documents — a single high-res image can easily be 5-20MB as base64 JSON. `0` or invalid values fall back to the default. |
 | `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` | no | `10` | Self-heal ceiling: how many accounts (API keys) of **one** provider get tried within a single request before giving up on it. Default `10` covers realistic key pools in full (a provider with 5 keys tries all 5 before failing). Lower it if you'd rather fail fast than have one slow/unlucky request serially churn through a very large key pool. `0` or invalid values fall back to the default. |
 | `MIN_COMPLETION_TOKENS` | no | `16` | Floor used by the [token-budget-too-small smart-mode heal](#smart-mode-token-budget-too-small): if a reasoning-tier model rejects a request because `max_tokens`/`max_completion_tokens` is too small to produce any output (e.g. a `max_tokens: 1` connection probe), the gateway bumps it up to this floor and retries once. Set to `0` to disable this heal entirely. |
@@ -102,6 +105,7 @@ All bootstrap/secret config comes from env vars. Everything else lives in SQLite
 | `BAN_TIME` | no | `30m` | Base ban duration; doubles per repeat offense |
 | `BAN_MAX_TIME` | no | `24h` | Cap on the escalated ban duration |
 | `TRUSTED_PROXY` | no | `0` | Whether the fail-to-ban gate trusts the `X-Forwarded-For`/`X-Real-IP` headers for the client's real IP. See [Setting TRUSTED_PROXY correctly](#setting-trusted_proxy-correctly) — getting this wrong either lets attackers evade bans or lets one attacker lock out every legitimate user. |
+| `DASHBOARD_SECURE_COOKIE` | no | `TRUSTED_PROXY` | Whether the dashboard session cookie is marked `Secure` unconditionally (for a TLS-terminating proxy where the gateway itself sees plain HTTP). Defaults to the `TRUSTED_PROXY` value; set it explicitly to decouple the two trust decisions. The `Secure` attribute is never derived from the client-spoofable `X-Forwarded-Proto` header. |
 
 ### Setting TRUSTED_PROXY correctly
 
@@ -190,7 +194,15 @@ This doesn't cost you self-heal, though: **a direct provider with multiple accou
 
 ### Failure & cooldown
 
-When an upstream returns a retryable status (default `402, 429, 500, 502, 503, 504`) or times out, the gateway records a failure and cools that **account** (API key) down for `health.cooldown` seconds (default 60) — a sibling key on the same provider stays in rotation. `402` is included by default because several OpenAI-compatible upstreams (e.g. some Vercel AI Gateway providers) report exhausted credits as "402 Payment Required" instead of the more common `429`; both are equally account-scoped and equally worth rotating away from. Customize the set via the `health.error_codes` dashboard/admin setting (comma-separated status codes) and the cooldown via `health.cooldown`. A 404 on `/v1/completions` permanently flags that provider as not supporting the legacy endpoint (until restart).
+When an upstream returns a retryable status (default `401, 402, 403, 408, 425, 429, 500, 502, 503, 504, 509`) or times out, the gateway records a failure and cools that **account** (API key) down — a sibling key on the same provider stays in rotation. The codes that matter most:
+
+- `402` — some OpenAI-compatible upstreams (e.g. some Vercel AI Gateway providers) report exhausted credits as "402 Payment Required" instead of `429`.
+- `401`/`403` — a revoked or model-scoped key is the most common key-death mode, and it is account-scoped: a sibling key on the same endpoint very likely still works, so the gateway rotates instead of failing the request terminally.
+- `408`/`425`/`509` — upstream request timeout / "too early" / bandwidth limit, all transient.
+
+Cooldown starts at `health.cooldown` seconds (default 60) and **backs off exponentially** (doubling per consecutive failure, capped at 30 minutes) with jitter, so a provider that keeps failing is re-probed less and less often instead of being hit at full concurrency every window. A pure *timeout* (an upstream slow to emit its first token, e.g. a long-reasoning model) books only a short soft penalty rather than the full cooldown, so a slow-but-healthy provider doesn't flap out of rotation. Customize the status set via the `health.error_codes` dashboard/admin setting (comma-separated status codes) and the base window via `health.cooldown` (set it to `0` to disable cooldown entirely). A 404 on `/v1/completions` permanently flags that provider as not supporting the legacy endpoint (until restart).
+
+Between rotation attempts the gateway waits a small exponential backoff (`ATTEMPT_BACKOFF_BASE`, default 100ms, capped at 2s, jittered) so one client request that draws several retryable failures doesn't become a burst against an already-rate-limiting upstream.
 
 **Self-heal within one request**: a direct provider call or an unpinned combo member automatically rotates across that provider's *other* healthy keys — up to `MAX_ACCOUNT_ATTEMPTS_PER_PROVIDER` of them — before the request fails, so a single client call transparently survives one or more keys being rate-limited or out of credit. Pinned combo members (a member bound to one specific key) don't have siblings to fall back to *within that member*, but a same-provider sibling pinned to a **different** key on another combo member still rotates in normally.
 
@@ -355,13 +367,14 @@ internal/middleware/ logging + panic recovery
 
 | Scenario | Behavior |
 |---|---|
-| Upstream 402 / 429 / 5xx | Rotate to the next account (same provider first, then next combo member), apply per-account cooldown |
+| Upstream 401 / 402 / 403 / 408 / 425 / 429 / 5xx | Rotate to the next account (same provider first, then next combo member), apply per-account cooldown |
 | Upstream 404/405 on an *optional* endpoint (legacy `/v1/completions`, `/v1/embeddings`, native `/v1/responses`) | Mark provider unsupported for that endpoint, rotate |
 | Upstream 404/405 on `/v1/chat/completions` | Surface the real upstream body unchanged — chat.completions is mandatory for every provider, so a 404 there means a bad base_url/auth/body, not a missing endpoint |
 | Upstream rejects `max_tokens`/`max_completion_tokens` (wrong one for that model) | Auto-corrected and retried once on the same key, transparent to the client (see [Smart mode](#smart-mode-max_tokens-vs-max_completion_tokens)) |
-| Every account/combo member exhausted after a 402/429/5xx | Surface the last real upstream status (e.g. `429`) instead of a generic error |
+| Every account/combo member exhausted after a retryable status | Surface the last real upstream status AND its body (plus `Retry-After` / `X-RateLimit-*`) instead of a generic error |
 | Every account/combo member exhausted with no upstream response at all | `502` with OpenAI-shaped error |
-| Upstream connect/header timeout | Rotate |
+| Upstream connect/header timeout | Rotate; a pure timeout books only a short soft penalty (see [Failure & cooldown](#failure--cooldown)) |
+| Upstream stalls mid-stream (no chunk for `STREAM_STALL_TIMEOUT`) | Emit an SSE error frame (chat) / `response.failed` (Responses), then end the stream |
 | Client disconnects mid-stream | Upstream request aborted (no eager rotation) |
 | Stream stalls >90s between chunks | Stream gracefully terminated |
 | Bad/missing API key | `401`, no upstream call |

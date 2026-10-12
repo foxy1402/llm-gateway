@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -151,6 +152,12 @@ func (s *Store) ExportSQL() (string, error) {
 		// Stable order.
 		keys := make([]string, 0, len(settings))
 		for k := range settings {
+			// Reserved runtime state (failban:state) is deliberately NOT exported:
+			// it is host-specific brute-force bookkeeping, not configuration, and
+			// including it let a restore silently reset bans.
+			if IsReservedSetting(k) {
+				continue
+			}
 			keys = append(keys, k)
 		}
 		for i := 0; i < len(keys); i++ {
@@ -160,13 +167,15 @@ func (s *Store) ExportSQL() (string, error) {
 				}
 			}
 		}
-		b.WriteString("INSERT INTO settings (key, value) VALUES\n")
-		for i, k := range keys {
-			fmt.Fprintf(&b, "  (%s, %s)", q(k), q(settings[k]))
-			if i == len(keys)-1 {
-				b.WriteString(";\n\n")
-			} else {
-				b.WriteString(",\n")
+		if len(keys) > 0 {
+			b.WriteString("INSERT INTO settings (key, value) VALUES\n")
+			for i, k := range keys {
+				fmt.Fprintf(&b, "  (%s, %s)", q(k), q(settings[k]))
+				if i == len(keys)-1 {
+					b.WriteString(";\n\n")
+				} else {
+					b.WriteString(",\n")
+				}
 			}
 		}
 	}
@@ -239,7 +248,7 @@ func (s *Store) ImportSQL(sqlText string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, st := range stmts {
+	for i, st := range stmts {
 		// Skip the wrapping BEGIN/COMMIT from the export; we manage our own tx.
 		upper := strings.ToUpper(strings.TrimSpace(st))
 		if upper == "BEGIN TRANSACTION" || upper == "COMMIT" {
@@ -252,11 +261,182 @@ func (s *Store) ImportSQL(sqlText string) error {
 		if err := validateImportStatement(st); err != nil {
 			return err
 		}
+		// Settings are subject to the same reservation as the dashboard write
+		// allowlist: an import must not carry reserved runtime keys
+		// (failban:state) that would silently reset brute-force protections on the
+		// next restart. Reserved rows are SKIPPED rather than failing the whole
+		// import, so an older export that predates this filter still restores
+		// everything else.
+		st, skipped := stripReservedSettings(st)
+		if skipped && st == "" {
+			continue
+		}
 		if _, err := tx.Exec(st); err != nil {
-			return fmt.Errorf("execute statement %q: %w", trunc(st, 60), err)
+			// st can be an INSERT row carrying provider/account auth keys verbatim.
+			// Surface only the statement KIND and index server-side; the caller
+			// (the uploading admin) gets a generic message, and the raw statement is
+			// never echoed into the HTTP response body.
+			slog.Warn("import statement failed", "kind", strings.Fields(st)[0], "err", err)
+			return fmt.Errorf("execute import statement %d (%s): %w", i, strings.ToLower(strings.Fields(st)[0]), err)
 		}
 	}
 	return tx.Commit()
+}
+
+// stripReservedSettings removes reserved-key rows from an
+// "INSERT INTO settings (key, value) VALUES (...), (...)" statement. Returns the
+// (possibly rewritten) statement and whether anything was dropped. A statement
+// that is not a settings INSERT, or whose shape can't be parsed, is returned
+// unchanged with skipped=false — the import validator has already constrained
+// the shape, and failing to parse simply means the row passes through
+// (reserved keys are additionally never written by this version's export).
+func stripReservedSettings(stmt string) (string, bool) {
+	fields := strings.Fields(stmt)
+	if len(fields) < 6 || !strings.EqualFold(fields[0], "INSERT") ||
+		!strings.EqualFold(fields[1], "INTO") || !strings.EqualFold(fields[2], "settings") {
+		return stmt, false
+	}
+	open := strings.Index(stmt, "(")
+	closeParen := strings.Index(stmt, ")")
+	if open < 0 || closeParen < open {
+		return stmt, false
+	}
+	cols := strings.Split(stmt[open+1:closeParen], ",")
+	keyIdx := -1
+	for i, c := range cols {
+		if strings.EqualFold(strings.TrimSpace(c), "key") {
+			keyIdx = i
+			break
+		}
+	}
+	if keyIdx < 0 {
+		return stmt, false
+	}
+	valuesAt := strings.Index(strings.ToUpper(stmt), "VALUES")
+	if valuesAt < 0 {
+		return stmt, false
+	}
+	head := stmt[:valuesAt] + "VALUES"
+	tuples, ok := splitValueTuples(stmt[valuesAt+len("VALUES"):])
+	if !ok {
+		return stmt, false
+	}
+	kept := tuples[:0]
+	dropped := false
+	for _, t := range tuples {
+		vals, ok := splitTupleValues(t)
+		if !ok || keyIdx >= len(vals) {
+			return stmt, false // unparseable → leave the whole statement alone
+		}
+		if IsReservedSetting(unquoteSQL(vals[keyIdx])) {
+			dropped = true
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if !dropped {
+		return stmt, false
+	}
+	if len(kept) == 0 {
+		return "", true
+	}
+	return head + "\n  " + strings.Join(kept, ",\n  "), true
+}
+
+// splitValueTuples splits " (a,b), (c,d);" into ["(a,b)", "(c,d)"], respecting
+// single-quoted strings. Returns ok=false on any shape surprise.
+func splitValueTuples(s string) ([]string, bool) {
+	var out []string
+	depth := 0
+	inString := false
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // escaped ''
+					continue
+				}
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inString = true
+		case '(':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				out = append(out, strings.TrimSpace(s[start:i+1]))
+				start = -1
+			} else if depth < 0 {
+				return nil, false
+			}
+		}
+	}
+	if depth != 0 || inString || len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// splitTupleValues splits one "(a, b, c)" tuple into its top-level comma-separated
+// values, respecting quoted strings and nested parens.
+func splitTupleValues(t string) ([]string, bool) {
+	t = strings.TrimSpace(t)
+	if len(t) < 2 || t[0] != '(' || t[len(t)-1] != ')' {
+		return nil, false
+	}
+	inner := t[1 : len(t)-1]
+	var out []string
+	depth := 0
+	inString := false
+	start := 0
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if inString {
+			if c == '\'' {
+				if i+1 < len(inner) && inner[i+1] == '\'' {
+					i++
+					continue
+				}
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inString = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(inner[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, strings.TrimSpace(inner[start:]))
+	return out, true
+}
+
+// unquoteSQL strips surrounding single quotes and unescapes doubled single
+// quotes from a SQL string literal; a non-literal (NULL, number) is returned
+// as-is.
+func unquoteSQL(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		return strings.ReplaceAll(s[1:len(s)-1], "''", "'")
+	}
+	return s
 }
 
 // importAllowedTables are the tables an export file may write. Notably absent:

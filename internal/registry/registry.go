@@ -18,6 +18,11 @@ const (
 	EndpointEmbeddings      = "embeddings"
 )
 
+// accountWeightCap bounds how many pick-list slots one account can contribute,
+// so an unbounded operator weight can't turn account rotation into an allocation
+// bomb (see NextAccount).
+const accountWeightCap = 100
+
 type wrrEntry struct {
 	// key is the full member identity (provider|account|model) so duplicate
 	// members that share a provider but pin different keys/models stay distinct
@@ -386,11 +391,19 @@ func (r *Registry) NextAccount(p *config.Provider, health *HealthTracker, skip m
 	}
 	// Build an expanded pick list so weight >1 gets multiple slots — number of
 	// slots equals the weight. Slot order is stable per provider (account order).
+	// Weights are clamped to accountWeightCap: they are operator-supplied ints
+	// with no upper bound, and the previous loop allocated sum(weights) slots on
+	// EVERY NextAccount call — a weight of 1e9 turned one routing decision into a
+	// multi-gigabyte allocation. The cap preserves the intended ratio for any
+	// realistic weight while bounding the per-call allocation.
 	picks := []config.Account{}
 	for _, a := range eligible {
 		w := a.Weight
 		if w < 1 {
 			w = 1
+		}
+		if w > accountWeightCap {
+			w = accountWeightCap
 		}
 		for i := 0; i < w; i++ {
 			picks = append(picks, a)

@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -49,7 +50,19 @@ type HealthTracker struct {
 // "402 Payment Required" instead of 429, and that failure mode is exactly as
 // account-scoped and retryable as a rate limit: a sibling key on the same
 // provider is very likely to still have credit.
-var defaultRetryableCodes = map[int]bool{402: true, 429: true, 500: true, 502: true, 503: true, 504: true}
+//
+// 401/403 are included for the same reason: a revoked or model-scoped key is
+// the most common key-death mode, and it is account-scoped — a sibling key on
+// the same endpoint would very likely succeed. Cooling is account-scoped (see
+// RecordAccountFailure), so a provider-wide auth misconfiguration cannot take
+// the whole provider out of rotation when it rotates.
+//
+// 408/425/509 round out the transient set: upstream request timeout, "too
+// early", and bandwidth-limit are all retryable in practice.
+var defaultRetryableCodes = map[int]bool{
+	401: true, 402: true, 403: true, 408: true, 425: true,
+	429: true, 500: true, 502: true, 503: true, 504: true, 509: true,
+}
 
 // defaultRetryableCodesList renders defaultRetryableCodes as a slice for
 // callers (Reload's fallback) that need the "no setting stored yet" default
@@ -78,10 +91,13 @@ func NewHealthTracker() *HealthTracker {
 }
 
 // Configure updates cooldown duration and retryable error codes from settings.
+// A cooldownSeconds of 0 explicitly DISABLES cooldown (failures still count, but
+// the provider/account is never taken out of rotation); a negative value is
+// treated as "leave unchanged" so a parse hiccup can't accidentally disable it.
 func (h *HealthTracker) Configure(cooldownSeconds int, errorCodes []int) {
 	h.codeMu.Lock()
 	defer h.codeMu.Unlock()
-	if cooldownSeconds > 0 {
+	if cooldownSeconds >= 0 {
 		h.cooldown = time.Duration(cooldownSeconds) * time.Second
 	}
 	if len(errorCodes) > 0 {
@@ -111,13 +127,72 @@ func (h *HealthTracker) state(id string) *providerHealth {
 	return s
 }
 
+// maxCooldown caps the exponential cooldown backoff so a long-dead provider is
+// still re-probed occasionally rather than being abandoned forever.
+const maxCooldown = 30 * time.Minute
+
 // RecordFailure increments the failure counter and starts a cooldown window.
+// The window grows exponentially with consecutive failures (base×2ⁿ⁻¹, capped
+// at maxCooldown) with jitter, so a provider that keeps failing backs off
+// instead of being re-probed at full concurrency every base interval forever.
 func (h *HealthTracker) RecordFailure(id string, code int) {
 	s := h.state(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failures++
-	s.cooldownUntil = time.Now().Add(h.currentCooldown())
+	if d := h.backoffFor(s.failures); d > 0 {
+		s.cooldownUntil = time.Now().Add(d)
+	} else {
+		// cooldown disabled (health.cooldown=0): the zero time keeps the provider
+		// available — using now+0 left a non-zero timestamp that IsAvailable only
+		// passed by comparison-race against a same-instant clock.
+		s.cooldownUntil = time.Time{}
+	}
+}
+
+// RecordSoftFailure books a short penalty for a failure that proves only
+// slowness, not death: a header timeout on an upstream that is merely slow to
+// emit its first token (long reasoning models) must not take the whole provider
+// out for a full cooldown window. The failure counter is NOT incremented, so a
+// slow-but-healthy provider can't escalate itself into a long backoff, and the
+// penalty is a small fixed slice of the base window.
+func (h *HealthTracker) RecordSoftFailure(id string) {
+	s := h.state(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	base := h.currentCooldown()
+	if base <= 0 {
+		return
+	}
+	soft := base / 8
+	if soft > 10*time.Second {
+		soft = 10 * time.Second
+	}
+	if until := time.Now().Add(soft); until.After(s.cooldownUntil) {
+		s.cooldownUntil = until
+	}
+}
+
+// backoffFor returns the cooldown for the Nth consecutive failure: the base
+// window doubled per failure up to maxCooldown, with ±20% jitter so a fleet
+// whose members recovered together doesn't re-probe in lockstep (thundering
+// herd on cooldown expiry).
+func (h *HealthTracker) backoffFor(failures int) time.Duration {
+	base := h.currentCooldown()
+	if base <= 0 {
+		return 0
+	}
+	if failures < 1 {
+		failures = 1
+	}
+	d := base
+	for i := 1; i < failures && d < maxCooldown; i++ {
+		d *= 2
+	}
+	if d > maxCooldown {
+		d = maxCooldown
+	}
+	return time.Duration(float64(d) * (0.8 + rand.Float64()*0.4))
 }
 
 func (h *HealthTracker) currentCooldown() time.Duration {

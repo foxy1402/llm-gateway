@@ -22,10 +22,12 @@ const (
 	StreamFormatResponses
 )
 
-// streamStallTimeout is the maximum time to wait between SSE chunks before
-// treating the upstream as stalled and terminating the stream. Distinct from the
-// per-request header timeout: long coding generations can legitimately idle for
-// tens of seconds between tokens, but a multi-minute silence means a hung upstream.
+// streamStallTimeout is the DEFAULT maximum time to wait between SSE chunks
+// before treating the upstream as stalled and terminating the stream. Distinct
+// from the per-request header timeout: long coding generations can legitimately
+// idle for tens of seconds between tokens, but a multi-minute silence means a
+// hung upstream. Overridable per-proxy via SetStreamStallTimeout
+// (STREAM_STALL_TIMEOUT); see Proxy.streamStall.
 const streamStallTimeout = 90 * time.Second
 
 // postDoneUsageWait is how long to keep reading after the [DONE] sentinel purely
@@ -39,6 +41,12 @@ const postDoneUsageWait = 250 * time.Millisecond
 // failed (it hung up mid-response). Like a context cancel, this is not the
 // upstream's fault and must not cool down the account.
 var errClientWriteFailed = errors.New("client write failed mid-stream")
+
+// errStreamStalled marks a stream that ended because the upstream stopped
+// emitting chunks for longer than the stall window. A stalled-but-alive key
+// (a slow model, a briefly wedged connection) is penalized softly rather than
+// being cooled down for a full window — see proxy's stream-error handling.
+var errStreamStalled = errors.New("upstream stalled mid-stream")
 
 // ssePayload extracts the data-field value from one SSE line. Per the SSE spec
 // the colon may be followed by an optional space, so matching only "data: "
@@ -124,6 +132,13 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 	// Read on every body implementation, e.g. wrapped or in-memory bodies).
 	defer upstream.Body.Close()
 
+	// Per-stream stall window: proxy-configured (SetStreamStallTimeout) so slow
+	// long-reasoning models can be given more room without a code change.
+	stallFor := p.streamStall
+	if stallFor <= 0 {
+		stallFor = streamStallTimeout
+	}
+
 	src := bufio.NewReaderSize(upstream.Body, 4096)
 	var out bytes.Buffer
 
@@ -181,7 +196,7 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			}
 		}
 	}()
-	stall := time.NewTimer(streamStallTimeout)
+	stall := time.NewTimer(stallFor)
 	defer stall.Stop()
 
 	// Buffered chat tool_call deltas (responses translation only). Chat-completions
@@ -221,6 +236,45 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 		out.WriteString("data: ")
 		out.Write(completed)
 		out.WriteString("\n\n")
+	}
+
+	// emitStreamError best-effort tells the client WHY the stream ended after the
+	// headers were committed. Without it a stall or an upstream read error produced
+	// an abrupt EOF that a client could not distinguish from a successful, complete
+	// generation — and on the Responses-translate path it also skipped
+	// response.completed, so a strict client hung until its own timeout. The write
+	// is best-effort: the client may already be gone, in which case there is
+	// nothing to flush to and the error is ignored.
+	emitStreamError := func(reason string) {
+		if translate && format == StreamFormatResponses {
+			// Responses clients expect a terminal event; surface the failure as one
+			// so the stream is unambiguously finished rather than truncated.
+			failed, _ := json.Marshal(map[string]any{
+				"type": "response.failed",
+				"response": map[string]any{
+					"id":     "resp_" + randomID(),
+					"object": "response",
+					"status": "failed",
+					"model":  respModel,
+					"error":  map[string]any{"code": "upstream_error", "message": reason},
+				},
+			})
+			out.WriteString("event: response.failed\n")
+			out.WriteString("data: ")
+			out.Write(failed)
+			out.WriteString("\n\n")
+		} else {
+			// Chat-completions clients recognize an error chunk in-band; this is the
+			// same shape the OpenAI API uses mid-stream.
+			chunk, _ := json.Marshal(map[string]any{
+				"error": map[string]string{"message": reason, "type": "upstream_error"},
+			})
+			out.WriteString("data: ")
+			out.Write(chunk)
+			out.WriteString("\n\n")
+			out.WriteString("data: [DONE]\n\n")
+		}
+		_ = flush()
 	}
 
 	// absorbUsage records token counts from one chunk, keeping already-captured
@@ -273,11 +327,14 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 			if len(rr.line) > 0 && !stall.Stop() {
 				<-stall.C
 			}
-			stall.Reset(streamStallTimeout)
+			stall.Reset(stallFor)
 		case <-stall.C:
 			// Upstream stalled mid-response: the client got a truncated stream and
-			// the account must not keep a clean health record for it.
-			return promptTokens, completionTokens, cachedTokens, fmt.Errorf("upstream stalled for %s mid-stream", streamStallTimeout)
+			// the account must not keep a clean health record for it. Tell the
+			// client explicitly rather than leaving an abrupt EOF it can't tell
+			// apart from a completed generation.
+			emitStreamError(fmt.Sprintf("upstream stalled for %s mid-stream", stallFor))
+			return promptTokens, completionTokens, cachedTokens, fmt.Errorf("%w (no chunk for %s)", errStreamStalled, stallFor)
 		case <-ctx.Done():
 			// Client went away mid-stream (Esc in an IDE, page nav). Not an upstream
 			// fault: the wrapped context error tells the caller NOT to penalize
@@ -289,7 +346,7 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 				if len(rr.line) > 0 && !stall.Stop() {
 					<-stall.C
 				}
-				stall.Reset(streamStallTimeout)
+				stall.Reset(stallFor)
 			default:
 				return promptTokens, completionTokens, cachedTokens, fmt.Errorf("client disconnected mid-stream: %w", ctx.Err())
 			}
@@ -385,8 +442,10 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, upstream *http.Response, f
 		}
 		if err != nil {
 			if err != io.EOF {
-				// Headers are long committed, so the client only sees an abrupt end;
-				// report it so the caller can mark the account unhealthy.
+				// Headers are long committed, so the client would otherwise only see an
+				// abrupt end; emit an error frame so truncation is distinguishable from
+				// completion, and report it so the caller can mark the account unhealthy.
+				emitStreamError(fmt.Sprintf("upstream stream read error: %v", err))
 				return promptTokens, completionTokens, cachedTokens, fmt.Errorf("upstream stream read error: %w", err)
 			}
 			break
